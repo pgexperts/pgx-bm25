@@ -1,0 +1,229 @@
+-- 86_errcodes_and_amvalidate: SQLSTATEs are part of the API, and amvalidate
+-- must be able to say NO (M5 #62.7, M3 #66.10/#66.14, L6 #69.3, L1 #64.19).
+--
+-- Two properties, both of which were previously unobservable from any suite.
+--
+-- Part 1: SQLSTATE. Five ereport(ERROR) sites omitted errcode(), so PostgreSQL
+-- defaulted them to ERRCODE_INTERNAL_ERROR (XX000). Two are reachable from
+-- ordinary user SQL by passing a bad segment number to a debug SRF. A wrong
+-- SQLSTATE changes NOTHING about the message text, so every existing suite that
+-- exercises these paths passes identically before and after the fix -- pg_regress
+-- compares stdout, and the SQLSTATE is not in it unless a test puts it there.
+-- That is what this suite does. The consequence is real: a PL/pgSQL handler
+-- keyed on invalid_parameter_value never fires, and a pooler or log scraper that
+-- treats XX000 as a backend defect misclassifies plain user error.
+--
+-- Part 2/3: amvalidate. bm25_validate returned true for any OID whatsoever,
+-- ignoring its argument, with a comment deferring the real check to a milestone
+-- that had already shipped. The amapi contract permits a stub, so nothing broke
+-- -- which is exactly why an assertion that the SHIPPED opclass validates is not
+-- enough on its own: `return true` satisfies it too. Part 3 is therefore the
+-- load-bearing half, and it is built as CANARIES: six deliberately malformed
+-- opclasses that must each come back INVALID, one per failure mode the validator
+-- can actually be shown to detect. Under the old stub every one reports valid.
+--
+-- Note CREATE OPERATOR CLASS does not itself invoke amvalidate (core calls it
+-- only from the amvalidate() SQL function that opr_sanity drives), which is what
+-- makes the broken opclasses below constructible at all.
+CREATE EXTENSION bm25_native;
+CREATE TABLE ec (id int primary key, body text) WITH (autovacuum_enabled=off);
+INSERT INTO ec SELECT g, 'alpha bravo charlie ' || g FROM generate_series(1, 20) g;
+CREATE INDEX ec_bm25 ON ec USING bm25_native (body) WITH (language = 'english');
+-- Seal, so there is exactly one live segment and segment 99 is genuinely out of range.
+SELECT bm25_seal(  'ec_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT count(*) AS live_segments FROM bm25_debug_segcat('ec_bm25');
+ live_segments 
+---------------
+             1
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Part 1: the two SQL-reachable out-of-range checks report 22023, not XX000.
+-- ---------------------------------------------------------------------------
+-- Reported SQLSTATE, printed so a regression to XX000 shows up as a diff rather
+-- than as identical output.
+DO $$
+BEGIN
+    BEGIN
+        PERFORM bm25_debug_seg_keymap('ec_bm25', 99);
+        RAISE EXCEPTION 'expected an out-of-range error, got none';
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'bm25_debug_seg_keymap(99) SQLSTATE = %', SQLSTATE;
+    END;
+END $$;
+NOTICE:  bm25_debug_seg_keymap(99) SQLSTATE = 22023
+DO $$
+BEGIN
+    BEGIN
+        PERFORM bm25_debug_seg_doc_live('ec_bm25', 99, 0);
+        RAISE EXCEPTION 'expected an out-of-range error, got none';
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'bm25_debug_seg_doc_live(99) SQLSTATE = %', SQLSTATE;
+    END;
+END $$;
+NOTICE:  bm25_debug_seg_doc_live(99) SQLSTATE = 22023
+-- The consequence the finding actually named: a handler keyed on the SPECIFIC
+-- condition must fire. A bare `WHEN OTHERS` above would stay green under XX000;
+-- these two will not.
+DO $$
+BEGIN
+    BEGIN
+        PERFORM bm25_debug_seg_keymap('ec_bm25', 99);
+        RAISE EXCEPTION 'expected an out-of-range error, got none';
+    EXCEPTION WHEN invalid_parameter_value THEN
+        RAISE NOTICE 'bm25_debug_seg_keymap(99) caught by invalid_parameter_value handler';
+    END;
+END $$;
+NOTICE:  bm25_debug_seg_keymap(99) caught by invalid_parameter_value handler
+DO $$
+BEGIN
+    BEGIN
+        PERFORM bm25_debug_seg_doc_live('ec_bm25', 99, 0);
+        RAISE EXCEPTION 'expected an out-of-range error, got none';
+    EXCEPTION WHEN invalid_parameter_value THEN
+        RAISE NOTICE 'bm25_debug_seg_doc_live(99) caught by invalid_parameter_value handler';
+    END;
+END $$;
+NOTICE:  bm25_debug_seg_doc_live(99) caught by invalid_parameter_value handler
+-- A negative segment takes the same branch through the other side of the test.
+DO $$
+BEGIN
+    BEGIN
+        PERFORM bm25_debug_seg_doc_live('ec_bm25', -1, 0);
+        RAISE EXCEPTION 'expected an out-of-range error, got none';
+    EXCEPTION WHEN invalid_parameter_value THEN
+        RAISE NOTICE 'bm25_debug_seg_doc_live(-1) caught by invalid_parameter_value handler';
+    END;
+END $$;
+NOTICE:  bm25_debug_seg_doc_live(-1) caught by invalid_parameter_value handler
+-- ---------------------------------------------------------------------------
+-- Part 2: the shipped opclass validates.
+-- ---------------------------------------------------------------------------
+SELECT opcname, amvalidate(oid) AS valid
+FROM pg_opclass
+WHERE opcmethod = (SELECT oid FROM pg_am WHERE amname = 'bm25_native')
+ORDER BY opcname;
+    opcname    | valid 
+---------------+-------
+ text_bm25_ops | t
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Part 3 (CANARIES): each malformed opclass must be reported INVALID.
+--
+-- Under the pre-fix `return true` stub every row below reads `t` and no INFO
+-- line appears. The INFO lines are part of the expected output on purpose --
+-- they are the diagnostic the user gets, and a validator that returned false
+-- without saying which member is wrong would be much less useful.
+--
+-- WHAT IS NOT HERE, AND WHY. Exactly two of the validator's branches cannot be
+-- reached, because CREATE OPERATOR CLASS rejects those shapes itself before
+-- amvalidate is ever called: a SEARCH operator that does not return boolean
+-- ("index search operators must return boolean" -- so `OPERATOR 2 &@@
+-- (text,text)` without FOR ORDER BY is unconstructible), and any support
+-- procedure at all ("invalid function number 1, must be between 1 and 0", since
+-- amsupport is 0). The validator still checks both, as a backstop that costs
+-- nothing and would matter the day amsupport grows, but they are deliberately
+-- not asserted here: a canary that cannot be injected is not a canary.
+--
+-- Note the ASYMMETRY in what core screens, which is what makes (c) and (f) worth
+-- having: core rejects a non-boolean operator declared as a SEARCH member, but
+-- accepts both a BOOLEAN one declared FOR ORDER BY (c) and an ORDER BY member
+-- whose sort family cannot sort the result type (e). Everything core declines to
+-- check is this validator's job, and each such branch has a canary below.
+CREATE FUNCTION bm25_opclass_oid(name text) RETURNS oid LANGUAGE sql STABLE AS $$
+  SELECT c.oid FROM pg_opclass c JOIN pg_am a ON a.oid = c.opcmethod
+   WHERE a.amname = 'bm25_native' AND c.opcname = $1
+$$;
+-- (a) No ORDER BY member: the opclass cannot drive a ranked scan at all.
+CREATE OPERATOR CLASS bad_no_orderby FOR TYPE text USING bm25_native AS
+  OPERATOR 1 @@@ (text, text);
+SELECT amvalidate(bm25_opclass_oid('bad_no_orderby')) AS valid_no_orderby;
+INFO:  bm25_native opclass bad_no_orderby is missing ORDER BY operator 2 for its own input type
+ valid_no_orderby 
+------------------
+ f
+(1 row)
+
+-- (b) No match member: strategy 2 alone, correctly declared FOR ORDER BY.
+CREATE OPERATOR CLASS bad_no_match FOR TYPE text USING bm25_native AS
+  OPERATOR 2 &@@ (text, text) FOR ORDER BY float_ops;
+SELECT amvalidate(bm25_opclass_oid('bad_no_match')) AS valid_no_match;
+INFO:  bm25_native opclass bad_no_match is missing operator 1 for its own input type
+ valid_no_match 
+----------------
+ f
+(1 row)
+
+-- (c) Right operator, right strategy number, wrong PURPOSE: the boolean match
+--     operator registered FOR ORDER BY. Core accepts this; a signature-only
+--     validator would too, since @@@ does return the boolean strategy 1 wants.
+--     Only the purpose check catches it.
+CREATE OPERATOR CLASS bad_purpose FOR TYPE text USING bm25_native AS
+  OPERATOR 1 @@@ (text, text) FOR ORDER BY float_ops;
+SELECT amvalidate(bm25_opclass_oid('bad_purpose')) AS valid_purpose;
+INFO:  bm25_native opfamily bad_purpose contains operator @@@(text,text) registered for ORDER BY, but strategy 1 is a search operator
+INFO:  bm25_native opclass bad_purpose is missing operator 1 for its own input type
+INFO:  bm25_native opclass bad_purpose is missing ORDER BY operator 2 for its own input type
+ valid_purpose 
+---------------
+ f
+(1 row)
+
+-- (d) A strategy number this AM does not define, alongside two correct members.
+--     The two good members must NOT mask the bad one.
+CREATE OPERATOR CLASS bad_strategy_number FOR TYPE text USING bm25_native AS
+  OPERATOR 1 @@@ (text, text),
+  OPERATOR 2 &@@ (text, text) FOR ORDER BY float_ops,
+  OPERATOR 5 = (text, text);
+SELECT amvalidate(bm25_opclass_oid('bad_strategy_number')) AS valid_strategy_number;
+INFO:  bm25_native opfamily bad_strategy_number contains operator =(text,text) with invalid strategy number 5
+ valid_strategy_number 
+-----------------------
+ f
+(1 row)
+
+-- (e) An ORDER BY member whose SORT FAMILY cannot sort float8. The operator and
+--     the purpose are both right; only the sort family is wrong, so this is the
+--     one case that reaches opfamily_can_sort_type.
+CREATE OPERATOR CLASS bad_sortfamily FOR TYPE text USING bm25_native AS
+  OPERATOR 1 @@@ (text, text),
+  OPERATOR 2 &@@ (text, text) FOR ORDER BY text_pattern_ops;
+SELECT amvalidate(bm25_opclass_oid('bad_sortfamily')) AS valid_sortfamily;
+INFO:  bm25_native opfamily bad_sortfamily contains operator &@@(text,text) with an ORDER BY sort family that cannot sort double precision
+INFO:  bm25_native opclass bad_sortfamily is missing ORDER BY operator 2 for its own input type
+ valid_sortfamily 
+------------------
+ f
+(1 row)
+
+-- (f) The boolean match operator as the strategy-2 ORDER BY member: right
+--     purpose, wrong RESULT TYPE. Reaches the strategy-2 signature branch, which
+--     none of the cases above touch.
+CREATE OPERATOR CLASS bad_distance_signature FOR TYPE text USING bm25_native AS
+  OPERATOR 1 @@@ (text, text),
+  OPERATOR 2 @@@ (text, text) FOR ORDER BY float_ops;
+SELECT amvalidate(bm25_opclass_oid('bad_distance_signature')) AS valid_distance_signature;
+INFO:  bm25_native opfamily bad_distance_signature contains operator @@@(text,text) with wrong signature for strategy 2 (expected double precision result)
+INFO:  bm25_native opclass bad_distance_signature is missing ORDER BY operator 2 for its own input type
+ valid_distance_signature 
+--------------------------
+ f
+(1 row)
+
+DROP OPERATOR CLASS bad_no_orderby USING bm25_native;
+DROP OPERATOR CLASS bad_no_match USING bm25_native;
+DROP OPERATOR CLASS bad_purpose USING bm25_native;
+DROP OPERATOR CLASS bad_strategy_number USING bm25_native;
+DROP OPERATOR CLASS bad_sortfamily USING bm25_native;
+DROP OPERATOR CLASS bad_distance_signature USING bm25_native;
+DROP FUNCTION bm25_opclass_oid(text);
+DROP TABLE ec;
+-- pg_regress shares ONE database across suites, so a suite that leaves the
+-- extension installed breaks whichever suite is appended after it. See 85's tail.
+DROP EXTENSION bm25_native;

@@ -1,0 +1,280 @@
+-- 18_vacuum_reclaim: Phase-3 anti-bloat — freed pending/orphan pages are REUSED by
+-- the GetFreeIndexPage-first allocator (bm25_page_alloc), so the relation does not
+-- grow one-extend-per-page across repeated seal+vacuum cycles.
+--
+-- SCOPE (Phase 3 vs Phase 4): Phase 3 reclaims orphan / recycled-pending pages and
+-- flips tombstone bits; it returns those pages to the FSM, and bm25_page_alloc reuses
+-- them instead of always extending. It does NOT physically reclaim the pages of
+-- deleted/tombstoned segments — that is Phase-4 merge (XID-horizon reclamation). So
+-- the STRONG cross-cycle anti-bloat bound (constant footprint across many seals) is a
+-- Phase-4 property; here each seal still adds a segment whose pages linger until merge.
+-- What this suite asserts is the Phase-3 guarantee: with a roughly-CONSTANT live corpus
+-- (delete the prior batch, insert a same-size batch, seal, vacuum), drained pending +
+-- orphan pages are reused, keeping growth BOUNDED over a few cycles. Empirically the
+-- allocator's reuse roughly halves per-cycle growth (~6 pages/cycle reused vs
+-- ~13/cycle extend-only); the < 3.0 bound is a robust, PG-minor/fillfactor-tolerant
+-- envelope around the reuse behavior, not a tight tripwire. (Those two per-cycle
+-- numbers were measured before the horizon stamp below; the bound is loose enough
+-- that they were not re-measured.)
+--
+-- HORIZON WAIT (issue #135). This suite's reuse premise is now horizon-dependent, so
+-- it joins the ADR 0031 group. A drained pending page used to be freed with
+-- InvalidFullTransactionId -- reusable by the very next allocation -- on the premise
+-- that a detached pending page has no live references. It does: a scan captures
+-- pending_head under one metapage SHARE lock and walks the chain long afterwards,
+-- and pending pages carry seg_gen = 0, so nothing catches the substitution. Both
+-- free paths (bm25_pending_truncate and bm25_reclaim_orphans's BM25_PAGE_PENDING
+-- case) therefore stamp a real ReadNextFullTransactionId() now, and the pages this
+-- suite counts on being reused are reusable only once that xid is removable
+-- cluster-wide. ADR 0031's mechanical predicate ("a VACUUM preceding an assertion
+-- that reads AM-internal post-VACUUM state") explicitly EXCLUDED this suite on the
+-- grounds that it "only asserts query results". That was true of tombstoning; it is
+-- not true of page REUSE, which is what the bounded-growth assertion below measures.
+-- Without the wait + xid burn, one unrelated backend holding a snapshot (autovacuum,
+-- a parallel test, a stray psql) pins the horizon, every cycle extends instead of
+-- reusing, and `bounded` flips to f -- reported as this AM leaking pages when
+-- nothing is wrong with it.
+CREATE EXTENSION bm25_native;
+-- Same helper as sql/21_retired_descriptors (and 17/19/20/34/37/75).
+CREATE FUNCTION pg_temp.wait_for_xmin_horizon() RETURNS void AS $$
+DECLARE
+  deadline timestamptz := clock_timestamp() + interval '30 seconds';
+BEGIN
+  LOOP
+    PERFORM pg_stat_clear_snapshot();
+    EXIT WHEN NOT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND backend_xmin IS NOT NULL);
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION
+        'xmin horizon still held by another backend after 30s; VACUUM cannot reclaim';
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+CREATE TABLE docs (id int primary key, body text) WITH (autovacuum_enabled=off);
+CREATE INDEX docs_bm25 ON docs USING bm25_native (body);
+-- WHERE THE WAIT+BURN GOES, and why it is between the seal and the VACUUM rather
+-- than at the top of the next cycle. There are TWO consumers of a page the seal's
+-- bm25_pending_truncate just freed, and the first one is inside the very next
+-- statement: amvacuumcleanup runs seal -> reclaim_retired -> merge_maybe ->
+-- reclaim_orphans, all in ONE transaction, so a merge selected by that VACUUM
+-- allocates against pages the same VACUUM (or the explicit seal before it) has just
+-- stamped. The second consumer is the next cycle's INSERT. A burn placed after the
+-- VACUUM covers only the second and leaves the merge extending. Wait first, then
+-- burn (a held snapshot pins the horizon no matter how many xids follow it --
+-- 20_merge_reclaim's note). Three burns because the stamp is a
+-- ReadNextFullTransactionId(): an xid NOT yet assigned when it was written, so at
+-- least one xid-assigning transaction has to commit after it before
+-- GlobalVisCheckRemovableFullXid can clear it -- and neither bm25_seal() nor VACUUM
+-- assigns one, so without the burn nextXid can sit still across a whole cycle.
+-- Cycle 1: insert a batch into the pending list, seal it into segment 1, vacuum.
+-- VACUUM seals nothing new here (the batch is already sealed) but drains+frees any
+-- recycled pending pages to the FSM, establishing the baseline footprint.
+INSERT INTO docs SELECT g, 'churn token ' || (g % 37) FROM generate_series(1, 1000) g;
+SELECT bm25_seal('docs_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT pg_temp.wait_for_xmin_horizon();
+ wait_for_xmin_horizon 
+-----------------------
+ 
+(1 row)
+
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+VACUUM docs;
+SELECT bm25_debug_npages('docs_bm25') AS pages_c1 \gset
+-- Cycle 2: roughly-constant live corpus. Delete cycle 1's batch (its segment pages
+-- are now tombstoned, not reclaimed — that's Phase 4), insert a same-size new batch,
+-- seal, vacuum. The new batch's pending pages reuse FSM-freed pages via the
+-- GetFreeIndexPage-first allocator rather than extending the relation.
+DELETE FROM docs WHERE id <= 1000;
+INSERT INTO docs SELECT g, 'churn token ' || (g % 37) FROM generate_series(1001, 2000) g;
+SELECT bm25_seal('docs_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT pg_temp.wait_for_xmin_horizon();
+ wait_for_xmin_horizon 
+-----------------------
+ 
+(1 row)
+
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+VACUUM docs;
+-- Cycle 3: same constant-corpus churn again.
+DELETE FROM docs WHERE id <= 2000;
+INSERT INTO docs SELECT g, 'churn token ' || (g % 37) FROM generate_series(2001, 3000) g;
+SELECT bm25_seal('docs_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT pg_temp.wait_for_xmin_horizon();
+ wait_for_xmin_horizon 
+-----------------------
+ 
+(1 row)
+
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+VACUUM docs;
+SELECT bm25_debug_npages('docs_bm25') AS pages_c3 \gset
+-- Bounded growth: 3 constant-corpus cycles must stay well under 3x the first cycle's
+-- footprint. The growth that remains is accumulated (tombstoned-but-not-yet-merged)
+-- segment pages; reuse of freed pending/orphan pages keeps it bounded. An extend-only
+-- allocator (no GetFreeIndexPage reuse) grows markedly faster on the same workload.
+SELECT (:pages_c3::float8 / GREATEST(:pages_c1, 1)) < 3.0 AS bounded;
+ bounded 
+---------
+ t
+(1 row)
+
+-- Correctness after churn: exactly the 1000 live docs of the final batch match, and
+-- none of the deleted-batch docs leak back in (reused pages carry no stale postings).
+SELECT count(*) = 1000 AS live_ok FROM docs WHERE body @@@ 'churn';
+ live_ok 
+---------
+ t
+(1 row)
+
+DROP TABLE docs;
+-- v4 field-config survival: the per-index BM25_PAGE_FIELDCFG chain rooted at
+-- meta->field_config_blkno is reachable ONLY from the metapage (not from any
+-- segment header or the pending/segcat/retired chains). bm25_reclaim_orphans must
+-- mark it reachable, else the first VACUUM frees it and the analyzer fingerprint /
+-- field config is lost. Assert the fingerprint is stable and non-zero across VACUUM.
+CREATE TABLE fcfg(id int primary key, body text) WITH (autovacuum_enabled=off);
+INSERT INTO fcfg SELECT g, 'negligent defendant storage ' || (g % 11) FROM generate_series(1, 2000) g;
+CREATE INDEX fcfg_bm25 ON fcfg USING bm25_native (body);
+SELECT bm25_debug_analyzer_fingerprint('fcfg_bm25') AS fp_before \gset
+-- Churn + repeated reclaim cycles: the field-config page must survive every sweep.
+DELETE FROM fcfg WHERE id <= 1000;
+-- Without the wait the sweeps below can reclaim nothing and fp_survived passes
+-- vacuously; see the wait_for_xmin_horizon definition above.
+SELECT pg_temp.wait_for_xmin_horizon();
+ wait_for_xmin_horizon 
+-----------------------
+ 
+(1 row)
+
+INSERT INTO fcfg SELECT g, 'negligent extra ' || (g % 7) FROM generate_series(2001, 3000) g;
+SELECT bm25_seal('fcfg_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+VACUUM fcfg;
+SELECT bm25_seal('fcfg_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+VACUUM fcfg;
+-- Fingerprint unchanged and non-zero => field-config page was not reclaimed.
+SELECT bm25_debug_analyzer_fingerprint('fcfg_bm25') = :'fp_before' AS fp_survived;
+ fp_survived 
+-------------
+ t
+(1 row)
+
+SELECT bm25_debug_analyzer_fingerprint('fcfg_bm25') <> 0 AS fp_nonzero;
+ fp_nonzero 
+------------
+ t
+(1 row)
+
+-- Scans still work (the gate reads the surviving fingerprint, no mismatch ERROR).
+SELECT count(*) > 0 AS still_matches FROM fcfg WHERE body @@@ 'negligent';
+ still_matches 
+---------------
+ t
+(1 row)
+
+DROP TABLE fcfg;
+-- Crashed-seal orphans (issue #226). bm25_debug_seal_unpublished runs a seal's build
+-- phase and stops before the publish record, leaving what a crash between build and
+-- publish leaves: segment pages that are written and WAL-logged but linked from
+-- nothing. The crash suites (t/004_crash_orphan and its siblings) take this state
+-- through recovery; this pins what the probe itself does and does not touch, and that
+-- the sweep reclaims what it leaves.
+CREATE TABLE orph(id int primary key, body text) WITH (autovacuum_enabled=off);
+CREATE INDEX orph_bm25 ON orph USING bm25_native (body);
+-- An empty pending list builds nothing.
+SELECT bm25_debug_seal_unpublished('orph_bm25') IS NULL AS nothing_built;
+ nothing_built 
+---------------
+ t
+(1 row)
+
+INSERT INTO orph SELECT g, 'orphan probe ' || (g % 13) FROM generate_series(1, 500) g;
+SELECT bm25_debug_seal_unpublished('orph_bm25') AS orphan_blk \gset
+-- The orphan is a segment header (BM25_PAGE_SEGCAT = 4) that nothing published: the
+-- catalog and the pending list are as they were, and every document matches once.
+SELECT bm25_debug_page_flags('orph_bm25', :orphan_blk) AS orphan_flags;
+ orphan_flags 
+--------------
+            4
+(1 row)
+
+SELECT nsegs, pending_ndocs FROM bm25_stats('orph_bm25');
+ nsegs | pending_ndocs 
+-------+---------------
+     0 |           500
+(1 row)
+
+SET enable_seqscan = off;
+SELECT count(*) AS matches FROM orph WHERE body @@@ 'orphan';
+ matches 
+---------
+     500
+(1 row)
+
+RESET enable_seqscan;
+-- A real seal publishes the same documents into pages of its own.
+SELECT bm25_seal('orph_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT nsegs, pending_ndocs FROM bm25_stats('orph_bm25');
+ nsegs | pending_ndocs 
+-------+---------------
+     1 |             0
+(1 row)
+
+-- VACUUM's sweep finds the orphan unreachable and stamps it DELETED (512).
+VACUUM orph;
+SELECT (bm25_debug_page_flags('orph_bm25', :orphan_blk) & 512) <> 0 AS orphan_reclaimed;
+ orphan_reclaimed 
+------------------
+ t
+(1 row)
+
+SET enable_seqscan = off;
+SELECT count(*) AS matches_after_vacuum FROM orph WHERE body @@@ 'orphan';
+ matches_after_vacuum 
+----------------------
+                  500
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE orph;
+DROP EXTENSION bm25_native;

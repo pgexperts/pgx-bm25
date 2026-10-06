@@ -1,0 +1,1114 @@
+-- 139_seg_walk -- BM25SegWalk, the validated page reader every sealed-chain walk reads
+-- through (issue #303), and the order invariants that end a cycle in each chain family.
+--
+-- Every case forges one link or field on a real page and asserts the SQLSTATE the
+-- walker raises. Post-fix every one is XX002 (ERRCODE_INDEX_CORRUPTED). Before the fix
+-- the same corruption gave 40001 (a link to block 0 read the metapage and failed the
+-- gen check as a "concurrent reclaim", which the ranking build retried three times), a
+-- spin until statement_timeout (57014), or no error and a wrong answer. Each section
+-- names what it gave pre-fix.
+--
+-- Pages are found by walking the real chains with the raw lever: bm25_debug_poke_page
+-- returns the bytes it replaced, so poking a value and poking the returned bytes back
+-- reads a field without changing it (pg_temp.peek). Offsets come from bm25_debug_layout,
+-- and multi-byte values are encoded in the host's byte order, which is read off the
+-- metapage first (pg_temp.le).
+CREATE EXTENSION bm25_native;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- SQLSTATE beside the message. Numbers are stripped: block numbers and page counts
+-- depend on the page layout, not on the check under test.
+CREATE FUNCTION pg_temp.err_of(q text) RETURNS text AS $$
+BEGIN
+    EXECUTE q;
+    RETURN 'NO ERROR RAISED';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' ' || regexp_replace(SQLERRM, '\m\d+\M', 'N', 'g');
+END; $$ LANGUAGE plpgsql;
+CREATE FUNCTION pg_temp.lay(s text, f text) RETURNS int AS $$
+    SELECT off FROM bm25_debug_layout() WHERE struct = s AND field = f;
+$$ LANGUAGE sql;
+CREATE FUNCTION pg_temp.size(s text) RETURNS int AS $$
+    SELECT size FROM bm25_debug_layout() WHERE struct = s AND field = '*';
+$$ LANGUAGE sql;
+CREATE FUNCTION pg_temp.special(f text) RETURNS int AS $$
+    SELECT pg_temp.lay('page', 'special') + pg_temp.lay('BM25PageOpaque', f);
+$$ LANGUAGE sql;
+CREATE FUNCTION pg_temp.contents(s text, f text) RETURNS int AS $$
+    SELECT pg_temp.lay('page', 'contents') + pg_temp.lay(s, f);
+$$ LANGUAGE sql;
+-- Read len bytes at (blk, off) without changing them: poke, then poke the old bytes back.
+CREATE FUNCTION pg_temp.peek(idx regclass, blk bigint, off int, len int) RETURNS bytea AS $$
+DECLARE old bytea;
+BEGIN
+    old := bm25_debug_poke_page(idx, blk, off, decode(repeat('ff', len), 'hex'));
+    PERFORM bm25_debug_poke_page(idx, blk, off, old);
+    RETURN old;
+END; $$ LANGUAGE plpgsql;
+-- Host byte order, from the metapage's opaque flags (BM25_PAGE_META, low byte nonzero).
+CREATE TABLE bo (id int PRIMARY KEY, body text);
+INSERT INTO bo VALUES (1, 'alpha');
+CREATE INDEX bo_bm ON bo USING bm25_native (body);
+CREATE TEMP TABLE host AS
+SELECT get_byte(pg_temp.peek('bo_bm', 0, pg_temp.special('flags'), 2), 0)
+         = (bm25_debug_page_flags('bo_bm', 0) & 255) AS le;
+DROP TABLE bo;
+CREATE FUNCTION pg_temp.u32(b bytea) RETURNS bigint AS $$
+    SELECT CASE WHEN (SELECT le FROM host)
+        THEN get_byte(b, 0)::bigint + (get_byte(b, 1)::bigint << 8) +
+             (get_byte(b, 2)::bigint << 16) + (get_byte(b, 3)::bigint << 24)
+        ELSE get_byte(b, 3)::bigint + (get_byte(b, 2)::bigint << 8) +
+             (get_byte(b, 1)::bigint << 16) + (get_byte(b, 0)::bigint << 24) END;
+$$ LANGUAGE sql;
+CREATE FUNCTION pg_temp.b32(v bigint) RETURNS bytea AS $$
+    SELECT CASE WHEN (SELECT le FROM host)
+        THEN set_byte(set_byte(set_byte(set_byte('\x00000000'::bytea,
+                 0, (v & 255)::int), 1, ((v >> 8) & 255)::int),
+                 2, ((v >> 16) & 255)::int), 3, ((v >> 24) & 255)::int)
+        ELSE set_byte(set_byte(set_byte(set_byte('\x00000000'::bytea,
+                 3, (v & 255)::int), 2, ((v >> 8) & 255)::int),
+                 1, ((v >> 16) & 255)::int), 0, ((v >> 24) & 255)::int) END;
+$$ LANGUAGE sql;
+CREATE FUNCTION pg_temp.b16(v int) RETURNS bytea AS $$
+    SELECT CASE WHEN (SELECT le FROM host)
+        THEN set_byte(set_byte('\x0000'::bytea, 0, v & 255), 1, (v >> 8) & 255)
+        ELSE set_byte(set_byte('\x0000'::bytea, 1, v & 255), 0, (v >> 8) & 255) END;
+$$ LANGUAGE sql;
+CREATE FUNCTION pg_temp.u16(b bytea) RETURNS int AS $$
+    SELECT CASE WHEN (SELECT le FROM host)
+        THEN get_byte(b, 0) + (get_byte(b, 1) << 8)
+        ELSE get_byte(b, 1) + (get_byte(b, 0) << 8) END;
+$$ LANGUAGE sql;
+-- A page's nextblk, and forging it (returns the old link).
+CREATE FUNCTION pg_temp.next_of(idx regclass, blk bigint) RETURNS bigint AS $$
+    SELECT pg_temp.u32(pg_temp.peek(idx, blk, pg_temp.special('nextblk'), 4));
+$$ LANGUAGE sql;
+CREATE FUNCTION pg_temp.set_next(idx regclass, blk bigint, nxt bigint) RETURNS bigint AS $$
+    SELECT pg_temp.u32(bm25_debug_poke_page(idx, blk, pg_temp.special('nextblk'),
+                                            pg_temp.b32(nxt)));
+$$ LANGUAGE sql;
+-- Segment n's header block, and a root field of its header.
+CREATE FUNCTION pg_temp.seg_hdr(idx regclass, n int) RETURNS bigint AS $$
+    SELECT pg_temp.u32(substring(bm25_debug_segcat_entry_bytes(idx, n)
+                                 FROM pg_temp.lay('BM25SegCatEntry', 'header_blkno') + 1
+                                 FOR 4));
+$$ LANGUAGE sql;
+CREATE FUNCTION pg_temp.seg_root(idx regclass, n int, f text) RETURNS bigint AS $$
+    SELECT pg_temp.u32(pg_temp.peek(idx, pg_temp.seg_hdr(idx, n),
+                                    pg_temp.contents('BM25SegmentHeader', f), 4));
+$$ LANGUAGE sql;
+-- The blocks of a chain, root first.
+CREATE FUNCTION pg_temp.chain(idx regclass, root bigint) RETURNS bigint[] AS $$
+DECLARE b bigint := root; out bigint[] := '{}';
+BEGIN
+    WHILE b <> 4294967295 AND cardinality(out) < 1000 LOOP
+        out := out || b;
+        b := pg_temp.next_of(idx, b);
+    END LOOP;
+    RETURN out;
+END; $$ LANGUAGE plpgsql;
+-- The fixture, rebuilt per case because every case leaves its index corrupt: 5000
+-- keyed documents, one segment. 'common' is in every document and sorts first, so its
+-- postings and position frames start on the first POST and POS pages and cross onto
+-- the next; the norms, doc-map and keymap chains span three, four and three pages.
+CREATE TABLE src AS
+SELECT g AS id, 'common w' || g || repeat(' pad', g % 7) || ' zeta eta theta' AS body
+  FROM generate_series(1, 5000) g;
+CREATE FUNCTION pg_temp.mk(t text) RETURNS void AS $$
+BEGIN
+    EXECUTE format('DROP TABLE IF EXISTS %I', t);
+    EXECUTE format('CREATE TABLE %I (id int PRIMARY KEY, body text)', t);
+    EXECUTE format('INSERT INTO %I SELECT * FROM src', t);
+    EXECUTE format('CREATE INDEX %I ON %I USING bm25_native (body) INCLUDE (id) '
+                   'WITH (key_field = ''id'')', t || '_bm', t);
+END; $$ LANGUAGE plpgsql;
+-- Controls on a healthy copy: every reader the cases aim at answers in full, and the
+-- chains are as long as the cases need.
+SELECT pg_temp.mk('ok');
+NOTICE:  table "ok" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT count(*) AS members FROM ok WHERE body @@@ 'common';
+ members 
+---------
+    5000
+(1 row)
+
+SELECT count(*) AS phrase FROM ok WHERE body @@@ '"common w4999"';
+ phrase 
+--------
+      1
+(1 row)
+
+SELECT count(*) AS keys FROM bm25_debug_seg_keymap('ok_bm', 0);
+ keys 
+------
+ 5000
+(1 row)
+
+SET bm25_native.wand_top_k = 0;
+SELECT count(*) AS ranked FROM
+  (SELECT id FROM ok WHERE body @@@ 'common' ORDER BY body &@@ 'common' LIMIT 3) s;
+ ranked 
+--------
+      3
+(1 row)
+
+RESET bm25_native.wand_top_k;
+SELECT c AS chain, cardinality(pg_temp.chain('ok_bm', pg_temp.seg_root('ok_bm', 0, c))) >= 3
+       AS three_or_more_pages
+  FROM unnest(ARRAY['dict_root', 'posts_root', 'norms_root', 'docmap_root', 'keymap_root',
+                    'pos_root']) c;
+    chain    | three_or_more_pages 
+-------------+---------------------
+ dict_root   | t
+ posts_root  | t
+ norms_root  | t
+ docmap_root | t
+ keymap_root | t
+ pos_root    | t
+(6 rows)
+
+-- The peek leaves the pages as they were.
+SELECT count(*) AS members_after_peeks FROM ok WHERE body @@@ 'common';
+ members_after_peeks 
+---------------------
+                5000
+(1 row)
+
+-- ===================================================== 1. a link to block 0 (303.B)
+-- The metapage is inside every extent, so before the fix a mid-chain link to block 0
+-- passed the extent bound, read the metapage, and failed the gen check: 40001 on the
+-- @@@ path and the keymap/phrase readers, and 40001 after three retries on a ranked
+-- query. Every one is now XX002 from the extent helper, before ReadBuffer.
+SELECT pg_temp.mk('z1');
+NOTICE:  table "z1" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT bm25_debug_stamp_chain_next('z1_bm', 'post', 0, 0, 0) > 0 AS stamped;
+ stamped 
+---------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM z1 WHERE body @@@ 'common'$q$) AS post;
+                             post                              
+---------------------------------------------------------------
+ XX002 bm25: segment POST chain links to block N, the metapage
+(1 row)
+
+SELECT pg_temp.mk('z2');
+NOTICE:  table "z2" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT bm25_debug_stamp_chain_next('z2_bm', 'docmap', 0, 0, 0) > 0 AS stamped;
+ stamped 
+---------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM z2 WHERE body @@@ 'common'$q$) AS docmap;
+                          docmap                          
+----------------------------------------------------------
+ XX002 bm25: segment chain links to block N, the metapage
+(1 row)
+
+SELECT pg_temp.mk('z3');
+NOTICE:  table "z3" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT bm25_debug_stamp_chain_next('z3_bm', 'norms', 0, 0, 0) > 0 AS stamped;
+ stamped 
+---------
+ t
+(1 row)
+
+SET bm25_native.wand_top_k = 0;
+SELECT pg_temp.err_of($q$SELECT id FROM z3 WHERE body @@@ 'common'
+                          ORDER BY body &@@ 'common' LIMIT 3$q$) AS norms;
+                          norms                           
+----------------------------------------------------------
+ XX002 bm25: segment chain links to block N, the metapage
+(1 row)
+
+RESET bm25_native.wand_top_k;
+SELECT pg_temp.mk('z4');
+NOTICE:  table "z4" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT bm25_debug_stamp_chain_next('z4_bm', 'keymap', 0, 0, 0) > 0 AS stamped;
+ stamped 
+---------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_seg_keymap('z4_bm', 0)$q$)
+       AS keymap;
+                             keymap                              
+-----------------------------------------------------------------
+ XX002 bm25: segment KEYMAP chain links to block N, the metapage
+(1 row)
+
+-- POS has no stamp lever; the raw poke forges the root page's link.
+SELECT pg_temp.mk('z5');
+NOTICE:  table "z5" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT pg_temp.set_next('z5_bm', pg_temp.seg_root('z5_bm', 0, 'pos_root'), 0)
+       = (pg_temp.chain('ok_bm', pg_temp.seg_root('ok_bm', 0, 'pos_root')))[2] AS was_page_two;
+ was_page_two 
+--------------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM z5 WHERE body @@@ '"common w4999"'$q$)
+       AS positions;
+                         positions                         
+-----------------------------------------------------------
+ XX002 bm25: position chain links to block N, the metapage
+(1 row)
+
+-- A keymap_root of 0. bm25_seg_keymeta read it with no block check at all; a ranked
+-- query on a keyed index reads it at scan start, and raised 40001 after three retries.
+-- The header decode (bm25_segheader_validate, #302) now refuses it before the walker
+-- reads the root; the walker's own block-0 check stays behind it as defense in depth.
+SELECT pg_temp.mk('z6');
+NOTICE:  table "z6" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT pg_temp.u32(bm25_debug_poke_page('z6_bm', pg_temp.seg_hdr('z6_bm', 0),
+           pg_temp.contents('BM25SegmentHeader', 'keymap_root'), pg_temp.b32(0)))
+       = pg_temp.seg_root('ok_bm', 0, 'keymap_root') AS was_keymap_root;
+ was_keymap_root 
+-----------------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT id FROM z6 WHERE body @@@ 'common'
+                          ORDER BY body &@@ 'common' LIMIT 3$q$) AS ranked_keymeta;
+                                   ranked_keymeta                                   
+------------------------------------------------------------------------------------
+ XX002 bm25: segment header at block N names the metapage as its key-map chain root
+(1 row)
+
+-- ===================================================== 2. dense chains: cycles
+-- A self-loop, and a link back to the chain's root. Each page is full, so the full-span
+-- rule (ADR 0111) passes them, and before the fix the walk answered from the wrong page
+-- within its offset budget: wrong doclens, so silently wrong scores (no error). Now the
+-- revisit test sees the link to the page just read, or to the walk's first page.
+SELECT pg_temp.mk('c1');
+NOTICE:  table "c1" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT bm25_debug_stamp_chain_next('c1_bm', 'norms', 0, 1,
+         bm25_debug_stamp_chain_next('c1_bm', 'norms', 0, 1, 4294967295)) > 0 AS stamped;
+ stamped 
+---------
+ t
+(1 row)
+
+SET bm25_native.wand_top_k = 0;
+SELECT pg_temp.err_of($q$SELECT id FROM c1 WHERE body @@@ 'common'
+                          ORDER BY body &@@ 'common' LIMIT 3$q$) AS norms_self_loop;
+              norms_self_loop               
+--------------------------------------------
+ XX002 bm25: segment chain revisits block N
+(1 row)
+
+RESET bm25_native.wand_top_k;
+SELECT pg_temp.mk('c2');
+NOTICE:  table "c2" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT bm25_debug_stamp_chain_next('c2_bm', 'docmap', 0, 2,
+         pg_temp.seg_root('c2_bm', 0, 'docmap_root')) > 0 AS stamped;
+ stamped 
+---------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM c2 WHERE body @@@ 'common'$q$)
+       AS docmap_to_root;
+               docmap_to_root               
+--------------------------------------------
+ XX002 bm25: segment chain revisits block N
+(1 row)
+
+-- KEYMAP: the same self-loop on a full page, which answered other documents' keys...
+SELECT pg_temp.mk('c3');
+NOTICE:  table "c3" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT bm25_debug_stamp_chain_next('c3_bm', 'keymap', 0, 1,
+         bm25_debug_stamp_chain_next('c3_bm', 'keymap', 0, 1, 4294967295)) > 0 AS stamped;
+ stamped 
+---------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_seg_keymap('c3_bm', 0)$q$)
+       AS keymap_self_loop;
+                 keymap_self_loop                  
+---------------------------------------------------
+ XX002 bm25: segment KEYMAP chain revisits block N
+(1 row)
+
+-- ...and a two-page cycle through pages that hold no keys (303.A d), which never
+-- advanced the walk's byte count and spun until cancelled (57014 here). It does not
+-- pass through the walk's first page, so the revisit test does not see it; the KEYMAP
+-- full-span rule does, at the first empty page walked past.
+SELECT pg_temp.mk('c4');
+NOTICE:  table "c4" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT bm25_debug_stamp_chain_lower('c4_bm', 'keymap', 0, 1, 0) > 0 AS lowered_1;
+ lowered_1 
+-----------
+ t
+(1 row)
+
+SELECT bm25_debug_stamp_chain_lower('c4_bm', 'keymap', 0, 2, 0) > 0 AS lowered_2;
+ lowered_2 
+-----------
+ t
+(1 row)
+
+SELECT bm25_debug_stamp_chain_next('c4_bm', 'keymap', 0, 2,
+         (pg_temp.chain('c4_bm', pg_temp.seg_root('c4_bm', 0, 'keymap_root')))[2]) > 0
+       AS stamped;
+ stamped 
+---------
+ t
+(1 row)
+
+SET statement_timeout = '3s';
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_seg_keymap('c4_bm', 0)$q$)
+       AS keymap_empty_cycle;
+                                          keymap_empty_cycle                                           
+-------------------------------------------------------------------------------------------------------
+ XX002 bm25: keymap chain page at block N holds N key bytes, not the N every page but the last carries
+(1 row)
+
+RESET statement_timeout;
+-- The KEYMAP full span, positively: a healthy multi-page keymap reads back whole, from
+-- the root and through a cursor that resumes on later pages.
+SELECT count(*) AS keys, count(DISTINCT key_int4) AS distinct_keys,
+       min(key_int4) AS lo, max(key_int4) AS hi
+  FROM bm25_debug_seg_keymap('ok_bm', 0);
+ keys | distinct_keys | lo |  hi  
+------+---------------+----+------
+ 5000 |          5000 |  1 | 5000
+(1 row)
+
+-- ===================================================== 3. DICT chains (303.A a, e)
+-- The dictionary is sorted across its pages, every page holds an entry, and the chain
+-- holds the header's nterms entries; those rules are what end a cycle here. Before
+-- them the DICT walkers bounded only the extent, so an in-extent cycle spun until
+-- cancelled: the lookup and the wildcard expander for a term sorting after every entry
+-- on the cycle, and the three dumps always. 'zzzz' sorts after every term.
+CREATE FUNCTION pg_temp.dict(idx regclass) RETURNS bigint[] AS $$
+    SELECT pg_temp.chain(idx, pg_temp.seg_root(idx, 0, 'dict_root'));
+$$ LANGUAGE sql;
+SELECT cardinality(pg_temp.dict('ok_bm')) >= 10 AS ten_or_more_dict_pages;
+ ten_or_more_dict_pages 
+------------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM bm25_debug_segterms('ok_bm')) = nterms AS dump_counts_nterms
+  FROM bm25_debug_segcat('ok_bm');
+ dump_counts_nterms 
+--------------------
+ t
+(1 row)
+
+-- The last page links back to the one before it. Not the walk's first page and not the
+-- page just read, so the walker's revisit test passes it; the cross-page order stops it.
+SELECT pg_temp.mk('d1');
+NOTICE:  table "d1" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT pg_temp.set_next('d1_bm', d[cardinality(d)], d[cardinality(d) - 1]) = 4294967295
+       AS was_chain_end
+  FROM pg_temp.dict('d1_bm') d;
+ was_chain_end 
+---------------
+ t
+(1 row)
+
+SET statement_timeout = '3s';
+SELECT pg_temp.err_of($q$SELECT count(*) FROM d1 WHERE body @@@ 'zzzz'$q$) AS lookup;
+                                           lookup                                            
+---------------------------------------------------------------------------------------------
+ XX002 bm25: segment DICT page at block N does not start after the previous page's last term
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM d1
+                          WHERE body @@@ bm25_wildcard('body', 'zzzz*')$q$) AS wildcard;
+                                          wildcard                                           
+---------------------------------------------------------------------------------------------
+ XX002 bm25: segment DICT page at block N does not start after the previous page's last term
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT id FROM d1 WHERE body @@@ 'zzzz'
+                          ORDER BY body &@@ 'zzzz' LIMIT 3$q$) AS ranked;
+                                           ranked                                            
+---------------------------------------------------------------------------------------------
+ XX002 bm25: segment DICT page at block N does not start after the previous page's last term
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_terms('d1_bm')$q$) AS dump_terms;
+                                         dump_terms                                          
+---------------------------------------------------------------------------------------------
+ XX002 bm25: segment DICT page at block N does not start after the previous page's last term
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_postings('d1_bm')$q$)
+       AS dump_postings;
+                                        dump_postings                                        
+---------------------------------------------------------------------------------------------
+ XX002 bm25: segment DICT page at block N does not start after the previous page's last term
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_segterms('d1_bm')$q$)
+       AS dump_segterms;
+                                        dump_segterms                                        
+---------------------------------------------------------------------------------------------
+ XX002 bm25: segment DICT page at block N does not start after the previous page's last term
+(1 row)
+
+RESET statement_timeout;
+-- A one-page self-loop: the walker's revisit test.
+SELECT pg_temp.mk('d2');
+NOTICE:  table "d2" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT pg_temp.set_next('d2_bm', d[cardinality(d)], d[cardinality(d)]) = 4294967295
+       AS was_chain_end
+  FROM pg_temp.dict('d2_bm') d;
+ was_chain_end 
+---------------
+ t
+(1 row)
+
+SET statement_timeout = '3s';
+SELECT pg_temp.err_of($q$SELECT count(*) FROM d2 WHERE body @@@ 'zzzz'$q$) AS lookup;
+                     lookup                      
+-------------------------------------------------
+ XX002 bm25: segment DICT chain revisits block N
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_segterms('d2_bm')$q$)
+       AS dump_segterms;
+                  dump_segterms                  
+-------------------------------------------------
+ XX002 bm25: segment DICT chain revisits block N
+(1 row)
+
+RESET statement_timeout;
+-- An unsorted page boundary, a wrong answer rather than a spin: page 6's first term is
+-- forged to a same-length string of 'a's, which sorts before page 5's last term. The
+-- lookup for the original term passed it on page 6 and stopped at the next entry,
+-- which sorts after: the term was reported absent and its row dropped, with no error.
+SELECT pg_temp.mk('d3');
+NOTICE:  table "d3" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+CREATE TEMP TABLE d3_first AS
+SELECT d[6] AS blk,
+       pg_temp.u16(pg_temp.peek('d3_bm', d[6], pg_temp.contents('BM25DictEntry', 'termlen'),
+                                2)) AS termlen
+  FROM pg_temp.dict('d3_bm') d;
+CREATE TEMP TABLE d3_term AS
+SELECT convert_from(pg_temp.peek('d3_bm', blk,
+           pg_temp.lay('page', 'contents') + pg_temp.size('BM25DictEntry'), termlen),
+           'UTF8') AS term
+  FROM d3_first;
+SELECT count(*) AS present_before FROM d3, d3_term WHERE d3.body @@@ d3_term.term;
+ present_before 
+----------------
+              1
+(1 row)
+
+SELECT convert_from(bm25_debug_poke_page('d3_bm', blk,
+           pg_temp.lay('page', 'contents') + pg_temp.size('BM25DictEntry'),
+           convert_to(repeat('a', termlen), 'UTF8')), 'UTF8') = (SELECT term FROM d3_term)
+       AS forged_first_term
+  FROM d3_first;
+ forged_first_term 
+-------------------
+ t
+(1 row)
+
+SELECT pg_temp.err_of(format($q$SELECT count(*) FROM d3 WHERE body @@@ %L$q$,
+                             (SELECT term FROM d3_term))) AS lookup_after;
+                                        lookup_after                                         
+---------------------------------------------------------------------------------------------
+ XX002 bm25: segment DICT page at block N does not start after the previous page's last term
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_segterms('d3_bm')$q$)
+       AS dump_segterms;
+                                        dump_segterms                                        
+---------------------------------------------------------------------------------------------
+ XX002 bm25: segment DICT page at block N does not start after the previous page's last term
+(1 row)
+
+-- A link to block 0 on a DICT page: 40001 before, from the gen check on the metapage.
+SELECT pg_temp.mk('d4');
+NOTICE:  table "d4" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT pg_temp.set_next('d4_bm', d[5], 0) = d[6] AS was_page_six
+  FROM pg_temp.dict('d4_bm') d;
+ was_page_six 
+--------------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM d4 WHERE body @@@ 'zzzz'$q$) AS lookup;
+                            lookup                             
+---------------------------------------------------------------
+ XX002 bm25: segment DICT chain links to block N, the metapage
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM d4
+                          WHERE body @@@ bm25_wildcard('body', 'zzzz*')$q$) AS wildcard;
+                           wildcard                            
+---------------------------------------------------------------
+ XX002 bm25: segment DICT chain links to block N, the metapage
+(1 row)
+
+-- A cycle through two pages emptied of entries (pd_lower back to the page header). The
+-- order rule has nothing to compare on an empty page, so before the empty-page rule
+-- this ran to the walker's cap; before the walker, it spun.
+-- The lever refuses a pd_lower lowered over live bytes (Generic WAL would zero them),
+-- so each page is emptied in three pokes, returning its old pd_lower: raise pd_lower to
+-- pd_special, which a page with no line pointers has as pd_upper, so there is no hole
+-- and the old value comes back; zero the entries, [contents, old pd_lower); then lower
+-- pd_lower to contents over what is now an all-zero hole.
+CREATE FUNCTION pg_temp.empty_page(idx regclass, blk bigint) RETURNS int AS $$
+DECLARE
+    lower_off int := pg_temp.lay('PageHeaderData', 'pd_lower');
+    contents  int := pg_temp.lay('page', 'contents');
+    old_lower int;
+BEGIN
+    old_lower := pg_temp.u16(bm25_debug_poke_page(idx, blk, lower_off,
+                                                  pg_temp.b16(pg_temp.lay('page', 'special'))));
+    IF old_lower > contents THEN
+        PERFORM bm25_debug_poke_page(idx, blk, contents,
+                                     decode(repeat('00', old_lower - contents), 'hex'));
+    END IF;
+    PERFORM bm25_debug_poke_page(idx, blk, lower_off, pg_temp.b16(contents));
+    RETURN old_lower;
+END; $$ LANGUAGE plpgsql;
+SELECT pg_temp.mk('d5');
+NOTICE:  table "d5" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT pg_temp.empty_page('d5_bm', d[i]) > pg_temp.lay('page', 'contents') AS emptied
+  FROM pg_temp.dict('d5_bm') d, generate_series(5, 6) i;
+ emptied 
+---------
+ t
+ t
+(2 rows)
+
+SELECT pg_temp.set_next('d5_bm', d[6], d[5]) = d[7] AS was_page_seven
+  FROM pg_temp.dict('d5_bm') d;
+ was_page_seven 
+----------------
+ t
+(1 row)
+
+SET statement_timeout = '3s';
+SELECT pg_temp.err_of($q$SELECT count(*) FROM d5 WHERE body @@@ 'zzzz'$q$) AS lookup;
+                          lookup                           
+-----------------------------------------------------------
+ XX002 bm25: segment DICT page at block N holds no entries
+(1 row)
+
+RESET statement_timeout;
+-- The merge feed over a DICT cycle (T4). Positions off, so the merge reads only the
+-- dictionary and the postings: with positions the POS replay of the re-fed terms raised
+-- a desync error first, which named the wrong chain. Four same-size segments, which the
+-- merge picks up together. Before the fix the feed re-read the cycle's terms until
+-- cancelled; now it stops at the cycle, and nothing is published.
+CREATE TABLE d6 (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+CREATE INDEX d6_bm ON d6 USING bm25_native (body) WITH (store_positions_body = false);
+CREATE FUNCTION pg_temp.four_segments(t text) RETURNS void AS $$
+DECLARE i int;
+BEGIN
+    FOR i IN 0..3 LOOP
+        EXECUTE format('INSERT INTO %I SELECT * FROM src WHERE id > %s AND id <= %s',
+                       t, i * 1250, (i + 1) * 1250);
+        PERFORM bm25_seal((t || '_bm')::regclass);
+    END LOOP;
+END; $$ LANGUAGE plpgsql;
+SELECT pg_temp.four_segments('d6');
+ four_segments 
+---------------
+ 
+(1 row)
+
+SELECT count(*) AS segments_before FROM bm25_debug_segcat('d6_bm');
+ segments_before 
+-----------------
+               4
+(1 row)
+
+SELECT cardinality(d) >= 3 AS three_or_more_dict_pages FROM pg_temp.dict('d6_bm') d;
+ three_or_more_dict_pages 
+--------------------------
+ t
+(1 row)
+
+SELECT pg_temp.set_next('d6_bm', d[cardinality(d)], d[cardinality(d) - 1]) = 4294967295
+       AS was_chain_end
+  FROM pg_temp.dict('d6_bm') d;
+ was_chain_end 
+---------------
+ t
+(1 row)
+
+SET statement_timeout = '3s';
+SELECT pg_temp.err_of($q$SELECT bm25_merge('d6_bm')$q$) AS merge;
+                                            merge                                            
+---------------------------------------------------------------------------------------------
+ XX002 bm25: segment DICT page at block N does not start after the previous page's last term
+(1 row)
+
+RESET statement_timeout;
+SELECT count(*) AS segments_after FROM bm25_debug_segcat('d6_bm');
+ segments_after 
+----------------
+              4
+(1 row)
+
+-- The count, on healthy chains: the same merge without the forged link reads every
+-- input's dictionary to its nterms, and the merged segment's chain holds its own.
+CREATE TABLE d7 (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+CREATE INDEX d7_bm ON d7 USING bm25_native (body) WITH (store_positions_body = false);
+SELECT pg_temp.four_segments('d7');
+ four_segments 
+---------------
+ 
+(1 row)
+
+SELECT bm25_merge('d7_bm');
+ bm25_merge 
+------------
+ 
+(1 row)
+
+SELECT count(*) AS segments, sum(ndocs) AS docs,
+       (SELECT count(*) FROM bm25_debug_segterms('d7_bm')) = min(nterms) AS counts_nterms
+  FROM bm25_debug_segcat('d7_bm');
+ segments | docs | counts_nterms 
+----------+------+---------------
+        1 | 5000 | t
+(1 row)
+
+-- ===================================================== 4. POST chains (ADR 0111 residuals)
+-- A term's run is held to df postings (ADR 0111), which bounded a POST walk by its
+-- postings but not by its pages: a cycle through pages holding no blocks spun, and a
+-- link back to a block already decoded re-emitted it. Now every page entered mid-run
+-- must yield a block, and (docid, field) must ascend across blocks.
+CREATE FUNCTION pg_temp.posts(idx regclass) RETURNS bigint[] AS $$
+    SELECT pg_temp.chain(idx, pg_temp.seg_root(idx, 0, 'posts_root'));
+$$ LANGUAGE sql;
+-- 'common' sorts first, so its run starts on the POST chain's first page and continues
+-- onto the second.
+SELECT array_agg(DISTINCT block_no ORDER BY block_no) = (pg_temp.posts('ok_bm'))[1:2]
+       AS common_on_first_two_pages
+  FROM bm25_debug_block_impacts('ok_bm', 'common');
+ common_on_first_two_pages 
+---------------------------
+ t
+(1 row)
+
+-- A cycle through two pages emptied of blocks: the second and third pages, the third
+-- linked back to the second. Driven through the exhaustive readers: the WAND sweep's
+-- header read already refuses an empty page.
+SELECT pg_temp.mk('p1');
+NOTICE:  table "p1" does not exist, skipping
+ mk 
+----
+ 
+(1 row)
+
+SELECT bm25_debug_stamp_chain_lower('p1_bm', 'post', 0, 1, 0) > 0 AS emptied_2;
+ emptied_2 
+-----------
+ t
+(1 row)
+
+SELECT bm25_debug_stamp_chain_lower('p1_bm', 'post', 0, 2, 0) > 0 AS emptied_3;
+ emptied_3 
+-----------
+ t
+(1 row)
+
+SELECT bm25_debug_stamp_chain_next('p1_bm', 'post', 0, 2, (pg_temp.posts('ok_bm'))[2]) > 0
+       AS stamped;
+ stamped 
+---------
+ t
+(1 row)
+
+SET statement_timeout = '3s';
+SELECT pg_temp.err_of($q$SELECT count(*) FROM p1 WHERE body @@@ 'common'$q$) AS members;
+                                         members                                          
+------------------------------------------------------------------------------------------
+ XX002 bm25: postings chain page at block N holds none of the term's remaining N postings
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_seg_postings('p1_bm', 'common')$q$)
+       AS postings;
+                                         postings                                         
+------------------------------------------------------------------------------------------
+ XX002 bm25: postings chain page at block N holds none of the term's remaining N postings
+(1 row)
+
+RESET statement_timeout;
+-- One document, one term, one block: its DICT entry forged to df 2 and its POST page
+-- linked to itself. The docid-only order rule (`first < prev_last`) admitted the same
+-- block twice, so the posting was emitted twice with no error. The walker's revisit
+-- test sees the self-link on the exhaustive path; the header reader's own self-link
+-- check sees it in the WAND sweep.
+CREATE TABLE so (id int PRIMARY KEY, body text);
+INSERT INTO so VALUES (1, 'solo');
+CREATE INDEX so_bm ON so USING bm25_native (body);
+SELECT pg_temp.u32(bm25_debug_poke_page('so_bm', (pg_temp.dict('so_bm'))[1],
+           pg_temp.contents('BM25DictEntry', 'df'), pg_temp.b32(2))) AS old_df;
+ old_df 
+--------
+      1
+(1 row)
+
+SELECT bm25_debug_stamp_chain_next('so_bm', 'post', 0, 0,
+         bm25_debug_stamp_chain_next('so_bm', 'post', 0, 0, 4294967295)) > 0 AS self_linked;
+ self_linked 
+-------------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_seg_postings('so_bm', 'solo')$q$)
+       AS postings;
+                    postings                     
+-------------------------------------------------
+ XX002 bm25: segment POST chain revisits block N
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM (SELECT id FROM so WHERE body @@@ 'solo'
+                          ORDER BY body &@@ 'solo' LIMIT 5) s$q$) AS ranked;
+                           ranked                           
+------------------------------------------------------------
+ XX002 bm25: postings chain page at block N links to itself
+(1 row)
+
+-- ===================================================== 5. WAND: block order
+-- 'even' is in every second document of 600, a run of three blocks on one POST page
+-- (128, 128, 44 postings). The later documents are shorter, so they score higher and a
+-- top-k must decode past the first block.
+CREATE TABLE w7 (id int PRIMARY KEY, body text);
+INSERT INTO w7 SELECT g, CASE WHEN g % 2 = 0 THEN 'even' ELSE 'odd' END ||
+                         CASE WHEN g <= 260 THEN ' filler filler filler' ELSE '' END
+  FROM generate_series(1, 600) g;
+CREATE INDEX w7_bm ON w7 USING bm25_native (body);
+SELECT block_ord, ndocs, first_docid > 127 AND first_docid < 16384 AS two_byte_first
+  FROM bm25_debug_block_spans('w7_bm', 'even') ORDER BY block_ord;
+ block_ord | ndocs | two_byte_first 
+-----------+-------+----------------
+         0 |   128 | f
+         1 |   128 | t
+         2 |    44 | t
+(3 rows)
+
+-- The healthy top 5, and the WAND build behind it, which decodes all three blocks.
+SELECT array_agg(id ORDER BY id) AS top5 FROM
+  (SELECT id FROM w7 WHERE body @@@ 'even' ORDER BY body &@@ 'even' LIMIT 5) s;
+         top5          
+-----------------------
+ {262,264,266,268,270}
+(1 row)
+
+SELECT blocks_examined FROM bm25_wand_stats('w7_bm', 'even', 5);
+ blocks_examined 
+-----------------
+               3
+(1 row)
+
+-- The second block's first docid is forged down below the first block's last, and its
+-- second delta up by the same amount, keeping each varbyte its width: the header and
+-- its last_docid still agree, so only the decoded first posting shows the step back.
+-- Before the fix the WAND cursor decoded it and scored on, with no error.
+CREATE TEMP TABLE w7_at AS
+SELECT d.post_root, d.post_off,
+       pg_temp.lay('page', 'contents') + d.post_off + pg_temp.size('BM25BlockHeader') +
+       pg_temp.u16(pg_temp.peek('w7_bm', d.post_root, pg_temp.lay('page', 'contents') +
+                                d.post_off + pg_temp.lay('BM25BlockHeader', f), 2)) AS x
+  FROM (SELECT pg_temp.u32(pg_temp.peek('w7_bm', (pg_temp.dict('w7_bm'))[1],
+                                        pg_temp.contents('BM25DictEntry', 'post_root'), 4))
+               AS post_root,
+               pg_temp.u16(pg_temp.peek('w7_bm', (pg_temp.dict('w7_bm'))[1],
+                                        pg_temp.contents('BM25DictEntry', 'post_off'), 2))
+               AS post_off) d,
+       unnest(ARRAY['docid_bytes', 'tf_bytes', 'field_rle_bytes', 'impact_bytes']) f;
+CREATE TEMP TABLE w7_blk2 AS
+SELECT post_root, sum(x) - 3 * min(post_off) - 3 * (pg_temp.lay('page', 'contents') +
+           pg_temp.size('BM25BlockHeader')) + pg_temp.size('BM25BlockHeader') AS docids_off
+  FROM w7_at GROUP BY post_root;
+CREATE TEMP TABLE w7_old AS
+SELECT post_root, docids_off, pg_temp.peek('w7_bm', post_root, docids_off::int, 3) AS b
+  FROM w7_blk2;
+-- The old bytes are the second block's first docid (two varbyte bytes) and a one-byte
+-- delta, as the spans above say.
+SELECT (get_byte(b, 0) & 127) + (get_byte(b, 1) << 7)
+         = (SELECT first_docid FROM bm25_debug_block_spans('w7_bm', 'even') WHERE block_ord = 1)
+       AS first_docid_found,
+       get_byte(b, 2) < 128 AS one_byte_delta
+  FROM w7_old;
+ first_docid_found | one_byte_delta 
+-------------------+----------------
+ t                 | t
+(1 row)
+
+CREATE TEMP TABLE w7_new AS
+SELECT post_root, docids_off, b,
+       (SELECT last_docid FROM bm25_debug_block_spans('w7_bm', 'even') WHERE block_ord = 0)
+         - 10 AS f2,
+       (get_byte(b, 0) & 127) + (get_byte(b, 1) << 7) AS f1
+  FROM w7_old;
+SELECT bm25_debug_poke_page('w7_bm', post_root, docids_off::int,
+           set_byte(set_byte(set_byte('\x000000'::bytea,
+               0, ((f2 & 127) | 128)::int), 1, (f2 >> 7)::int),
+               2, (get_byte(b, 2) + f1 - f2)::int)) = b AS forged
+  FROM w7_new;
+ forged 
+--------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_cursor_scan('w7_bm', 'even')$q$)
+       AS cursor_next;
+                                                cursor_next                                                 
+------------------------------------------------------------------------------------------------------------
+ XX002 bm25: posting block starts at docid N field N, not after the previous block's last posting (docid N)
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT * FROM bm25_debug_cursor_skip('w7_bm', 'even', 300)$q$)
+       AS cursor_skip;
+                                                cursor_skip                                                 
+------------------------------------------------------------------------------------------------------------
+ XX002 bm25: posting block starts at docid N field N, not after the previous block's last posting (docid N)
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT id FROM w7 WHERE body @@@ 'even'
+                          ORDER BY body &@@ 'even' LIMIT 5$q$) AS ranked;
+                                                   ranked                                                   
+------------------------------------------------------------------------------------------------------------
+ XX002 bm25: posting block starts at docid N field N, not after the previous block's last posting (docid N)
+(1 row)
+
+-- The exhaustive reader's own order rule sees the same step back.
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_seg_postings('w7_bm', 'even')$q$)
+       AS postings;
+                                                      postings                                                      
+--------------------------------------------------------------------------------------------------------------------
+ XX002 bm25: posting block starts at docid N field N, not after the previous block's last posting (docid N field N)
+(1 row)
+
+-- A header out of order, forged on the second block (its last_docid below the first
+-- block's). A next_geq that bypasses such a block header-only never decodes it, so only
+-- the header order can see it; the open-time sweep reads every header of the run and
+-- now holds them in order, before any decode. This pins WHERE it is caught, not whether:
+-- the probe's own linear control walk decodes the block, and before the fix that decode
+-- refused it through the header's last_docid check. A query that bypasses the block
+-- without decoding it needs pruning this small corpus does not produce.
+CREATE TABLE w8 AS SELECT * FROM w7 WITH NO DATA;
+ALTER TABLE w8 ADD PRIMARY KEY (id);
+INSERT INTO w8 SELECT g, CASE WHEN g % 2 = 0 THEN 'even' ELSE 'odd' END ||
+                         CASE WHEN g <= 260 THEN ' filler filler filler' ELSE '' END
+  FROM generate_series(1, 600) g;
+CREATE INDEX w8_bm ON w8 USING bm25_native (body);
+SELECT bm25_debug_stamp_post_block('w8_bm', 0, 0, 1, 'last_docid', 100) > 0 AS stamped;
+ stamped 
+---------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT * FROM bm25_debug_cursor_skip('w8_bm', 'even', 520)$q$)
+       AS cursor_skip;
+                                          cursor_skip                                          
+-----------------------------------------------------------------------------------------------
+ XX002 bm25: posting block header ends at docid N, not after the previous block's last docid N
+(1 row)
+
+-- ===================================================== 6. a link into another segment
+-- Every segment chain carries its segment's gen, so a link into another segment's page
+-- of the same kind failed the gen check -- which read every mismatch as a concurrent
+-- reclaim: 40001, retried three times by the ranking build and retryable forever by a
+-- client. A segment still in the live catalog cannot have had a page reclaimed, so the
+-- mismatch is now told apart by the catalog, read under the metapage lock: XX002 when
+-- the walk's own segment is live, 40001 only when it has left the catalog (the standby
+-- race). That 40001 branch is not driven by any test: the segment scan path has no
+-- pause point to park a walk across a merge + reclaim, and a standby TAP for it was
+-- judged M-cost (t/025 covers the pending-list epoch 40001, a different arm).
+CREATE FUNCTION pg_temp.seg_of(idx regclass, docs bigint) RETURNS int AS $$
+    SELECT (n - 1)::int FROM bm25_debug_segcat(idx) WITH ORDINALITY
+                           AS t(ndocs, live_ndocs, total_len, nterms, has_pos, tokens, n)
+     WHERE ndocs = docs;
+$$ LANGUAGE sql;
+CREATE FUNCTION pg_temp.mk2(t text) RETURNS void AS $$
+BEGIN
+    PERFORM pg_temp.mk(t);
+    EXECUTE format('INSERT INTO %I SELECT g, ''common late'' FROM generate_series(9001, 9010) g',
+                   t);
+    PERFORM bm25_seal((t || '_bm')::regclass);
+END; $$ LANGUAGE plpgsql;
+-- NORMS: the big segment's first norms page linked to the small one's norms root.
+SELECT pg_temp.mk2('g1');
+NOTICE:  table "g1" does not exist, skipping
+ mk2 
+-----
+ 
+(1 row)
+
+SELECT bm25_debug_stamp_chain_next('g1_bm', 'norms', pg_temp.seg_of('g1_bm', 5000), 0,
+           pg_temp.seg_root('g1_bm', pg_temp.seg_of('g1_bm', 10), 'norms_root')) > 0
+       AS stamped;
+ stamped 
+---------
+ t
+(1 row)
+
+SET bm25_native.wand_top_k = 0;
+SELECT pg_temp.err_of($q$SELECT id FROM g1 WHERE body @@@ 'common'
+                          ORDER BY body &@@ 'common' LIMIT 3$q$) AS norms;
+                                   norms                                   
+---------------------------------------------------------------------------
+ XX002 bm25: segment chain reaches block N, a page of segment gen N, not N
+(1 row)
+
+RESET bm25_native.wand_top_k;
+-- POST, on the default WAND path: the run's first page linked to the small segment's
+-- postings root, which the open-time sweep reaches through the header reader.
+SELECT pg_temp.mk2('g2');
+NOTICE:  table "g2" does not exist, skipping
+ mk2 
+-----
+ 
+(1 row)
+
+SELECT bm25_debug_stamp_chain_next('g2_bm', 'post', pg_temp.seg_of('g2_bm', 5000), 0,
+           pg_temp.seg_root('g2_bm', pg_temp.seg_of('g2_bm', 10), 'posts_root')) > 0
+       AS stamped;
+ stamped 
+---------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT id FROM g2 WHERE body @@@ 'common'
+                          ORDER BY body &@@ 'common' LIMIT 3$q$) AS wand;
+                                      wand                                      
+--------------------------------------------------------------------------------
+ XX002 bm25: segment POST chain reaches block N, a page of segment gen N, not N
+(1 row)
+
+-- LIVE, on VACUUM's write path (T13). bm25_livedocs_locate walks to the page holding a
+-- document's bit and hands the link it ends on to bm25_livedocs_clear unread; it carried
+-- no gen, and the clear checked only the page's kind. A big segment's first LIVE page
+-- linked to a small segment's LIVE root therefore sent the tombstone for the big
+-- segment's document 65152 (bit 0 of its second page) to bit 0 of the small segment:
+-- the small segment's document 0 was deleted, with no error.
+CREATE TABLE lv (id int PRIMARY KEY, body text);
+INSERT INTO lv SELECT g, 'alpha' FROM generate_series(1, 66000) g;
+CREATE INDEX lv_bm ON lv USING bm25_native (body);
+INSERT INTO lv SELECT g, 'beta' FROM generate_series(70001, 70005) g;
+SELECT bm25_seal('lv_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT (pg_temp.lay('page', 'special') - pg_temp.lay('page', 'contents')) * 8 AS bits_per_page;
+ bits_per_page 
+---------------
+         65152
+(1 row)
+
+SELECT bm25_debug_stamp_chain_next('lv_bm', 'live', pg_temp.seg_of('lv_bm', 66000), 0,
+           pg_temp.seg_root('lv_bm', pg_temp.seg_of('lv_bm', 5), 'livedocs_root')) > 0
+       AS stamped;
+ stamped 
+---------
+ t
+(1 row)
+
+SELECT pg_temp.err_of(format($q$SELECT bm25_debug_livedocs_clear('lv_bm', %s, %s)$q$,
+           pg_temp.seg_of('lv_bm', 66000),
+           (pg_temp.lay('page', 'special') - pg_temp.lay('page', 'contents')) * 8))
+       AS tombstone;
+                                  tombstone                                  
+-----------------------------------------------------------------------------
+ XX002 bm25: live-docs chain reaches block N, a page of segment gen N, not N
+(1 row)
+
+SELECT bm25_debug_seg_doc_live('lv_bm', pg_temp.seg_of('lv_bm', 5), 0) AS small_doc0_live;
+ small_doc0_live 
+-----------------
+ t
+(1 row)
+
+DROP TABLE ok, z1, z2, z3, z4, z5, z6, c1, c2, c3, c4, d1, d2, d3, d4, d5, d6, d7, p1, so,
+           w7, w8, g1, g2, lv, src;
+DROP EXTENSION bm25_native;

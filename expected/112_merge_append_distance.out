@@ -1,0 +1,239 @@
+-- 112_merge_append_distance -- a ranked ORDER BY on a partitioned or inheritance
+-- parent returns rows in score order (#252).
+--
+-- The shape: `ORDER BY body &@@ q` on a parent plans as a Merge Append over one
+-- bm25_native Index Scan per child. Merge Append orders by the &@@ value each
+-- child's scan projects on its own target list right after it emits a row. All
+-- the children rank the SAME query, so resolving the projection by ORDER BY RHS
+-- (ADR 0061) cannot tell them apart. It used to take the first match from the
+-- registry head, the most recently REGISTERED child, so every other child's row
+-- was projected with that child's current distance. Merge Append then saw a
+-- constant key for those children and drained them in one block: rows out of
+-- score order, and LIMIT k returned the wrong top-k, silently. The resolver now
+-- picks the same-query candidate that emitted most recently, which for a scan-
+-- node projection is the scan that owns the row.
+--
+-- Oracle: each child's rows are also ranked by a SINGLE-scan query on that child
+-- alone (no sibling, so no ambiguity), stored as a baseline. The merged output
+-- must project the baseline distance for every row, be non-decreasing in
+-- distance, and its LIMIT 5 must be the baseline's top 5. Assertions are booleans,
+-- counts and id arrays -- no pinned floats or EXPLAIN text (`Disabled:` and cost
+-- lines vary across PG 17/18/19). Every index is sealed and every table ANALYZEd,
+-- so neither the pending list nor autovacuum decides the plan or the scores.
+CREATE EXTENSION bm25_native;
+SET enable_seqscan = off;
+SET enable_sort = off;
+-- EXPLAIN lines for a query, for the plan guards below.
+CREATE FUNCTION mad_plan(q text) RETURNS SETOF text LANGUAGE plpgsql AS
+$$ BEGIN RETURN QUERY EXECUTE 'EXPLAIN (COSTS OFF) ' || q; END $$;
+-- ===========================================================================
+-- Part 1: declarative partitioning (the issue's repro).
+-- ===========================================================================
+CREATE TABLE pp (id int, body text) PARTITION BY RANGE (id);
+CREATE TABLE pp1 PARTITION OF pp FOR VALUES FROM (1) TO (13);
+CREATE TABLE pp2 PARTITION OF pp FOR VALUES FROM (13) TO (25);
+INSERT INTO pp SELECT g, repeat('foo ', (g % 5) + 1) || 'x' || g || ' ' || repeat('pad ', g % 3)
+  FROM generate_series(1, 24) g;
+CREATE INDEX pp_i ON pp USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id', language = 'english');
+SELECT bm25_seal('pp1_body_id_idx') IS NOT NULL AS sealed_1,
+       bm25_seal('pp2_body_id_idx') IS NOT NULL AS sealed_2;
+ sealed_1 | sealed_2 
+----------+----------
+ t        | t
+(1 row)
+
+ANALYZE pp;
+-- Baselines: each child ranked on its own. d is the &@@ distance (-score).
+CREATE TABLE pp_base AS
+  SELECT id, body &@@ 'foo' AS d FROM pp1 WHERE body @@@ 'foo' ORDER BY body &@@ 'foo';
+INSERT INTO pp_base
+  SELECT id, body &@@ 'foo' AS d FROM pp2 WHERE body @@@ 'foo' ORDER BY body &@@ 'foo';
+-- The baselines are real scores (a +inf would mean no scan ranked them), every
+-- row matched, and the 5th and 6th best differ, so "the top 5" is well defined.
+SELECT count(*) AS base_rows,
+       bool_and(d < 0) AS base_all_ranked,
+       (SELECT count(DISTINCT d) = count(*) FROM pp_base) AS base_no_ties
+FROM pp_base;
+ base_rows | base_all_ranked | base_no_ties 
+-----------+-----------------+--------------
+        24 | t               | t
+(1 row)
+
+-- (1) Plan guard: a Merge Append over the two children's bm25 index scans, for
+-- both the exact ranking query captured below and the LIMIT form. Without it every assertion below
+-- could pass on a Sort plan that never exercises the resolver.
+SELECT bool_or(l ~ 'Merge Append') AS merge_append,
+       count(*) FILTER (WHERE l ~ 'Index Scan using pp[12]_body_id_idx') AS child_index_scans
+FROM mad_plan($q$ SELECT id, d, row_number() OVER () AS rn
+                  FROM (SELECT id, body &@@ 'foo' AS d FROM pp WHERE body @@@ 'foo'
+                        ORDER BY body &@@ 'foo') s $q$) l;
+ merge_append | child_index_scans 
+--------------+-------------------
+ t            |                 2
+(1 row)
+
+SELECT bool_or(l ~ 'Merge Append') AS merge_append_limit,
+       count(*) FILTER (WHERE l ~ 'Index Scan using pp[12]_body_id_idx') AS child_index_scans_limit
+FROM mad_plan($q$ SELECT id FROM pp WHERE body @@@ 'foo'
+                  ORDER BY body &@@ 'foo' LIMIT 5 $q$) l;
+ merge_append_limit | child_index_scans_limit 
+--------------------+-------------------------
+ t                  |                       2
+(1 row)
+
+-- The merged ranking, in output order. row_number() OVER () numbers rows in the
+-- order the ordered subquery delivers them.
+CREATE TABLE pp_out AS
+  SELECT id, d, row_number() OVER () AS rn
+  FROM (SELECT id, body &@@ 'foo' AS d FROM pp WHERE body @@@ 'foo'
+        ORDER BY body &@@ 'foo') s;
+-- (2) Every row's projected distance is its own child's, not a sibling's. Before
+-- the fix the rows of every child but one carried a sibling's current distance.
+SELECT count(*) AS out_rows,
+       count(b.id) AS out_rows_with_baseline,
+       bool_and(o.d = b.d) AS distance_is_own_childs
+FROM pp_out o LEFT JOIN pp_base b USING (id);
+ out_rows | out_rows_with_baseline | distance_is_own_childs 
+----------+------------------------+------------------------
+       24 |                     24 | t
+(1 row)
+
+-- (3) Output order is non-decreasing in distance (non-increasing in score),
+-- judged both by the projected distance and by the baseline one -- the second
+-- catches a wrong order even if the projection were wrong in a consistent way.
+SELECT count(*) FILTER (WHERE d < prev_d) AS projected_order_violations,
+       count(*) FILTER (WHERE bd < prev_bd) AS baseline_order_violations
+FROM (SELECT o.d, lag(o.d) OVER (ORDER BY o.rn) AS prev_d,
+             b.d AS bd, lag(b.d) OVER (ORDER BY o.rn) AS prev_bd
+      FROM pp_out o JOIN pp_base b USING (id)) x;
+ projected_order_violations | baseline_order_violations 
+----------------------------+---------------------------
+                          0 |                         0
+(1 row)
+
+-- (4) LIMIT 5 through the Merge Append is the true top 5.
+SELECT (SELECT array_agg(id ORDER BY id)
+          FROM (SELECT id FROM pp WHERE body @@@ 'foo'
+                ORDER BY body &@@ 'foo' LIMIT 5) s)
+     = (SELECT array_agg(id ORDER BY id)
+          FROM (SELECT id FROM pp_base ORDER BY d LIMIT 5) s) AS limit5_is_true_top5;
+ limit5_is_true_top5 
+---------------------
+ t
+(1 row)
+
+-- A single-child query is unchanged by the tiebreak: a sole candidate resolves
+-- exactly as before.
+SELECT bool_and(d = -bm25_score(ctid)) AS single_child_unchanged
+FROM (SELECT ctid, body &@@ 'foo' AS d FROM pp1 WHERE body @@@ 'foo'
+      ORDER BY body &@@ 'foo') s;
+ single_child_unchanged 
+------------------------
+ t
+(1 row)
+
+DROP TABLE pp_out, pp_base;
+DROP TABLE pp;
+-- ===========================================================================
+-- Part 2: table inheritance. The parent holds rows of its own and has its own
+-- index, so the Merge Append has three same-query children.
+-- ===========================================================================
+CREATE TABLE ih (id int, body text);
+CREATE TABLE ih1 () INHERITS (ih);
+CREATE TABLE ih2 () INHERITS (ih);
+INSERT INTO ih  SELECT g, repeat('foo ', (g % 5) + 1) || 'x' || g || ' ' || repeat('pad ', g % 3)
+  FROM generate_series(1, 8) g;
+INSERT INTO ih1 SELECT g, repeat('foo ', (g % 5) + 1) || 'x' || g || ' ' || repeat('pad ', g % 3)
+  FROM generate_series(9, 16) g;
+INSERT INTO ih2 SELECT g, repeat('foo ', (g % 5) + 1) || 'x' || g || ' ' || repeat('pad ', g % 3)
+  FROM generate_series(17, 24) g;
+CREATE INDEX ih_i  ON ih  USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id', language = 'english');
+CREATE INDEX ih1_i ON ih1 USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id', language = 'english');
+CREATE INDEX ih2_i ON ih2 USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id', language = 'english');
+SELECT bm25_seal('ih_i')  IS NOT NULL AS sealed_0,
+       bm25_seal('ih1_i') IS NOT NULL AS sealed_1,
+       bm25_seal('ih2_i') IS NOT NULL AS sealed_2;
+ sealed_0 | sealed_1 | sealed_2 
+----------+----------+----------
+ t        | t        | t
+(1 row)
+
+ANALYZE ih, ih1, ih2;
+-- Baselines. ONLY ih keeps the parent's own scan free of its children.
+CREATE TABLE ih_base AS
+  SELECT id, body &@@ 'foo' AS d FROM ONLY ih WHERE body @@@ 'foo' ORDER BY body &@@ 'foo';
+INSERT INTO ih_base
+  SELECT id, body &@@ 'foo' AS d FROM ih1 WHERE body @@@ 'foo' ORDER BY body &@@ 'foo';
+INSERT INTO ih_base
+  SELECT id, body &@@ 'foo' AS d FROM ih2 WHERE body @@@ 'foo' ORDER BY body &@@ 'foo';
+SELECT count(*) AS base_rows,
+       bool_and(d < 0) AS base_all_ranked,
+       (SELECT count(DISTINCT d) = count(*) FROM ih_base) AS base_no_ties
+FROM ih_base;
+ base_rows | base_all_ranked | base_no_ties 
+-----------+-----------------+--------------
+        24 | t               | t
+(1 row)
+
+SELECT bool_or(l ~ 'Merge Append') AS merge_append,
+       count(*) FILTER (WHERE l ~ 'Index Scan using ih[12]?_i') AS child_index_scans
+FROM mad_plan($q$ SELECT id, d, row_number() OVER () AS rn
+                  FROM (SELECT id, body &@@ 'foo' AS d FROM ih WHERE body @@@ 'foo'
+                        ORDER BY body &@@ 'foo') s $q$) l;
+ merge_append | child_index_scans 
+--------------+-------------------
+ t            |                 3
+(1 row)
+
+SELECT bool_or(l ~ 'Merge Append') AS merge_append_limit,
+       count(*) FILTER (WHERE l ~ 'Index Scan using ih[12]?_i') AS child_index_scans_limit
+FROM mad_plan($q$ SELECT id FROM ih WHERE body @@@ 'foo'
+                  ORDER BY body &@@ 'foo' LIMIT 5 $q$) l;
+ merge_append_limit | child_index_scans_limit 
+--------------------+-------------------------
+ t                  |                       3
+(1 row)
+
+CREATE TABLE ih_out AS
+  SELECT id, d, row_number() OVER () AS rn
+  FROM (SELECT id, body &@@ 'foo' AS d FROM ih WHERE body @@@ 'foo'
+        ORDER BY body &@@ 'foo') s;
+SELECT count(*) AS out_rows,
+       count(b.id) AS out_rows_with_baseline,
+       bool_and(o.d = b.d) AS distance_is_own_childs
+FROM ih_out o LEFT JOIN ih_base b USING (id);
+ out_rows | out_rows_with_baseline | distance_is_own_childs 
+----------+------------------------+------------------------
+       24 |                     24 | t
+(1 row)
+
+SELECT count(*) FILTER (WHERE d < prev_d) AS projected_order_violations,
+       count(*) FILTER (WHERE bd < prev_bd) AS baseline_order_violations
+FROM (SELECT o.d, lag(o.d) OVER (ORDER BY o.rn) AS prev_d,
+             b.d AS bd, lag(b.d) OVER (ORDER BY o.rn) AS prev_bd
+      FROM ih_out o JOIN ih_base b USING (id)) x;
+ projected_order_violations | baseline_order_violations 
+----------------------------+---------------------------
+                          0 |                         0
+(1 row)
+
+SELECT (SELECT array_agg(id ORDER BY id)
+          FROM (SELECT id FROM ih WHERE body @@@ 'foo'
+                ORDER BY body &@@ 'foo' LIMIT 5) s)
+     = (SELECT array_agg(id ORDER BY id)
+          FROM (SELECT id FROM ih_base ORDER BY d LIMIT 5) s) AS limit5_is_true_top5;
+ limit5_is_true_top5 
+---------------------
+ t
+(1 row)
+
+DROP TABLE ih_out, ih_base;
+DROP TABLE ih1, ih2, ih;
+DROP FUNCTION mad_plan(text);
+RESET enable_sort;
+RESET enable_seqscan;
+DROP EXTENSION bm25_native;

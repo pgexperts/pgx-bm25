@@ -1,0 +1,170 @@
+-- 34_merge_multifield.sql — merge + retire + horizon reclaim over a MULTI-FIELD
+-- index WITH key_field (cluster C6, C5 dependencies).
+--
+-- Proves (R10) the merge rebuilds the KEYMAP for the merged segment — a keyed index
+-- still returns the user id (NOT ctid) AFTER a seal+merge — and (R11) the retired
+-- merged-away segments' KEYMAP pages are freed by the horizon-gated reclaim
+-- (BM25RetiredEntry.keymap_root is load-bearing) and REUSED, so the relation stays
+-- bounded. Mirrors 19_merge + 20_merge_reclaim for the M5 key_field surface.
+--
+-- key_field is an INCLUDE column so its int type needs no bm25_native opclass; the tokenized
+-- fields are the two text columns (title 5x-boosted, body 1x).
+CREATE EXTENSION bm25_native;
+-- Waits until no other backend in this database holds a snapshot -- needed before
+-- the XID burn below, since a held snapshot pins the horizon regardless of how many
+-- xids get burned. See docs/adr/0031-vacuum-tests-wait-for-xmin-horizon.md for the
+-- full rationale (and 20_merge_reclaim for why wait precedes burn).
+CREATE FUNCTION pg_temp.wait_for_xmin_horizon() RETURNS void AS $$
+DECLARE
+  deadline timestamptz := clock_timestamp() + interval '30 seconds';
+BEGIN
+  LOOP
+    PERFORM pg_stat_clear_snapshot();
+    EXIT WHEN NOT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND backend_xmin IS NOT NULL);
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION
+        'xmin horizon still held by another backend after 30s; VACUUM cannot reclaim';
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+CREATE TABLE docs (id int primary key, title text, body text);
+SET enable_seqscan = off;
+-- Distinct high-idf term per batch in TITLE (boosted 5:1); shared low-idf term in BODY.
+INSERT INTO docs SELECT g, 'alpha', 'common database storage' FROM generate_series(1,50)   g;
+CREATE INDEX docs_bm25 ON docs USING bm25_native (title, body) INCLUDE (id)
+  WITH (key_field='id', boost_title='5.0', boost_body='1.0');   -- segment 0 (build)
+INSERT INTO docs SELECT g, 'beta',  'common database storage' FROM generate_series(51,100)  g;
+SELECT bm25_seal('docs_bm25');                                   -- segment 1
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+INSERT INTO docs SELECT g, 'gamma', 'common database storage' FROM generate_series(101,150) g;
+SELECT bm25_seal('docs_bm25');                                   -- segment 2
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+INSERT INTO docs SELECT g, 'delta', 'common database storage' FROM generate_series(151,200) g;
+SELECT bm25_seal('docs_bm25');                                   -- segment 3
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT nsegs AS nsegs_before FROM bm25_stats('docs_bm25');
+ nsegs_before 
+--------------
+            4
+(1 row)
+
+-- Key-resolved ranking BEFORE the merge: the top 'alpha' hits are ids 1..5 (the term
+-- lives only in the batch-1 titles, 5x-boosted). Snapshot the returned KEYS.
+SELECT array_agg(key_int4 ORDER BY score DESC, key_int4) AS rank_before
+FROM (SELECT key_int4, score FROM bm25_debug_rank_key('docs_bm25', 'alpha')
+      ORDER BY score DESC, key_int4 LIMIT 5) s \gset
+SELECT pg_relation_size('docs_bm25') AS pages_before_merge \gset
+-- Force the merge (drains ladder to target + records retired RANGE entries, each now
+-- carrying the dropped segment's keymap_root).
+SELECT bm25_merge('docs_bm25');
+ bm25_merge 
+------------
+ 
+(1 row)
+
+SELECT nsegs AS nsegs_after FROM bm25_stats('docs_bm25');
+ nsegs_after 
+-------------
+           1
+(1 row)
+
+SELECT bm25_debug_retired_count('docs_bm25') > 0 AS retired_after_merge;
+ retired_after_merge 
+---------------------
+ t
+(1 row)
+
+-- R10: the merged segment returns the SAME ranked KEYS (keymap rebuilt on merge). If
+-- the merge dropped the keymap, key_int4 would be all-NULL (ctid fallback) and this
+-- would differ from rank_before.
+SELECT array_agg(key_int4 ORDER BY score DESC, key_int4) AS rank_after
+FROM (SELECT key_int4, score FROM bm25_debug_rank_key('docs_bm25', 'alpha')
+      ORDER BY score DESC, key_int4 LIMIT 5) s \gset
+SELECT :'rank_before' = :'rank_after' AS keys_stable_across_merge;
+ keys_stable_across_merge 
+--------------------------
+ t
+(1 row)
+
+-- The per-docid keymap on the merged segment(s) round-trips (no NULL keys leaked in).
+SELECT bool_and(key_int4 IS NOT NULL) AS all_keys_present
+  FROM bm25_debug_seg_keymap('docs_bm25', 0);
+ all_keys_present 
+------------------
+ t
+(1 row)
+
+-- Wait before burning (see 20_merge_reclaim): a held snapshot pins the horizon no
+-- matter how many xids get burned afterward, so clear it first.
+SELECT pg_temp.wait_for_xmin_horizon();
+ wait_for_xmin_horizon 
+-----------------------
+ 
+(1 row)
+
+-- Burn xids so the cluster horizon passes retire_xid, then VACUUM to run reclaim.
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+VACUUM docs;                       -- horizon now past retire_xid → reclaim drains the list
+SELECT bm25_debug_retired_count('docs_bm25') AS retired_after_reclaim;   -- expect 0
+ retired_after_reclaim 
+-----------------------
+                     0
+(1 row)
+
+-- R11: freed keymap pages were reused, not re-extended. A leaked retired keymap chain
+-- would grow the relation past the pre-merge size on the follow-up insert+seal.
+SELECT pg_relation_size('docs_bm25') AS size_after_reclaim \gset
+INSERT INTO docs SELECT g, 'alpha', 'common database storage' FROM generate_series(201,250) g;
+SELECT bm25_seal('docs_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT pg_relation_size('docs_bm25') <= :pages_before_merge * 2 AS size_bounded;
+ size_bounded 
+--------------
+ t
+(1 row)
+
+-- After reclaim + reuse, BM25F still ranks a title hit above a body-only hit and the
+-- key round-trips (field-RLE + keymap intact on the reused pages). 'alpha' now spans
+-- batch 1 and the re-added batch; all resolve to real int keys, none NULL.
+SELECT bool_and(key_int4 IS NOT NULL) AS keys_after_reclaim
+FROM (SELECT key_int4 FROM bm25_debug_rank_key('docs_bm25', 'alpha') LIMIT 10) s;
+ keys_after_reclaim 
+--------------------
+ t
+(1 row)
+
+SELECT count(*) FROM docs WHERE body @@@ 'database';   -- all body hits survive
+ count 
+-------
+   250
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE docs;
+DROP EXTENSION bm25_native;

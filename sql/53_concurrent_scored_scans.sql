@@ -1,0 +1,354 @@
+-- 53_concurrent_scored_scans — two concurrently-live bm25_native scored scans must not
+-- clobber one another's ranking. Before the R3 fix, an outer scored scan's
+-- bm25_score_key(o.id) silently returned the INNER scan's score (single global
+-- slot). The plan is forced (enable_seqscan/sort off + a non-indexable
+-- correlation) so two bm25_native Index Scan nodes are genuinely live at once.
+CREATE EXTENSION IF NOT EXISTS bm25_native;
+CREATE TABLE css(id int PRIMARY KEY, body text);
+-- Every doc matches BOTH 'foo' and 'bar' with different term frequencies, so a
+-- clobber shows a WRONG NUMBER (bar-score) not a NULL. Distinct doclens/tfs.
+INSERT INTO css(id, body) VALUES
+ (1, 'foo foo foo bar alpha'),
+ (2, 'foo bar bar bar beta gamma'),
+ (3, 'foo foo bar bar delta epsilon zeta'),
+ (4, 'foo bar eta theta'),
+ (5, 'foo foo foo foo bar iota'),
+ (6, 'foo bar bar kappa lambda mu nu xi');
+CREATE INDEX css_bm25 ON css USING bm25_native (body) INCLUDE (id)
+  WITH (key_field='id', language='english');
+SELECT bm25_seal('css_bm25');
+-- #242: plan stability. Without stats (autovacuum off, reltuples = -1) the JOIN
+-- checks below planned as a Hash Join and failed; with them, as a Nested Loop that
+-- passed only because both sides were wrong identically. The per-row assertions
+-- further down do not go through a JOIN and fail on the pre-#242 build under
+-- either plan; this keeps the JOIN checks from depending on autovacuum's timing.
+ANALYZE css;
+SET enable_seqscan=off;
+SET enable_sort=off;
+
+-- Portable plan-shape guard: prove TWO bm25_native Index Scan nodes are live (do NOT
+-- pin raw EXPLAIN -- Disabled:/cost lines vary by PG version).
+CREATE FUNCTION css_plan(q text) RETURNS SETOF text LANGUAGE plpgsql AS
+$$ BEGIN RETURN QUERY EXECUTE 'EXPLAIN (COSTS OFF) ' || q; END $$;
+
+SELECT count(*) AS two_bm25_scan_nodes
+FROM css_plan(
+  $q$ SELECT o.id, bm25_score_key(o.id) FROM css o
+      WHERE o.body @@@ 'foo'
+        AND (SELECT i.id FROM css i WHERE i.body @@@ 'bar' AND i.body <> (o.body||'x')
+              ORDER BY i.body &@@ 'bar' LIMIT 1) >= 0
+      ORDER BY o.body &@@ 'foo' $q$) AS line
+WHERE line LIKE '%Index Scan using css_bm25%';
+
+-- #242 baselines, each from a SINGLE-scan query in its own statement (never a
+-- sibling subquery of the query under test, which would put two live scans on the
+-- same row in one statement and measure the collision instead of the answer).
+CREATE TEMP TABLE css_foo AS
+  SELECT id, round(bm25_score_key(id)::numeric,6) AS s,
+         round(bm25_score(ctid)::numeric,6) AS s_ctid
+    FROM css WHERE body @@@ 'foo' ORDER BY body &@@ 'foo';
+CREATE TEMP TABLE css_bar AS
+  SELECT id, round(bm25_score_key(id)::numeric,6) AS s,
+         round(bm25_score(ctid)::numeric,6) AS s_ctid
+    FROM css WHERE body @@@ 'bar' ORDER BY body &@@ 'bar';
+-- id 2 is 0.074108 under 'foo' and 0.116455 under 'bar'; the two accessors agree.
+SELECT f.id, f.s AS foo_s, b.s AS bar_s,
+       f.s = f.s_ctid AND b.s = b.s_ctid AS accessors_agree
+  FROM css_foo f JOIN css_bar b USING (id) ORDER BY f.id;
+
+-- #242 NESTED, per row, no JOIN. The correlated inner 'bar' scan's current row is
+-- always id 2 (its top hit; the correlation never rejects it) and it re-registers
+-- at the registry head on every rescan, so when the outer emits id 2 both scans'
+-- current rows are id 2. Before #242 the head won and id 2 read 0.116455 (the
+-- inner's 'bar' score) from BOTH accessors, under any plan. It must be the
+-- single-scan 0.074108.
+SELECT o.id, round(bm25_score_key(o.id)::numeric,6) AS nested_key,
+       round(bm25_score(o.ctid)::numeric,6)       AS nested_ctid
+  FROM css o
+ WHERE o.body @@@ 'foo'
+   AND (SELECT i.id FROM css i WHERE i.body @@@ 'bar' AND i.body <> (o.body||'x')
+         ORDER BY i.body &@@ 'bar' LIMIT 1) >= 0
+ ORDER BY o.body &@@ 'foo';
+
+-- The same rows checked against the baseline, false on a NULL as well.
+CREATE TEMP TABLE css_nested AS
+  SELECT o.id, round(bm25_score_key(o.id)::numeric,6) AS nested_key,
+         round(bm25_score(o.ctid)::numeric,6)       AS nested_ctid
+    FROM css o
+   WHERE o.body @@@ 'foo'
+     AND (SELECT i.id FROM css i WHERE i.body @@@ 'bar' AND i.body <> (o.body||'x')
+           ORDER BY i.body &@@ 'bar' LIMIT 1) >= 0
+   ORDER BY o.body &@@ 'foo';
+SELECT n.id, coalesce(n.nested_key = f.s, false)  AS key_matches_baseline,
+             coalesce(n.nested_ctid = f.s, false) AS ctid_matches_baseline
+  FROM css_nested n JOIN css_foo f USING (id) ORDER BY n.id;
+
+-- #242 TWO RANKED SUBQUERIES JOINED ('foo' x 'bar', both live), the accessors
+-- inside each subquery. Correct before #242 and after. The baselines are read by
+-- scalar subqueries in the top-level projection, not joined in, so they cannot
+-- change how the two scans are joined.
+SELECT j.id,
+       coalesce(j.foo_s = (SELECT s FROM css_foo WHERE id = j.id), false) AS foo_key_ok,
+       coalesce(j.foo_c = (SELECT s FROM css_foo WHERE id = j.id), false) AS foo_ctid_ok,
+       coalesce(j.bar_s = (SELECT s FROM css_bar WHERE id = j.id), false) AS bar_key_ok,
+       coalesce(j.bar_c = (SELECT s FROM css_bar WHERE id = j.id), false) AS bar_ctid_ok
+  FROM (SELECT a.id, a.s AS foo_s, a.c AS foo_c, b.s AS bar_s, b.c AS bar_c
+          FROM (SELECT id, round(bm25_score_key(id)::numeric,6) AS s,
+                       round(bm25_score(ctid)::numeric,6) AS c
+                  FROM css WHERE body @@@ 'foo' ORDER BY body &@@ 'foo') a
+          JOIN (SELECT id, round(bm25_score_key(id)::numeric,6) AS s,
+                       round(bm25_score(ctid)::numeric,6) AS c
+                  FROM css WHERE body @@@ 'bar' ORDER BY body &@@ 'bar') b
+         USING (id)) j
+ ORDER BY j.id;
+
+-- #242 RESIDUAL, pinned as the plain walk's answer and NOT correct. A call site
+-- learns which scan it belongs to only from a row whose probe matches exactly one
+-- scan's current row. Here the correlated inner ranks 'iota', which only id 5
+-- matches, so its current row is always id 5 -- and the outer's FIRST row is id 5
+-- too. The call site has nothing to go on yet, so row 5 gets the head-first pick,
+-- the inner's 'iota' score 1.540445, as before #242 (its 'foo' score is 0.125413).
+-- Every later row is correct.
+SELECT o.id, round(bm25_score_key(o.id)::numeric,6) AS key_s,
+       round(bm25_score(o.ctid)::numeric,6)       AS ctid_s
+  FROM css o
+ WHERE o.body @@@ 'foo'
+   AND (SELECT i.id FROM css i WHERE i.body @@@ 'iota' AND i.body <> (o.body||'x')
+         ORDER BY i.body &@@ 'iota' LIMIT 1) >= 0
+ ORDER BY o.body &@@ 'foo';
+
+-- #242 ONE CALL SITE OVER SEVERAL SCANS IN TURN. Projected above the Append, each
+-- accessor below is a single call site that sees all of branch 1's rows, then 2's,
+-- then 3's. Branch 1 ('foo') ends on id 6, branch 2 ('kappa') matches only id 6,
+-- and branch 3 ('bar') emits id 6 again mid-stream. Every row must carry its OWN
+-- branch's score: a call site that trusted its binding to the finished branch 1,
+-- whose current row is still id 6, would give branches 2 and 3 their id-6 row at
+-- 'foo''s 0.065215. Correct before #242 as well. CTAS, not SELECT ... ORDER BY, so
+-- no Sort is planned between the scans and the projection.
+CREATE TEMP TABLE css_union AS
+  SELECT u.branch, u.id, round(bm25_score_key(u.id)::numeric,6) AS key_s,
+         round(bm25_score(u.ctid)::numeric,6) AS ctid_s
+    FROM ((SELECT 1 AS branch, id, ctid FROM css WHERE body @@@ 'foo'
+            ORDER BY body &@@ 'foo')
+          UNION ALL
+          (SELECT 2, id, ctid FROM css WHERE body @@@ 'kappa'
+            ORDER BY body &@@ 'kappa')
+          UNION ALL
+          (SELECT 3, id, ctid FROM css WHERE body @@@ 'bar'
+            ORDER BY body &@@ 'bar')) u;
+SELECT branch, id, key_s, ctid_s,
+       CASE branch WHEN 1 THEN key_s = (SELECT s FROM css_foo f WHERE f.id = u.id)
+                   WHEN 3 THEN key_s = (SELECT s FROM css_bar b WHERE b.id = u.id)
+       END AS matches_baseline
+  FROM css_union u ORDER BY branch, id;
+
+-- Same single call site with a LIMITed first branch. A Limit stops pulling, so
+-- branch 1's scan never reports that it is finished: its current row stays its
+-- last emitted row (id 5, 'foo' 0.125413) while branch 2, 'iota', emits id 5 with
+-- 1.540445. Branch 1 has not moved since the call site last ran, so its binding is
+-- not trusted and branch 2's row gets branch 2's score. The second query does the
+-- same with LIMIT 2 ('foo' ids 5, 1) followed by every 'bar' row.
+CREATE TEMP TABLE css_union_limit AS
+  SELECT 'lim1' AS q, u.branch, u.id, round(bm25_score_key(u.id)::numeric,6) AS key_s,
+         round(bm25_score(u.ctid)::numeric,6) AS ctid_s
+    FROM ((SELECT 1 AS branch, id, ctid FROM css WHERE body @@@ 'foo'
+            ORDER BY body &@@ 'foo' LIMIT 1)
+          UNION ALL
+          (SELECT 2, id, ctid FROM css WHERE body @@@ 'iota'
+            ORDER BY body &@@ 'iota')) u;
+INSERT INTO css_union_limit
+  SELECT 'lim2', u.branch, u.id, round(bm25_score_key(u.id)::numeric,6),
+         round(bm25_score(u.ctid)::numeric,6)
+    FROM ((SELECT 1 AS branch, id, ctid FROM css WHERE body @@@ 'foo'
+            ORDER BY body &@@ 'foo' LIMIT 2)
+          UNION ALL
+          (SELECT 2, id, ctid FROM css WHERE body @@@ 'bar'
+            ORDER BY body &@@ 'bar')) u;
+SELECT q, branch, id, key_s, ctid_s,
+       CASE WHEN branch = 1 THEN key_s = (SELECT s FROM css_foo f WHERE f.id = u.id)
+            WHEN q = 'lim2' THEN key_s = (SELECT s FROM css_bar b WHERE b.id = u.id)
+       END AS matches_baseline
+  FROM css_union_limit u ORDER BY q, branch, id;
+
+-- Same single call site, but branch 2 is the NESTED shape: its correlated inner
+-- 'bar' scan re-registers at the head on every row. Branch 2's id 2 is the #242
+-- collision again (before #242 it read the inner's 'bar' 0.116455); every row must
+-- be its 'foo' score.
+CREATE TEMP TABLE css_union_nested AS
+  SELECT u.branch, u.id, round(bm25_score_key(u.id)::numeric,6) AS key_s,
+         round(bm25_score(u.ctid)::numeric,6) AS ctid_s
+    FROM ((SELECT 1 AS branch, id, ctid FROM css WHERE body @@@ 'foo'
+            ORDER BY body &@@ 'foo')
+          UNION ALL
+          (SELECT 2, o.id, o.ctid FROM css o
+            WHERE o.body @@@ 'foo'
+              AND (SELECT i.id FROM css i WHERE i.body @@@ 'bar'
+                     AND i.body <> (o.body||'x')
+                   ORDER BY i.body &@@ 'bar' LIMIT 1) >= 0
+            ORDER BY o.body &@@ 'foo')) u;
+SELECT branch, id,
+       coalesce(key_s  = (SELECT s FROM css_foo f WHERE f.id = u.id), false) AS key_ok,
+       coalesce(ctid_s = (SELECT s FROM css_foo f WHERE f.id = u.id), false) AS ctid_ok
+  FROM css_union_nested u ORDER BY branch, id;
+
+-- #242 JOIN WITH THE ACCESSORS IN THE TOP-LEVEL PROJECTION (OFFSET 0 keeps the two
+-- ranked subqueries as separate scans). Joined on the key, so every projected row
+-- is the current row of BOTH scans: no call site ever sees a unique match, never
+-- binds, and every row gets the plain walk's head-first pick.
+--
+-- Nested loop, 'foo' outer x 'bar' inner. RESIDUAL, pinned as before #242 and
+-- NOT correct: the rescanned 'bar' side is the head, so the 'foo' columns carry
+-- 'bar' scores (foo_want is the right answer; ids 3 and 4 score alike).
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SELECT a.id, round(bm25_score_key(a.id)::numeric,6) AS foo_key,
+       round(bm25_score(a.ctid)::numeric,6) AS foo_ctid,
+       (SELECT s FROM css_foo WHERE id = a.id) AS foo_want,
+       round(bm25_score_key(b.id)::numeric,6) AS bar_key,
+       round(bm25_score(b.ctid)::numeric,6) AS bar_ctid,
+       (SELECT s FROM css_bar WHERE id = a.id) AS bar_want
+  FROM (SELECT id, ctid FROM css WHERE body @@@ 'foo' ORDER BY body &@@ 'foo' OFFSET 0) a
+  JOIN (SELECT id, ctid FROM css WHERE body @@@ 'bar' ORDER BY body &@@ 'bar' OFFSET 0) b
+    ON a.id = b.id;
+
+-- Hash join, 'bar' probe side x 'foo' hashed. The hashed side finished before any
+-- row was projected; its current row is its last, id 6. The 'foo' call site binds
+-- to the streaming 'bar' scan on id 2 (the only current-row match), so on id 6 the
+-- bound scan and the head-first pick disagree. The pick (the finished 'foo' scan)
+-- has not emitted since the call site last ran, so its match is a leftover row --
+-- and here it is the right one: the call site keeps the plain walk's answer, 'foo'
+-- 0.065215, instead of the bound 'bar' scan's 0.093164. The 'bar' columns on
+-- id 6 read 'foo''s 0.065215 for the same reason: RESIDUAL, as before #242, as is
+-- every 'foo' column but id 6 (those read 'bar' scores).
+SET enable_nestloop = off;
+SET enable_hashjoin = on;
+SELECT a.id, round(bm25_score_key(a.id)::numeric,6) AS bar_key,
+       round(bm25_score(a.ctid)::numeric,6) AS bar_ctid,
+       (SELECT s FROM css_bar WHERE id = a.id) AS bar_want,
+       round(bm25_score_key(b.id)::numeric,6) AS foo_key,
+       round(bm25_score(b.ctid)::numeric,6) AS foo_ctid,
+       (SELECT s FROM css_foo WHERE id = a.id) AS foo_want
+  FROM (SELECT id, ctid FROM css WHERE body @@@ 'bar' ORDER BY body &@@ 'bar' OFFSET 0) a
+  JOIN (SELECT id, ctid FROM css WHERE body @@@ 'foo' ORDER BY body &@@ 'foo' OFFSET 0) b
+    ON a.id = b.id;
+RESET enable_nestloop;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+
+-- #242 RESIDUAL (decoupled projection): NOT correct, and NOT the plain walk's
+-- answer either. A PL/pgSQL FOR loop fetches its query's rows in batches (10, then
+-- 50), so a scan's current row is the end of its latest batch, not the row the loop
+-- body is on -- and the body's bm25_score_key(...) is one call site that persists
+-- across iterations. Eleven rows ranked by 'foo', ids 11 down to 1; the inner loop
+-- ranks 'bar' over a chosen id set and scores only its first row.
+--   n = 10: the outer is on id 2, its current row (end of batch 1) is also id 2.
+--           The inner ranks {2, 11}: 2 first under 'bar', but its current row is
+--           11. The probe (2) matches only the outer, so the call site binds to it
+--           and returns the outer's 'foo' score, as the plain walk does.
+--   n = 11: the outer fetches batch 2 (id 1) and the inner ranks {1}. Both scans
+--           have just emitted id 1, so the bound outer wins: 'foo''s 0.042681 for
+--           a 'bar' row whose score is 0.084465 -- which the plain walk returned.
+CREATE TABLE css_plx(id int PRIMARY KEY, body text);
+INSERT INTO css_plx SELECT g, repeat('foo ', g) || repeat('bar ', 12 - g) || repeat('pad ', g % 3)
+  FROM generate_series(1, 11) g;
+CREATE INDEX css_plx_bm25 ON css_plx USING bm25_native (body) INCLUDE (id)
+  WITH (key_field='id', language='english');
+SELECT bm25_seal('css_plx_bm25') IS NOT NULL AS sealed;
+CREATE TEMP TABLE plx_foo AS SELECT id, round(bm25_score_key(id)::numeric,6) AS s
+  FROM css_plx WHERE body @@@ 'foo' ORDER BY body &@@ 'foo';
+CREATE TEMP TABLE plx_bar AS SELECT id, round(bm25_score_key(id)::numeric,6) AS s
+  FROM css_plx WHERE body @@@ 'bar' ORDER BY body &@@ 'bar';
+CREATE FUNCTION css_plx_probe() RETURNS TABLE(n int, oid_ int, iid int, got numeric)
+LANGUAGE plpgsql AS $$
+DECLARE o record; i record; ids int[];
+BEGIN
+  n := 0;
+  FOR o IN SELECT id FROM css_plx WHERE body @@@ 'foo' ORDER BY body &@@ 'foo' LOOP
+    n := n + 1;
+    ids := CASE n WHEN 10 THEN ARRAY[2, 11] WHEN 11 THEN ARRAY[1] END;
+    CONTINUE WHEN ids IS NULL;
+    oid_ := o.id;
+    FOR i IN SELECT id FROM css_plx WHERE body @@@ 'bar' AND id = ANY (ids)
+             ORDER BY body &@@ 'bar' LIMIT cardinality(ids) LOOP
+      iid := i.id;
+      got := round(bm25_score_key(i.id)::numeric, 6);
+      RETURN NEXT;
+      EXIT;
+    END LOOP;
+  END LOOP;
+END $$;
+SELECT p.n, p.oid_, p.iid, p.got, b.s AS bar_want, f.s AS foo_of_iid
+  FROM css_plx_probe() p JOIN plx_bar b ON b.id = p.iid JOIN plx_foo f ON f.id = p.iid
+ ORDER BY p.n;
+
+-- CORRECTNESS: the outer's score under the correlated bar scan must equal the
+-- single-scan baseline for every row. (Before #242 only id 2 differed, and the
+-- JOIN hid even that under a Nested Loop: both sides got the same wrong number.)
+SELECT bool_and(b.foo IS NOT DISTINCT FROM c.foo) AS all_scores_correct
+FROM (SELECT id, round(bm25_score_key(id)::numeric,6) AS foo
+        FROM css WHERE body @@@ 'foo' ORDER BY body &@@ 'foo') b
+JOIN (SELECT o.id, round(bm25_score_key(o.id)::numeric,6) AS foo
+        FROM css o
+        WHERE o.body @@@ 'foo'
+          AND (SELECT i.id FROM css i WHERE i.body @@@ 'bar' AND i.body <> (o.body||'x')
+                ORDER BY i.body &@@ 'bar' LIMIT 1) >= 0
+        ORDER BY o.body &@@ 'foo') c USING (id);
+
+-- Same for bm25_score(ctid).
+SELECT bool_and(b.foo IS NOT DISTINCT FROM c.foo) AS all_ctid_scores_correct
+FROM (SELECT id, round(bm25_score(ctid)::numeric,6) AS foo
+        FROM css WHERE body @@@ 'foo' ORDER BY body &@@ 'foo') b
+JOIN (SELECT o.id, round(bm25_score(o.ctid)::numeric,6) AS foo
+        FROM css o
+        WHERE o.body @@@ 'foo'
+          AND (SELECT i.id FROM css i WHERE i.body @@@ 'bar' AND i.body <> (o.body||'x')
+                ORDER BY i.body &@@ 'bar' LIMIT 1) >= 0
+        ORDER BY o.body &@@ 'foo') c USING (id);
+
+-- FAIL-LOUD: bm25_snippet (a user-explicit call, never an ORDER BY resjunk) ERRORs
+-- under >=2 concurrent scored scans -- it carries no row identity to disambiguate.
+-- Projected on the outer while the inner bar scan is correlated-live:
+SELECT bm25_snippet(o.body, '<mark>', '</mark>', 300) FROM css o
+WHERE o.body @@@ 'foo'
+  AND (SELECT i.id FROM css i WHERE i.body @@@ 'bar' AND i.body <> (o.body||'x')
+        ORDER BY i.body &@@ 'bar' LIMIT 1) >= 0
+ORDER BY o.body &@@ 'foo';   -- expect ERROR: bm25: bm25_snippet is ambiguous ...
+
+-- The projected &@@ distance does NOT fail loud (it is also the ORDER BY resjunk
+-- mechanism, present on every ranked query): under the same two-live-scan shape it
+-- returns rows, not an error. Wrapped in count(*) so the resolved distance
+-- VALUES are not pinned (only that evaluation completes without erroring).
+SELECT count(*) >= 1 AS distance_does_not_fail_loud FROM (
+  SELECT (o.body &@@ 'foo') AS d FROM css o
+  WHERE o.body @@@ 'foo'
+    AND (SELECT i.id FROM css i WHERE i.body @@@ 'bar' AND i.body <> (o.body||'x')
+          ORDER BY i.body &@@ 'bar' LIMIT 1) >= 0
+  ORDER BY o.body &@@ 'foo') s;
+
+-- SINGLE-scan snippet still works (one active scan -> no ambiguity):
+SELECT bm25_snippet(body, '<mark>', '</mark>', 60) IS NOT NULL AS snippet_ok
+FROM css WHERE body @@@ 'foo' ORDER BY body &@@ 'foo' LIMIT 1;
+
+-- Decoupled single-scan projection: the OUTER bm25_score_key(id) resolves via the
+-- full-ranking hash FALLBACK (its row comes from the materialized tuplestore, not the
+-- live cursor), while true_s was captured on the hot (current-row) path DURING the scan.
+-- Exactly ONE bm25_native scan is live throughout (count()==1) -- plan-stable across PG
+-- versions, unlike a two-scan JOIN whose build-side order could flip the fallback off.
+-- Asserts the fallback value EQUALS the hot-path value; coalesce(...,false) also fails
+-- on a NULL (a total miss), which bool_and would otherwise skip.
+WITH ranked AS MATERIALIZED (
+  SELECT id, bm25_score_key(id) AS true_s
+  FROM css WHERE body @@@ 'foo' ORDER BY body &@@ 'foo'
+)
+SELECT bool_and(coalesce(round(bm25_score_key(id)::numeric,6)
+                         = round(true_s::numeric,6), false)) AS all_decoupled_scores_correct
+FROM ranked;
+
+RESET enable_sort;
+RESET enable_seqscan;
+DROP FUNCTION css_plan(text);
+DROP FUNCTION css_plx_probe();
+DROP TABLE plx_foo, plx_bar, css_plx;
+DROP TABLE css_foo, css_bar, css_nested, css_union, css_union_limit, css_union_nested;
+DROP TABLE css;
+DROP EXTENSION bm25_native;

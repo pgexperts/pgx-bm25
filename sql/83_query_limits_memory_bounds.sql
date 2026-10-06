@@ -1,0 +1,276 @@
+-- 83_query_limits_memory_bounds: PR-G — the four unbounded query/memory inputs
+-- (#65.7 jsonb slop, #65.8 folded boost, #62.5 match-set materialization,
+-- #65.13 token array).
+--
+-- What each section would look like WITHOUT its fix, since a bound is the class of
+-- thing that most easily ships a test passing either way:
+--
+--   #65.7  the jsonb line returns 20 instead of erroring, while the text line
+--          beside it errors — the asymmetry IS the defect, so both surfaces are
+--          asserted together rather than the jsonb one alone.
+--   #65.8  the query returns 0 rows and no error. That is the whole point: a
+--          folded-to-zero boost makes seg_posting_cb drop the doc BEFORE it
+--          reaches the accumulator, so the doc is absent rather than scored 0.
+--          A count of 0 next to an otherwise identical query returning 20 is what
+--          "silently vanishes" looks like from SQL.
+--   #62.5  both scan paths return 3000. Nothing errors, nothing warns; the
+--          pre-fix failure only appears at a corpus size no regression suite can
+--          afford, which is why the budget is made small instead of the corpus
+--          large.
+--   #65.13 nothing observable — the pre-fix code produces identical tokens, just
+--          from one oversized up-front palloc. What IS newly exercised is the
+--          growth path (the initial guess is now clamped to 1024 entries), so the
+--          assertions below are about token identity across several doublings.
+--
+-- Deliberately NOT asserted: how many documents a given budget buys. The per-entry
+-- charges are sums of sizeof()s, so pinning a document count would make this suite
+-- fail on any platform whose struct padding differs from the CI pair's. Every #62.5
+-- assertion therefore shrinks the BUDGET and — with the one documented exception
+-- below — stays an order of magnitude clear of the boundary in both directions,
+-- rather than tuning a corpus to sit near it. Where the message's content matters
+-- (which GUC it names), it is inspected through GET STACKED DIAGNOSTICS rather than
+-- diffed out of the error text.
+CREATE EXTENSION bm25_native;
+CREATE TABLE ql (id int PRIMARY KEY, body text);
+INSERT INTO ql SELECT i, 'red car number ' || i FROM generate_series(1,20) i;
+CREATE INDEX ql_bm25 ON ql USING bm25_native (body);
+SET enable_seqscan = off;
+
+-- ------------------------------------------------------- #65.7 phrase.slop cap
+-- One bound, both surfaces. At the cap both accept.
+SELECT count(*) AS jsonb_at_cap FROM ql
+ WHERE body @@@ bm25_phrase('body', 'red car', slop => 100000);
+SELECT count(*) AS text_at_cap FROM ql
+ WHERE body @@@ '"red car"~100000';
+-- One past it, both reject. Before the fix only the text line did.
+\set VERBOSITY terse
+SELECT count(*) FROM ql WHERE body @@@ bm25_phrase('body', 'red car', slop => 100001);
+SELECT count(*) FROM ql WHERE body @@@ '"red car"~100001';
+-- The value the finding names: INT_MAX made (nterms - 1) + slop wrap, and the
+-- span test then admitted any co-occurrence at all.
+SELECT count(*) FROM ql WHERE body @@@ bm25_phrase('body', 'red car', slop => 2147483647);
+-- The lower bound still holds and still has its own message.
+SELECT count(*) FROM ql WHERE body @@@ bm25_phrase('body', 'red car', slop => -1);
+\set VERBOSITY default
+
+-- ------------------------------------------------------ #65.8 folded boost
+-- A legal fold is untouched: 2.0 * 3.0 = 6.0 multiplies the leaf's idf.
+SELECT count(*) AS legal_fold FROM ql
+ WHERE body @@@ bm25_boost(2.0, bm25_boost(3.0, bm25_term('body', 'red')));
+-- Underflow: each weight passes parse_boost's per-weight guard, the product does
+-- not. Pre-fix this returned 0 rows with no error.
+SELECT count(*) FROM ql
+ WHERE body @@@ bm25_boost(1e-300, bm25_boost(1e-300, bm25_term('body', 'red')));
+-- Overflow is the symmetric case and threads +Inf into every score and WAND bound.
+SELECT count(*) FROM ql
+ WHERE body @@@ bm25_boost(1e300, bm25_boost(1e300, bm25_term('body', 'red')));
+-- Not a property of extreme literals: eleven ordinary-looking 1e-30 weights reach
+-- the same place, well inside BM25_QUERY_MAX_DEPTH.
+SELECT count(*) FROM ql WHERE body @@@
+  bm25_boost(1e-30, bm25_boost(1e-30, bm25_boost(1e-30, bm25_boost(1e-30,
+  bm25_boost(1e-30, bm25_boost(1e-30, bm25_boost(1e-30, bm25_boost(1e-30,
+  bm25_boost(1e-30, bm25_boost(1e-30, bm25_boost(1e-30,
+    bm25_term('body', 'red'))))))))))));
+-- A NEGATED leaf's folded boost is never read — a must_not leaf marks presence and
+-- contributes no score — so the guard must not fire there. It is the same underflow
+-- as above, in a query whose behaviour is correct and unchanged. (Review finding,
+-- PR-G: the first version errored here, with a "would silently match nothing"
+-- message that is false for must_not.)
+SELECT count(*) AS inert_must_not_boost FROM ql WHERE body @@@ bm25_boolean(
+         must     => ARRAY[bm25_term('body', 'red')],
+         must_not => ARRAY[bm25_boost(1e-300, bm25_boost(1e-300,
+                             bm25_term('body', 'absent')))]);
+-- ...and the exclusion still excludes, so this is inertness and not a hole: the same
+-- underflowed boost over a term every document HAS must still remove every row.
+SELECT count(*) AS zero_boost_must_not_still_excludes FROM ql WHERE body @@@ bm25_boolean(
+         must     => ARRAY[bm25_term('body', 'red')],
+         must_not => ARRAY[bm25_boost(1e-300, bm25_boost(1e-300,
+                             bm25_term('body', 'car')))]);
+-- ...and the same depth with ordinary weights still folds to a finite positive
+-- product, so the guard rejects the arithmetic and not the nesting.
+SELECT count(*) AS deep_legal_fold FROM ql WHERE body @@@
+  bm25_boost(2.0, bm25_boost(2.0, bm25_boost(2.0, bm25_boost(2.0,
+  bm25_boost(2.0, bm25_boost(2.0, bm25_boost(2.0, bm25_boost(2.0,
+  bm25_boost(2.0, bm25_boost(2.0, bm25_boost(2.0,
+    bm25_term('body', 'red'))))))))))));
+
+-- --------------------------------------------- #62.5 match-set materialization
+CREATE TABLE qm (id int PRIMARY KEY, body text);
+INSERT INTO qm SELECT i, 'common word doc ' || i FROM generate_series(1,3000) i;
+CREATE INDEX qm_bm25 ON qm USING bm25_native (body);
+-- 3000 documents is nowhere near the 256 MB default, on either path.
+SELECT count(*) AS filter_default_budget FROM qm WHERE body @@@ 'common';
+SELECT count(*) AS ranked_default_budget FROM
+  (SELECT id FROM qm WHERE body @@@ 'common' ORDER BY body &@@ 'common') s;
+-- Shrink the budget rather than growing the corpus: 64kB is a few hundred
+-- documents, which is the same arithmetic a 256 MB budget performs at a few
+-- million. Both materializing paths must stop.
+SET bm25_native.max_match_memory = '64kB';
+\set VERBOSITY terse
+-- the non-scoring @@@ union path (tid_collector_add)
+SELECT count(*) FROM qm WHERE body @@@ 'common';
+-- the exhaustive scorer (the BM25AccEnt dynahash); wand_top_k = 0 forces it
+SET bm25_native.wand_top_k = 0;
+SELECT count(*) FROM
+  (SELECT id FROM qm WHERE body @@@ 'common' ORDER BY body &@@ 'common') s;
+RESET bm25_native.wand_top_k;
+\set VERBOSITY default
+-- The escape the HINT promises has to be real, or the hint is worse than none: a
+-- ranked scan stopping inside wand_top_k never materializes the match set, so it
+-- succeeds on the SAME 64kB budget that just rejected both paths above.
+SELECT count(*) AS ranked_limit_within_topk FROM
+  (SELECT id FROM qm WHERE body @@@ 'common' ORDER BY body &@@ 'common' LIMIT 10) s;
+-- ...and reading PAST wand_top_k does not, because bm25_gettuple's over-pull tail
+-- rebuild re-runs the exhaustive scorer. Asserted because the hint's wording
+-- ("LIMIT n no larger than wand_top_k") depends on it.
+\set VERBOSITY terse
+SELECT count(*) FROM
+  (SELECT id FROM qm WHERE body @@@ 'common' ORDER BY body &@@ 'common' LIMIT 500) s;
+\set VERBOSITY default
+-- The message must name the knob that actually supplied the budget, or it sends
+-- the reader to a setting that changes nothing. Inspected rather than diffed so
+-- the platform-dependent document count stays out of the expected output.
+DO $$
+DECLARE h text;
+BEGIN
+    PERFORM count(*) FROM qm WHERE body @@@ 'common';
+    RAISE NOTICE 'no error raised';
+EXCEPTION WHEN program_limit_exceeded THEN
+    GET STACKED DIAGNOSTICS h = PG_EXCEPTION_HINT;
+    RAISE NOTICE 'knob budget: names max_match_memory=% names work_mem=%',
+                 h LIKE '%max_match_memory%', h LIKE '%work\_mem%';
+END $$;
+-- 0 hands the budget back to work_mem, and the message follows it there.
+SET bm25_native.max_match_memory = 0;
+SET work_mem = '64kB';
+DO $$
+DECLARE h text;
+BEGIN
+    PERFORM count(*) FROM qm WHERE body @@@ 'common';
+    RAISE NOTICE 'no error raised';
+EXCEPTION WHEN program_limit_exceeded THEN
+    GET STACKED DIAGNOSTICS h = PG_EXCEPTION_HINT;
+    RAISE NOTICE 'work_mem budget: names max_match_memory=% names work_mem=%',
+                 h LIKE '%max_match_memory%', h LIKE '%work\_mem%';
+END $$;
+RESET work_mem;
+-- A must_not leaf contributes NO score, so its documents never enter the scoring
+-- accumulator — they enter the leaf-presence hash instead. Bounding the
+-- accumulator alone would therefore have left this shape unbounded through the one
+-- leaf kind that never reaches it: here the must leaf matches one document and the
+-- must_not leaf matches all 3000.
+SET bm25_native.max_match_memory = '64kB';
+\set VERBOSITY terse
+SELECT count(*) FROM qm WHERE body @@@ bm25_boolean(
+         must     => ARRAY[bm25_term('body', '2999')],
+         must_not => ARRAY[bm25_term('body', 'common')]);
+\set VERBOSITY default
+RESET bm25_native.max_match_memory;
+-- Same query on the default budget: the must_not does its job, no error.
+SELECT count(*) AS boolean_default_budget FROM qm WHERE body @@@ bm25_boolean(
+         must     => ARRAY[bm25_term('body', '2999')],
+         must_not => ARRAY[bm25_term('body', 'common')]);
+-- The budget is charged in BYTES, not documents, and the `@@@` union collector takes
+-- one entry per (term, document) — it dedupes only afterwards. An earlier version
+-- counted documents there, which made the effective limit scale as 1/nterms: these
+-- two queries match the SAME 3000 documents, and the three-term one errored while
+-- the one-term one did not. Both must now behave alike. (Review finding, PR-G.)
+--
+-- The one assertion in this file that sits NEAR its boundary, and unavoidably so:
+-- it separates two accountings that differ by only 2.5x per posting (48 charged
+-- bytes against the 120 the old code charged per counted document), so the window
+-- where byte-counting passes and document-counting fails is 2.5x wide and no
+-- choice of budget widens it. 640kB is its geometric middle — ~1.5x of margin
+-- either way, verified against both versions of the code rather than computed.
+SET bm25_native.max_match_memory = '640kB';
+SELECT count(*) AS union_one_term    FROM qm WHERE body @@@ 'common';
+SELECT count(*) AS union_three_terms FROM qm WHERE body @@@ 'common word doc';
+RESET bm25_native.max_match_memory;
+-- Phrase position lists are charged too. They are the one structure whose BYTES do
+-- not follow the document count: a stashed doc costs up to tf positions, and tf
+-- reaches 65535. 200 documents is far under any document-count limit, but their
+-- positions are not — before the budget became byte-based this returned 200 rows
+-- having stashed megabytes. (Review finding, PR-G.)
+CREATE TABLE qp (id int PRIMARY KEY, body text);
+INSERT INTO qp SELECT i, repeat('lorem ipsum ', 1500) FROM generate_series(1,200) i;
+CREATE INDEX qp_bm25 ON qp USING bm25_native (body);
+SET bm25_native.max_match_memory = '64kB';
+\set VERBOSITY terse
+SELECT count(*) FROM
+  (SELECT id FROM qp WHERE body @@@ '"lorem ipsum"' ORDER BY body &@@ '"lorem ipsum"') s;
+\set VERBOSITY default
+RESET bm25_native.max_match_memory;
+SELECT count(*) AS phrase_default_budget FROM
+  (SELECT id FROM qp WHERE body @@@ '"lorem ipsum"' ORDER BY body &@@ '"lorem ipsum"') s;
+-- Restored budget, restored answers.
+SELECT count(*) AS filter_budget_restored FROM qm WHERE body @@@ 'common';
+
+-- ------------------------------------------------------ #65.13 token array growth
+-- The up-front guess is clamped to 1024 entries and the array doubles from there,
+-- so these cross the growth boundary two and three times. Distinct tokens, so a
+-- botched repalloc surfaces as wrong CONTENT and not merely a wrong count.
+SELECT array_length(bm25_debug_tokenize(
+         (SELECT string_agg('w' || i, ' ' ORDER BY i)
+            FROM generate_series(1, 3000) i)), 1) AS analyze_ntok;
+-- The token at the far end is the one an off-by-one in the growth step loses.
+SELECT (bm25_debug_tokenize(
+          (SELECT string_agg('w' || i, ' ' ORDER BY i)
+             FROM generate_series(1, 3000) i)))[3000] AS analyze_last_token;
+-- Exactly at the boundary, and one either side of it.
+SELECT array_length(bm25_debug_tokenize(
+         (SELECT string_agg('w' || i, ' ' ORDER BY i)
+            FROM generate_series(1, 1024) i)), 1) AS at_initial_cap;
+SELECT array_length(bm25_debug_tokenize(
+         (SELECT string_agg('w' || i, ' ' ORDER BY i)
+            FROM generate_series(1, 1025) i)), 1) AS one_past_initial_cap;
+-- The legacy tokenizer (bm25_tokenize, debug-only since M3) has its own emit site
+-- and its own growth call; bm25_debug_accum is the only SQL path that reaches it.
+SELECT count(*) AS legacy_distinct_terms
+  FROM bm25_debug_accum(ARRAY[(SELECT string_agg('t' || i, ' ' ORDER BY i)
+                                 FROM generate_series(1, 2000) i)]);
+
+-- ------------------------------------------------- HDL-04/QRY-10 wand_top_k
+-- bm25_native.wand_top_k drove an EAGER sizeof(BM25Scored) * k allocation --
+-- twice, once for the heap's array and once for the drain buffer -- and its upper
+-- bound was INT_MAX. The allocation was a function of the GUC alone, not of the
+-- corpus or the query, so `SET bm25_native.wand_top_k = 33554431` cost ~1 GB per
+-- ranked scan on this 20-row table, and one notch higher it became palloc's
+-- anonymous XX000 "invalid memory alloc request size" from inside the scan.
+--
+-- WITHOUT the fix: the SET below SUCCEEDS (INT_MAX was in range) and the ranked
+-- query underneath it either allocates gigabytes or fails with that XX000.
+--
+-- THAT IS THE ONLY TOOTH HERE, and only for the GUC's bound (HDL-04). The other
+-- half of the fix -- the heap's array growing on demand toward k instead of being
+-- sized to it up front (QRY-10) -- has NO assertion, and cannot have one from SQL:
+-- it changes an allocation SIZE and nothing else, so the query below returns the
+-- identical rows against the unfixed build (at k = 1000000 the pre-fix allocation
+-- is ~32 MB twice, comfortably under MaxAllocSize, so it does not even error).
+-- Stated rather than left to be inferred, because a section whose assertions pass
+-- against the broken build is exactly the failure this suite's own header warns
+-- about. QRY-10 is covered by review, not by a test.
+--
+-- The ceiling's VALUE is MaxAllocSize / sizeof(BM25Scored) -- a sizeof, so it is
+-- platform-dependent and deliberately never printed here (this suite's header
+-- states the rule). Only the SQLSTATE is inspected, via GET STACKED DIAGNOSTICS,
+-- exactly as the #62.5 section inspects which GUC its message names.
+DO $$
+BEGIN
+    EXECUTE 'SET bm25_native.wand_top_k = 2147483647';
+    RAISE NOTICE 'wand_top_k INT_MAX accepted (no ceiling)';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'wand_top_k INT_MAX rejected, sqlstate %', SQLSTATE;
+END $$;
+-- A k far above any plausible corpus is still legal, and now costs what the query
+-- produces rather than what the knob says: the heap's array grows on demand toward
+-- k instead of being sized to it up front. Single-key ORDER BY, per house style --
+-- a secondary sort key would collapse the ranking onto that key.
+SET bm25_native.wand_top_k = 1000000;
+SELECT id FROM ql WHERE body @@@ 'red' ORDER BY body &@@ 'red' LIMIT 3;
+RESET bm25_native.wand_top_k;
+
+RESET enable_seqscan;
+DROP TABLE qp;
+DROP TABLE qm;
+DROP TABLE ql;
+DROP EXTENSION bm25_native;

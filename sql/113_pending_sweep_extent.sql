@@ -1,0 +1,157 @@
+-- 113_pending_sweep_extent -- issue #243: VACUUM's pending sweep and its extent sample.
+--
+-- bm25_pending_mark_dead bounds its walk of the pending chain by the relation's extent
+-- and raises ERRCODE_INDEX_CORRUPTED when a link points past it. It sampled that
+-- extent once, and it walks under the seal singleton in ShareLock mode -- the SAME mode
+-- appenders take -- so a concurrent INSERT could extend the relation and link a new
+-- tail page after the sample. The sweep then met a healthy block at or past its own
+-- sample and failed VACUUM with a false "chain exceeds the relation's extent". It now
+-- re-samples the extent before it calls a link out of range, like the SEGCAT walkers
+-- (issue #225, ADR 0095 addendum).
+--
+-- No suite can land an append inside a live sweep deterministically, but the race only
+-- changes the VALUE of the sample, so bm25_debug_pending_sweep runs the real sweep with
+-- a caller-chosen one (and a callback that reports nothing dead, so it writes nothing).
+--
+-- Known residuals, left untested on purpose (#269 T2, T3):
+--   - A concurrent INSERT+VACUUM stress run. There is no pause point inside the sweep's
+--     window between sampling the extent and following a link, so such a run would
+--     only rarely open that window. The re-sample is pinned here by the stale-sample
+--     probe instead.
+--   - A dedicated test of bm25_debug_pending_nth_page's re-sample. It goes through the
+--     same bm25_blk_in_extent the sweep uses, which this file and
+--     110_chain_walk_consistency already cover. Only its out-of-extent NULL answers
+--     are checked below.
+CREATE EXTENSION bm25_native;
+
+-- A shared error renderer. SQLSTATE is pinned alongside the message; block numbers are
+-- stripped because they depend on BLCKSZ and on how many pages this build wrote.
+CREATE FUNCTION pg_temp.err_of(q text) RETURNS text AS $$
+BEGIN
+    EXECUTE q;
+    RETURN 'NO ERROR RAISED';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' ' || regexp_replace(SQLERRM, 'block [0-9]+', 'block N');
+END; $$ LANGUAGE plpgsql;
+
+-- VACUUM hands bulkdelete only REMOVABLE tuples. Another backend in this database
+-- holding an older snapshot (in installcheck, an autovacuum worker's ANALYZE) leaves
+-- rows deleted before a VACUUM "recently dead": bulkdelete never sees them and nothing is
+-- tombstoned. Each VACUUM that depends on reclaiming them waits for no other backend
+-- here to hold an xmin first; sql/17_delete documents the mechanism and why the wait
+-- is sufficient, not just a narrower race.
+CREATE FUNCTION pg_temp.wait_for_xmin_horizon() RETURNS void AS $$
+DECLARE
+  deadline timestamptz := clock_timestamp() + interval '30 seconds';
+BEGIN
+  LOOP
+    PERFORM pg_stat_clear_snapshot();   -- else pg_stat_activity is cached per xact
+    EXIT WHEN NOT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND backend_xmin IS NOT NULL);
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION
+        'xmin horizon still held by another backend after 30s; VACUUM cannot reclaim';
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+-- The chain's length in pages, counted through bm25_debug_pending_nth_page -- an
+-- independent walker -- so the sweep's own count is checked against something it did
+-- not produce. The relation's page count bounds n.
+CREATE FUNCTION pg_temp.chain_len(idx regclass) RETURNS bigint AS $$
+    SELECT count(*) FROM generate_series(0, bm25_debug_npages(idx)) n
+     WHERE bm25_debug_pending_nth_page(idx, n::int) IS NOT NULL;
+$$ LANGUAGE sql;
+
+-- Never seal during the load: the chain must still be pending when it is swept.
+-- Autovacuum off, because its cleanup pass seals the pending list.
+SET bm25_native.seal_threshold = '1GB';
+CREATE TABLE ps (id int, body text) WITH (autovacuum_enabled = off);
+CREATE INDEX ps_bm ON ps USING bm25_native (body);
+INSERT INTO ps SELECT g, 'alpha beta gamma delta doc' || g FROM generate_series(1, 2000) g;
+
+SELECT pg_temp.chain_len('ps_bm') >= 3 AS chain_spans_pages,
+       (SELECT nsegs FROM bm25_stats('ps_bm')) AS nsegs;
+
+-- Negative control first: a fresh sample walks the whole chain.
+SELECT bm25_debug_pending_sweep('ps_bm', -1) = pg_temp.chain_len('ps_bm')
+       AS fresh_sample_walks_chain;
+
+-- The stale sample. 1 is the metapage alone, which puts every pending page -- the head
+-- first -- past the sample, exactly as a tail page linked mid-sweep lands past it; 0 is
+-- staler still. The chain is healthy, so the sweep must walk all of it. Pre-fix each
+-- of these raised "pending-list chain exceeds the relation's extent".
+SELECT bm25_debug_pending_sweep('ps_bm', 1) = pg_temp.chain_len('ps_bm')
+       AS stale_sample_walks_chain;
+SELECT bm25_debug_pending_sweep('ps_bm', 0) = pg_temp.chain_len('ps_bm')
+       AS stale_sample_0_walks_chain;
+-- A sample that ends partway down the chain: the violation is met mid-walk rather
+-- than at the head, and the cycle cap -- which reads the same extent -- must see the
+-- refreshed value from then on.
+SELECT bm25_debug_pending_sweep('ps_bm', bm25_debug_pending_nth_page('ps_bm', 2))
+         = pg_temp.chain_len('ps_bm')
+       AS stale_sample_mid_chain_walks_chain;
+
+-- The probe validates its arguments before it opens the index (97_debug_probe_arguments),
+-- and so does the lever for the chain added to it here.
+\set VERBOSITY terse
+SELECT bm25_debug_pending_sweep('ps_bm', -2);
+SELECT bm25_debug_pending_sweep('ps_bm', 4294967296);
+-- A sample AHEAD of the relation is not stale, it is impossible, and it would switch
+-- the bound off rather than exercise the re-sample.
+SELECT bm25_debug_pending_sweep('ps_bm', bm25_debug_npages('ps_bm') + 1);
+SELECT bm25_debug_stamp_chain_next('ps_bm', 'pending', 0, 0, 1);
+\set VERBOSITY default
+
+-- A GENUINELY out-of-extent link must still raise, stale sample or not: the re-sample
+-- must not turn the bound into no bound. One past the last real page is the smallest
+-- rejected value, which shows the bound is `>=` against the live extent. The lever
+-- returns the block it stamped; only its being a real block matters here.
+SELECT bm25_debug_stamp_chain_next('ps_bm', 'pending', -1, 1, bm25_debug_npages('ps_bm')) > 0
+       AS stamped_one_past_end;
+SELECT pg_temp.err_of($q$SELECT bm25_debug_pending_sweep('ps_bm', -1)$q$)
+       AS sweep_one_past_end;
+SELECT pg_temp.err_of($q$SELECT bm25_debug_pending_sweep('ps_bm', 1)$q$)
+       AS stale_sweep_one_past_end;
+-- nth_page meets the same link as the end of the chain, not as a page: n = 2 reads the
+-- stamped link as its answer (the trailing extent check), and n = 3 would have to step
+-- through it (the loop's extent check). n = 1 still names a real page.
+SELECT bm25_debug_pending_nth_page('ps_bm', 1) IS NOT NULL AS nth_1_is_a_page,
+       bm25_debug_pending_nth_page('ps_bm', 2) IS NULL AS nth_2_past_end_is_null,
+       bm25_debug_pending_nth_page('ps_bm', 3) IS NULL AS nth_3_past_end_is_null;
+
+-- And through VACUUM itself. 4294967294 is one below InvalidBlockNumber -- the largest
+-- value that is still a block number, so nothing that tests for InvalidBlockNumber can
+-- answer instead of the extent bound -- and it keeps the message free of a
+-- build-dependent block number. INDEX_CLEANUP ON so the dead tuples reach
+-- ambulkdelete rather than being bypassed; the index has no segments, so the pending
+-- sweep is the first walk that VACUUM makes.
+SELECT bm25_debug_stamp_chain_next('ps_bm', 'pending', -1, 1, 4294967294) > 0
+       AS stamped_near_invalid;
+DELETE FROM ps WHERE id <= 10;
+SELECT pg_temp.wait_for_xmin_horizon();
+VACUUM (INDEX_CLEANUP ON) ps;
+SELECT pg_temp.err_of($q$SELECT bm25_debug_pending_sweep('ps_bm', 1)$q$)
+       AS stale_sweep_near_invalid;
+
+-- The lever's own kind check on the pending chain names a PENDING page, not a segment
+-- page (issue #278, K3). Forge the head page's nextblk to block 0, the metapage: forging
+-- a link on page 1 then meets the metapage as the lever's target, and page 2 meets it
+-- mid-walk -- the two places the lever checks a page's kind.
+SELECT bm25_debug_stamp_chain_next('ps_bm', 'pending', -1, 0, 0) > 0
+       AS stamped_head_to_metapage;
+SELECT pg_temp.err_of($q$SELECT bm25_debug_stamp_chain_next('ps_bm', 'pending', -1, 1, 1)$q$)
+       AS lever_target_wrong_kind;
+SELECT pg_temp.err_of($q$SELECT bm25_debug_stamp_chain_next('ps_bm', 'pending', -1, 2, 1)$q$)
+       AS lever_walk_wrong_kind;
+
+-- The lever leaves the chain permanently corrupt by construction.
+DROP TABLE ps;
+RESET bm25_native.seal_threshold;
+
+DROP EXTENSION bm25_native;

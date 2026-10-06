@@ -1,0 +1,222 @@
+-- Negative IDF and the WAND block-max bound (review ref C3).
+--
+-- bm25_idf's non-negativity was documented as "guaranteed by caller" and was not.
+-- The single-field scan path sums the RAW dictionary df across segments (df is
+-- never decremented on delete) while the denominator live_ndocs IS live (every
+-- tombstone decrements meta->ndocs).  Delete enough of a term's documents with no
+-- intervening merge and df > N, so log's argument drops below 1 and idf goes
+-- negative.
+--
+-- That is not merely an odd score.  bm25_termscore is idf * (tf*(k1+1)) / denom,
+-- so a negative idf INVERTS its monotonicity in tf and doclen -- and that
+-- monotonicity is the entire basis of the WAND block-max bound.  Evaluated at
+-- (max_tf, min_doclen) the bound becomes the block MINIMUM, sinks below real
+-- scores, and WAND prunes documents the exhaustive scorer keeps: a silent wrong
+-- answer that also breaks the bit-identical WAND == exhaustive contract.
+--
+-- Two things are needed to make the divergence observable, and 44_wand_skip has
+-- neither:
+--   * varying tf, so the top-k is not a pile of ties broken by ascending TID --
+--     which WAND scans in anyway, masking the reordering; and
+--   * enough live documents to span SEVERAL 128-posting blocks, so block-max
+--     pruning has something to skip.  Under a few hundred docs everything sits in
+--     one block and WAND is trivially correct no matter how wrong the bound is.
+-- With both, the pre-fix scan returns the top-scoring docs it meets first and then
+-- breaks out of the segment ("nothing remaining can reach theta", because the
+-- inverted bound is below every real score), silently truncating the ranking.
+
+CREATE EXTENSION bm25_native;
+
+-- ---------------------------------------------------------------- unit level
+-- bm25_debug_score calls bm25_idf directly.  df <= N is unchanged; df > N is
+-- treated as df == N ("more docs contain the term than exist" means all of them).
+SELECT round(bm25_debug_score(200, 20, 1, 3, 3.0, 1.2, 0.75)::numeric, 6) AS df_well_below_n;
+SELECT round(bm25_debug_score(200, 200, 1, 3, 3.0, 1.2, 0.75)::numeric, 6) AS df_equals_n;
+SELECT round(bm25_debug_score(100, 200, 1, 3, 3.0, 1.2, 0.75)::numeric, 6) AS df_double_n;
+SELECT round(bm25_debug_score(100, 200, 5, 3, 3.0, 1.2, 0.75)::numeric, 6) AS df_double_n_high_tf;
+
+-- df > N collapses onto df == N rather than going negative.
+SELECT bm25_debug_score(100, 200, 1, 3, 3.0, 1.2, 0.75)
+         = bm25_debug_score(100, 100, 1, 3, 3.0, 1.2, 0.75) AS clamps_to_df_equals_n;
+
+-- The two properties the WAND bound depends on, in the df > N regime:
+-- monotone non-decreasing in tf, monotone non-increasing in doclen.  Both invert
+-- when idf is negative, which is what made the bound a LOWER bound.
+SELECT bm25_debug_score(100, 200, 5, 3, 3.0, 1.2, 0.75)
+         >= bm25_debug_score(100, 200, 1, 3, 3.0, 1.2, 0.75) AS monotone_in_tf;
+SELECT bm25_debug_score(100, 200, 1, 3, 3.0, 1.2, 0.75)
+         >= bm25_debug_score(100, 200, 1, 30, 3.0, 1.2, 0.75) AS monotone_in_doclen;
+
+-- Strictly positive, NOT exactly zero.  idf == 0.0 is a live in-band sentinel
+-- meaning "term absent from this field"; a present term that landed on it would
+-- be skipped by the scorer and drop out of the ranking entirely.
+SELECT bm25_debug_score(100, 200, 1, 3, 3.0, 1.2, 0.75) > 0 AS not_the_absent_sentinel;
+
+-- ------------------------------------------------------------- end to end
+-- 3000 single-field docs, all containing 'xterm', with tf varying 1..7 so the
+-- scores are not a pile of ties.  A distinct filler token per doc spreads doclens.
+-- 1000 survive the delete below; all 3000 postings (24 blocks) stay in the
+-- segment until a merge. Pre-fix, the inverted bound made WAND prune here; with
+-- the clamp it prunes nothing on this corpus (see "WAND pruning in the regime"
+-- below).
+CREATE TABLE nidf (id int primary key, body text);
+INSERT INTO nidf
+SELECT g,
+       repeat('xterm ', 1 + (g % 7)) || 'filler' || g
+  FROM generate_series(1, 3000) g;
+CREATE INDEX nidf_bm25 ON nidf USING bm25_native (body);
+SELECT bm25_seal('nidf_bm25');
+
+-- Delete two thirds of the corpus and tombstone it.  No merge, so the dictionary
+-- df stays 3000 while live_ndocs falls to 1000: df > N, and the idf goes negative.
+DELETE FROM nidf WHERE id > 1000;
+-- VACUUM hands bulkdelete only REMOVABLE tuples. Another backend in this database
+-- holding an older snapshot (in installcheck, an autovacuum worker's ANALYZE) leaves
+-- the rows deleted above "recently dead": bulkdelete never sees them and nothing is
+-- tombstoned. Each VACUUM that depends on reclaiming them waits for no other backend
+-- here to hold an xmin first; sql/17_delete documents the mechanism and why the wait
+-- is sufficient, not just a narrower race.
+CREATE FUNCTION pg_temp.wait_for_xmin_horizon() RETURNS void AS $$
+DECLARE
+  deadline timestamptz := clock_timestamp() + interval '30 seconds';
+BEGIN
+  LOOP
+    PERFORM pg_stat_clear_snapshot();   -- else pg_stat_activity is cached per xact
+    EXIT WHEN NOT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND backend_xmin IS NOT NULL);
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION
+        'xmin horizon still held by another backend after 30s; VACUUM cannot reclaim';
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+SELECT pg_temp.wait_for_xmin_horizon();
+VACUUM nidf;
+
+SELECT (SELECT count(*) FROM nidf) AS live_rows;
+
+-- The index really is in the clamped regime. Read df off the index, not off the
+-- numbers this file meant to produce: if VACUUM ever merged here (it runs an
+-- opportunistic merge), df would drop to the live count and every gate below
+-- would pass without testing the clamp.
+SELECT df AS dict_df, df > (SELECT count(*) FROM nidf) AS df_exceeds_live_rows
+  FROM bm25_debug_terms('nidf_bm25') WHERE term = 'xterm';
+-- At df=3000 over N=1000 the unclamped formula would be negative.
+SELECT round(bm25_debug_score(1000, 3000, 3, 6, 6.0, 1.2, 0.75)::numeric, 6) AS clamped_contribution;
+
+SET enable_seqscan = off;
+
+-- The ranked scan must still RETURN the matching rows.  Clamping the idf RESULT
+-- to zero instead of clamping df would land on the "term absent from this field"
+-- sentinel and empty this out -- trading a mis-ordered answer for no answer.
+SELECT count(*) AS ranked_rows
+  FROM (SELECT id FROM nidf WHERE body @@@ 'xterm'
+         ORDER BY body &@@ 'xterm' LIMIT 30) s;
+
+-- ...and agree with plain @@@ membership on which rows qualify.
+SELECT count(*) AS membership_rows FROM nidf WHERE body @@@ 'xterm';
+
+-- The gate: WAND's ordered top-30 must equal the exhaustive scan's, exactly.
+-- An array equality, not a count -- a single dropped or reordered doc fails it.
+SET bm25_native.wand_top_k = 100;
+WITH w AS (SELECT id FROM nidf WHERE body @@@ 'xterm'
+             ORDER BY body &@@ 'xterm' LIMIT 30)
+SELECT array_agg(id) AS ids FROM w \gset wand_
+
+SET bm25_native.wand_top_k = 0;
+WITH e AS (SELECT id FROM nidf WHERE body @@@ 'xterm'
+             ORDER BY body &@@ 'xterm' LIMIT 30)
+SELECT array_agg(id) AS ids FROM e \gset exh_
+
+SELECT :'wand_ids'::int[] = :'exh_ids'::int[] AS wand_parity_under_negative_idf;
+
+-- Pinned (still under wand_top_k = 0, i.e. the exhaustive scan) so a future
+-- reordering reads as a diff rather than a bare flipped boolean.  Every tf=1 doc
+-- ties, so the order is the TID tie-break.  Pre-fix, WAND truncated its own list
+-- at doc 98 and wrapped round to lower-scoring docs while this list ran on.
+SELECT array_agg(id) AS exhaustive_top30
+  FROM (SELECT id FROM nidf WHERE body @@@ 'xterm'
+         ORDER BY body &@@ 'xterm' LIMIT 30) s;
+
+-- A term whose df is still well below N keeps a real, positive-idf ranking, so
+-- the clamp has not flattened ordinary scoring.
+SELECT array_agg(id ORDER BY id) AS rare_hits
+  FROM (SELECT id FROM nidf WHERE body @@@ 'filler7' LIMIT 10) s;
+
+-- After a merge the dictionary df is rebuilt from live docs only, so idf leaves
+-- the clamped regime -- and the two paths must still agree.
+--
+-- The merge has to happen for that to be true. bm25_merge_select chooses nothing
+-- from a one-segment catalog, so on the index as it stands bm25_merge is a no-op
+-- and df stays 3000. A second, unrelated segment lets the tombstone rule pick the
+-- two-thirds-dead one and rewrite it alone.
+INSERT INTO nidf VALUES (5001, 'unrelated');
+SELECT bm25_seal('nidf_bm25');
+SELECT ndocs, live_ndocs, chosen FROM bm25_debug_merge_plan('nidf_bm25') ORDER BY gen;
+SELECT bm25_merge('nidf_bm25');
+SELECT df AS dict_df_after_merge, df <= (SELECT count(*) FROM nidf) AS left_clamped_regime
+  FROM bm25_debug_terms('nidf_bm25') WHERE term = 'xterm';
+
+SET bm25_native.wand_top_k = 100;
+WITH w AS (SELECT id FROM nidf WHERE body @@@ 'xterm'
+             ORDER BY body &@@ 'xterm' LIMIT 30)
+SELECT array_agg(id) AS ids FROM w \gset wandm_
+
+SET bm25_native.wand_top_k = 0;
+WITH e AS (SELECT id FROM nidf WHERE body @@@ 'xterm'
+             ORDER BY body &@@ 'xterm' LIMIT 30)
+SELECT array_agg(id) AS ids FROM e \gset exhm_
+
+SELECT :'wandm_ids'::int[] = :'exhm_ids'::int[] AS wand_parity_after_merge;
+
+-- ------------------------------------------------- WAND pruning in the regime
+-- The parity gates above caught the inverted bound because, pre-fix, that bound
+-- made WAND prune. With the clamp in place WAND prunes nothing on that corpus:
+-- every 128-posting block holds a tf=7 doc, so no block bound falls below theta,
+-- and bm25_wand_stats scores all 3000 postings. Parity there shows the clamp
+-- does not mis-rank, not that pruning is sound under it. This corpus varies tf by
+-- block instead -- tf 1..7 in the first 256 ids, tf 1 after -- so once theta
+-- reaches the high-tf docs the tf=1 blocks are skipped, and the same gate then
+-- runs with WAND actually pruning, still at df > N.
+CREATE TABLE nidb (id int primary key, body text);
+INSERT INTO nidb
+SELECT g,
+       repeat('xterm ', CASE WHEN g <= 256 THEN 1 + (g % 7) ELSE 1 END) || 'filler' || g
+  FROM generate_series(1, 3000) g;
+CREATE INDEX nidb_bm25 ON nidb USING bm25_native (body);
+DELETE FROM nidb WHERE id > 1000;
+SELECT pg_temp.wait_for_xmin_horizon();
+VACUUM nidb;
+
+SELECT df > (SELECT count(*) FROM nidb) AS df_exceeds_live_rows
+  FROM bm25_debug_terms('nidb_bm25') WHERE term = 'xterm';
+
+-- Pruning engaged: fewer postings scored than the term has, and at least one
+-- block passed over, whole or at its deep check.
+SELECT docs_scored < 3000 AS scored_fewer_than_df,
+       blocks_skipped + deep_check_skips > 0 AS blocks_pruned
+  FROM bm25_wand_stats('nidb_bm25', 'xterm', 100);
+
+SET bm25_native.wand_top_k = 100;
+WITH w AS (SELECT id FROM nidb WHERE body @@@ 'xterm'
+             ORDER BY body &@@ 'xterm' LIMIT 30)
+SELECT array_agg(id) AS ids FROM w \gset wandb_
+
+SET bm25_native.wand_top_k = 0;
+WITH e AS (SELECT id FROM nidb WHERE body @@@ 'xterm'
+             ORDER BY body &@@ 'xterm' LIMIT 30)
+SELECT array_agg(id) AS ids FROM e \gset exhb_
+
+SELECT :'wandb_ids'::int[] = :'exhb_ids'::int[] AS wand_parity_while_pruning;
+-- Pinned (exhaustive): the tf=7 docs of the first 256 ids, in TID order.
+SELECT :'exhb_ids' AS exhaustive_top30_pruning_corpus;
+
+RESET bm25_native.wand_top_k;
+RESET enable_seqscan;
+DROP TABLE nidf, nidb;
+DROP EXTENSION bm25_native;

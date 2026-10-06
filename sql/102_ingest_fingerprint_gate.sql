@@ -1,0 +1,219 @@
+-- 102_ingest_fingerprint_gate: the INGEST path is analyzer-gated, not just the scan
+-- path (#188, ADR 0081).
+--
+-- What was wrong. bm25_fingerprint_gate had scan-side callers only. bm25_insert
+-- resolved the analyzer with bm25_analyzer_config and tokenized with it, and nothing
+-- compared the result against the fingerprint the build stamped on the metapage. That
+-- is not the scan side's failure mode: a wrongly-analyzed SCAN returns bad results for
+-- one session and the next session is fine, while a wrongly-analyzed INSERT commits
+-- terms this index's analyzer does not produce, the next seal folds them into a real
+-- segment, and the row stays invisible to every correct query until REINDEX.
+--
+-- Two independent vectors reach it, and a fix that covers only the first is only half
+-- a fix -- which is why the gate is a fingerprint comparison and not a restricted
+-- search_path for ingest:
+--
+--   (1) DICTIONARY SHADOWING. Resolution of "<language>_stem" is by unqualified name
+--       through the CALLER's search_path, and INSERT is not one of the maintenance
+--       commands PG17's RestrictSearchPath covers. Pinning resolution the way CREATE
+--       INDEX does would cover this vector.
+--   (2) A RELOPTION EDIT. ALTER INDEX ... SET (language = 'french') moves the
+--       analyzer with no shadowing anywhere and nothing for a restricted search_path
+--       to see. #148 HDL-07 has since given `language` a validate_string callback,
+--       and that does NOT close this vector -- it rejects a language whose dictionary
+--       does not resolve, and 'french' resolves perfectly well. The reloption edit is
+--       legal; what it must not do is silently change what an INSERT writes into an
+--       index built under a different analyzer, which is what the gate below is for.
+--
+-- Both are asserted below, and both fail against the pre-fix build for the same
+-- reason: the INSERT simply succeeds.
+--
+-- The canary in Part 2 is load-bearing in the sense sql/85_builder_search_path and
+-- sql/101_stemmer_identity established: if "english_stem" does not actually resolve to
+-- the shadowing schema, every shadowing assertion after it is vacuously true and would
+-- stay true after someone reverted the fix.
+--
+-- On message text. Both ERROR variants embed the two fingerprint integers, which fold
+-- the database encoding and are NOT stable across environments, so every ERROR here is
+-- caught by a plpgsql handler that checks SQLSTATE and the message PREFIX. SQLSTATE
+-- alone would not do: any unrelated feature_not_supported raised by that statement
+-- would satisfy it, which is exactly the vacuity the canary exists to rule out. The
+-- WARNING in Part 5 cannot be caught at all, so its primary line is deliberately
+-- integer-free and its diagnostics live in DETAIL, which \set VERBOSITY terse drops.
+--
+-- No ranked-sequence assertion appears here on purpose: what #188 is about is whether
+-- a row is IN the index at all, so every assertion is a membership test in the house
+-- shape, array_agg(id ORDER BY id), which keeps row order out of the plan's hands.
+CREATE EXTENSION bm25_native;
+
+-- ---------------------------------------------------------------- Part 1
+-- Baseline. Build and insert under the ordinary path, where the resolved analyzer and
+-- the stamped fingerprint agree and the gate is a no-op.
+CREATE TABLE igt_docs (id int primary key, body text);
+INSERT INTO igt_docs VALUES (1, 'the negligent defendants'), (2, 'a quiet contract');
+CREATE INDEX igt_bm ON igt_docs USING bm25_native (body) WITH (language = 'english');
+
+SET enable_seqscan = off;
+
+-- An ordinary INSERT still works: the gate must not cost anything on the happy path.
+INSERT INTO igt_docs VALUES (3, 'another negligent filing');
+SELECT array_agg(id ORDER BY id) AS baseline FROM igt_docs WHERE body @@@ 'negligent';
+
+-- ---------------------------------------------------------------- Part 2
+-- ambuild needs nothing, and this pins why rather than assuming it.
+--
+-- pg_catalog is searched implicitly FIRST, so `SET search_path = igt, public` would
+-- still resolve english_stem in pg_catalog and this suite would test nothing. Listing
+-- pg_catalog explicitly LAST is what makes igt win.
+--
+-- Language = russian rather than english so the shadow is not merely a different
+-- catalog object but a genuinely different analyzer: russian_stem leaves 'negligent'
+-- alone where english_stem returns 'neglig'. The corruption in Part 5 is real, not
+-- notional.
+CREATE SCHEMA igt;
+CREATE TEXT SEARCH DICTIONARY igt.english_stem (TEMPLATE = snowball, Language = russian);
+SET search_path = igt, public, pg_catalog;
+
+-- Expect "igt". Anything else and every shadowing assertion below is vacuous.
+SELECT n.nspname AS english_stem_resolves_to
+FROM pg_ts_dict d JOIN pg_namespace n ON n.oid = d.dictnamespace
+WHERE d.oid = 'english_stem'::regdictionary;
+
+-- CREATE INDEX runs under PG17's restricted "pg_catalog, pg_temp" path, so it binds
+-- pg_catalog's dictionary no matter what the session's path says, and stamps the
+-- fingerprint it actually used. A recompute from a CLEAN path therefore matches: the
+-- build is self-consistent, which is why the write path WAS the only ungated one.
+CREATE INDEX igt_bm_shadowbuilt ON public.igt_docs USING bm25_native (body);
+RESET search_path;
+SELECT (bm25_stats('igt_bm_shadowbuilt')).analyzer_fingerprint
+       = bm25_debug_analyzer_fingerprint('igt_bm_shadowbuilt') AS ambuild_binds_pg_catalog;
+-- Drop it again so the rest of the suite has exactly one bm25 index to reason about.
+DROP INDEX igt_bm_shadowbuilt;
+
+-- ---------------------------------------------------------------- Part 3
+-- Vector 1: an INSERT under the shadowing path must be refused. Against the pre-fix
+-- build the INSERT succeeds and the DO block falls through to its own RAISE.
+SET search_path = igt, public, pg_catalog;
+DO $$
+DECLARE d text; h text;
+BEGIN
+  INSERT INTO public.igt_docs VALUES (4, 'a negligent trustee');
+  RAISE EXCEPTION 'ingest gate did NOT fire under a shadowing search_path (unexpected)';
+EXCEPTION
+  WHEN feature_not_supported THEN
+    GET STACKED DIAGNOSTICS d = PG_EXCEPTION_DETAIL, h = PG_EXCEPTION_HINT;
+    IF SQLERRM NOT LIKE 'bm25: analyzer fingerprint mismatch on insert%' THEN
+      RAISE EXCEPTION 'wrong feature_not_supported: %', SQLERRM;
+    END IF;
+    RAISE NOTICE 'ingest gate fired on the shadowing search_path, as expected';
+    -- The ERROR's DETAIL and HINT are deliberately integer-free (unlike its primary
+    -- line), so they are pinnable. Printing them here means a wording regression, or a
+    -- DETAIL/HINT swap, fails this suite instead of shipping.
+    RAISE NOTICE 'DETAIL: %', d;
+    RAISE NOTICE 'HINT: %', h;
+END $$;
+RESET search_path;
+
+-- The refused row is not in the table, and the rows that were already there are
+-- untouched. (The DO block's own RAISE would roll the INSERT back too, so this is a
+-- consistency check rather than a second A/B point.)
+SELECT array_agg(id ORDER BY id) AS after_refused_insert FROM igt_docs;
+
+-- ---------------------------------------------------------------- Part 4
+-- Vector 2: no shadowing anywhere, just a reloption edit. This is the vector a
+-- restricted search_path for ingest could not have caught, and it needs no privilege
+-- beyond owning the index.
+ALTER INDEX igt_bm SET (language = 'french');
+DO $$
+DECLARE d text; h text;
+BEGIN
+  INSERT INTO igt_docs VALUES (5, 'a negligent officer');
+  RAISE EXCEPTION 'ingest gate did NOT fire after a language reloption edit (unexpected)';
+EXCEPTION
+  WHEN feature_not_supported THEN
+    GET STACKED DIAGNOSTICS d = PG_EXCEPTION_DETAIL, h = PG_EXCEPTION_HINT;
+    IF SQLERRM NOT LIKE 'bm25: analyzer fingerprint mismatch on insert%' THEN
+      RAISE EXCEPTION 'wrong feature_not_supported: %', SQLERRM;
+    END IF;
+    RAISE NOTICE 'ingest gate fired after the reloption edit, as expected';
+    -- Identical text to Part 3: the message is a property of the GATE, not of which
+    -- vector reached it. If these two ever diverge, one of them was special-cased.
+    RAISE NOTICE 'DETAIL: %', d;
+    RAISE NOTICE 'HINT: %', h;
+END $$;
+
+-- Not sticky: put the reloption back and the same INSERT is accepted and findable. A
+-- gate that stayed tripped would be indistinguishable from one firing for the wrong
+-- reason.
+ALTER INDEX igt_bm RESET (language);
+INSERT INTO igt_docs VALUES (5, 'a negligent officer');
+SELECT array_agg(id ORDER BY id) AS findable_after_reset FROM igt_docs WHERE body @@@ 'negligent';
+
+-- ---------------------------------------------------------------- Part 5
+-- require_analyzer_match = false must STILL be honored on the write path: WARNING and
+-- proceed, never a hard error. ADR 0080 recommends that setting as the safe deferral
+-- for the #62 transition, so an unconditional ingest error would turn every table
+-- mid-transition read-only -- a worse failure than the one being prevented.
+--
+-- The wording is the part that differs from the read path, and it has to: on the read
+-- path proceeding costs one session's results, here whatever is written persists until
+-- REINDEX.
+--
+-- THE WARNING IS MEMOIZED PER (INDEX, TRANSACTION), and the three statements below are
+-- the assertion for it -- each one's WARNING count is visible in the expected output, so
+-- a regression that dropped the memo shows up as N lines instead of 1. This is not a
+-- cosmetic nicety: unmemoized, the very configuration ADR 0080 recommends as the safe
+-- deferral makes a bulk load emit one client warning AND one server log line PER ROW.
+ALTER INDEX igt_bm SET (require_analyzer_match = false);
+SET search_path = igt, public, pg_catalog;
+-- terse: the DETAIL carries the two environment-dependent fingerprint integers.
+\set VERBOSITY terse
+
+-- (a) SIX rows, ONE warning.
+INSERT INTO public.igt_docs
+SELECT g, 'a negligent trustee number '||g FROM generate_series(6,11) g;
+
+-- (b) A separate statement is a separate transaction, so it warns again. Without this
+-- case a memo that never reset -- suppressing every warning after the first, forever --
+-- would pass (a) and look correct.
+INSERT INTO public.igt_docs VALUES (12, 'a negligent auditor');
+
+-- (c) Three statements inside ONE explicit transaction: one warning total, not three.
+BEGIN;
+INSERT INTO public.igt_docs VALUES (13, 'a negligent notary');
+INSERT INTO public.igt_docs VALUES (14, 'a negligent clerk');
+INSERT INTO public.igt_docs VALUES (15, 'a negligent bailiff');
+COMMIT;
+\set VERBOSITY default
+RESET search_path;
+
+-- Exactly what the warning says: the rows ARE stored...
+SELECT count(*) AS rows_stored_under_warning FROM igt_docs WHERE id >= 6;
+-- ...and they are NOT findable, because they were tokenized through russian_stem: the
+-- stored term is 'negligent' where a correct query looks for 'neglig'. This is the
+-- durable half of the defect, and it is asserted rather than described so that a future
+-- change claiming to make the WARNING safe has to confront it.
+--
+-- Note what this case is NOT evidence for. Here the shadow really is a different
+-- stemmer, so the rows really are lost; across a transition that only re-encodes a
+-- fingerprint component (ADR 0080) tokenization is byte-identical and rows written under
+-- the same warning stay findable. The gate compares fingerprints, not tokens, and cannot
+-- tell the two apart -- which is why the warning says "may not be findable".
+SELECT array_agg(id ORDER BY id) AS warned_rows_not_findable
+FROM igt_docs WHERE body @@@ 'negligent';
+
+-- The recovery the hint promises, pinned. REINDEX re-tokenizes from the heap under the
+-- restricted path, so every warned row joins the others.
+ALTER INDEX igt_bm RESET (require_analyzer_match);
+REINDEX INDEX igt_bm;
+SELECT array_agg(id ORDER BY id) AS findable_after_reindex
+FROM igt_docs WHERE body @@@ 'negligent';
+
+RESET enable_seqscan;
+DROP TABLE igt_docs;
+SET client_min_messages = warning;   -- silence the CASCADE object list
+DROP SCHEMA igt CASCADE;             -- takes the shadow dictionary with it
+RESET client_min_messages;
+-- pg_regress shares ONE database across suites: a suite that leaves the extension
+-- installed breaks whichever suite runs next on CREATE EXTENSION.
+DROP EXTENSION bm25_native;

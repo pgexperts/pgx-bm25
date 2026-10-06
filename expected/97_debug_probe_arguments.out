@@ -1,0 +1,187 @@
+-- 97_debug_probe_arguments: debug probes validate their arguments (#149).
+--
+-- A debug probe is reachable from SQL by anyone the REVOKE loop and the C-level gates
+-- let through, so its arguments are untrusted input in exactly the way a query's are.
+-- Several probes had drifted from the code they exist to exercise: they accepted values
+-- their production counterpart's preconditions forbid, which is worse than useless --
+-- a suite can then "verify" behaviour against inputs that can never occur, and a probe
+-- whose whole purpose is to mirror the real path stops mirroring it.
+CREATE EXTENSION bm25_native;
+CREATE TABLE probe (id int primary key, body text);
+INSERT INTO probe SELECT g, 'alpha beta doc' || g FROM generate_series(1, 30) g;
+CREATE INDEX probe_bm ON probe USING bm25_native (body);
+SELECT bm25_seal('probe_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+\set VERBOSITY terse
+-- ------------------------------------------------------------ top-k heap size
+-- k reaches `MemoryContextAlloc(cxt, sizeof(BM25Scored) * k)` behind an Assert that is
+-- compiled out in the builds these probes ship in. Only k <= 0 was rejected, so the
+-- multiplication was unbounded above: a large k overflows the product on the way to a
+-- size_t and turns a huge request into a small allocation the heap writes then overrun.
+SELECT * FROM bm25_debug_topk(2000000000, ARRAY[1.0]::float8[], ARRAY[1]::int[]);
+ERROR:  bm25_debug_topk: k must not exceed 33554431
+SELECT * FROM bm25_debug_wand_rank('probe_bm', 'alpha', 2000000000);
+ERROR:  bm25_debug_wand_rank: k must not exceed 33554431
+SELECT * FROM bm25_wand_stats('probe_bm', 'alpha', 2000000000);
+ERROR:  bm25_wand_stats: k must not exceed 33554431
+-- Zero and negative are still rejected, by the same helper.
+SELECT * FROM bm25_debug_topk(0, ARRAY[1.0]::float8[], ARRAY[1]::int[]);
+ERROR:  bm25_debug_topk: k must be positive
+-- A legitimate k still works, so the bound did not swallow the useful range.
+SELECT count(*) >= 0 AS wand_rank_ok FROM bm25_debug_wand_rank('probe_bm', 'alpha', 5);
+ wand_rank_ok 
+--------------
+ t
+(1 row)
+
+-- ------------------------------------------------------------ scorer preconditions
+-- bm25_termscore has no guards of its own, correctly: on the query path k1 and b come
+-- from reloptions bm25_build.c already validated. This probe took them from SQL, so it
+-- was the one caller able to violate the contract -- and with tf = 0 and k1 = 0 the
+-- denominator is exactly zero and the function returned NaN rather than erroring.
+SELECT bm25_debug_score(100, 10, 0, 50, 40.0, 0.0, 0.75);   -- tf=0, k1=0
+ERROR:  bm25_debug_score: these arguments give a zero BM25 denominator
+-- The second zero-denominator route, which an earlier version of this guard missed
+-- because it enumerated input combinations instead of computing the denominator:
+-- b = 1 (inclusive, deliberately) with doclen = 0 collapses (1 - b + b*norm) to 0.
+SELECT bm25_debug_score(100, 10, 0, 0, 40.0, 1.2, 1.0);     -- tf=0, b=1, doclen=0
+ERROR:  bm25_debug_score: these arguments give a zero BM25 denominator
+SELECT bm25_debug_score(100, 10, 5, 50, 40.0, -1.0, 0.75);  -- k1 < 0
+ERROR:  bm25_debug_score: k1 must be >= 0 (got -1)
+SELECT bm25_debug_score(100, 10, 5, 50, 40.0, 1.2, 1.5);    -- b outside [0, 1]
+ERROR:  bm25_debug_score: b must be in [0, 1] (got 1.5)
+SELECT bm25_debug_score(100, 10, 5, 50, -1.0, 1.2, 0.75);   -- negative avgdl
+ERROR:  bm25_debug_score: avgdl must be >= 0 (got -1)
+SELECT bm25_debug_score(100, 10, 5, 50, 'NaN'::float8, 1.2, 0.75);
+ERROR:  bm25_debug_score: avgdl, k1 and b must be finite
+SELECT bm25_debug_score(100, 10, 5, 50, 'Infinity'::float8, 1.2, 0.75);
+ERROR:  bm25_debug_score: avgdl, k1 and b must be finite
+-- The defaults still score, and the boundary values of b are inclusive.
+SELECT round(bm25_debug_score(100, 10, 5, 50, 40.0, 1.2, 0.75)::numeric, 6) AS default_score;
+ default_score 
+---------------
+      3.875673
+(1 row)
+
+SELECT round(bm25_debug_score(100, 10, 5, 50, 40.0, 1.2, 0.0)::numeric, 6) AS b_zero;
+  b_zero  
+----------
+ 4.016322
+(1 row)
+
+SELECT round(bm25_debug_score(100, 10, 5, 50, 40.0, 1.2, 1.0)::numeric, 6) AS b_one;
+  b_one   
+----------
+ 3.830954
+(1 row)
+
+-- tf = 0 is fine as long as k1 > 0: the denominator is then non-zero.
+SELECT round(bm25_debug_score(100, 10, 0, 50, 40.0, 1.2, 0.75)::numeric, 6) AS tf_zero_ok;
+ tf_zero_ok 
+------------
+   0.000000
+(1 row)
+
+-- ------------------------------------------------------------ pending span probe
+-- `avail` stands in for "page bytes left" and was used to form `(char *) &hdr + avail`
+-- against an 8-byte stack object -- so any value past sizeof(hdr) built an out-of-range
+-- pointer, and a page-scale one (which the probe's own comment invites) pointed
+-- arbitrarily far into the stack.
+SELECT bm25_debug_pending_term_entry_span(4, 0, -1);
+ERROR:  bm25_debug_pending_term_entry_span: avail must be within [0, 8192]
+SELECT bm25_debug_pending_term_entry_span(4, 0, 8193);
+ERROR:  bm25_debug_pending_term_entry_span: avail must be within [0, 8192]
+-- In-range values still answer, including the page-sized budget the probe is for.
+SELECT bm25_debug_pending_term_entry_span(4, 0, 8192) AS page_budget;
+ page_budget 
+-------------
+          16
+(1 row)
+
+SELECT bm25_debug_pending_term_entry_span(4, 0, 4);   -- budget too small for the entry
+ERROR:  bm25: pending term entry header overruns the page
+-- ------------------------------------------------------------ segment docid
+-- `seg` was always range-checked; `docid` never was. Two wrong outcomes followed: the
+-- callee rejected an out-of-range local docid as ERRCODE_INDEX_CORRUPTED, so a user
+-- typo was reported to an operator as a corrupt index; and the (uint32) cast silently
+-- truncated, so 2^32 + 5 read document 5 and returned a confident wrong answer.
+SELECT bm25_debug_seg_doc_live('probe_bm', 0, -1);
+ERROR:  bm25_debug_seg_doc_live: docid -1 out of range for segment 0 (30 documents)
+SELECT bm25_debug_seg_doc_live('probe_bm', 0, 4294967301);   -- 2^32 + 5, used to read doc 5
+ERROR:  bm25_debug_seg_doc_live: docid 4294967301 out of range for segment 0 (30 documents)
+SELECT bm25_debug_seg_doc_live('probe_bm', 0, 1000000);
+ERROR:  bm25_debug_seg_doc_live: docid 1000000 out of range for segment 0 (30 documents)
+-- A real docid still answers.
+SELECT bm25_debug_seg_doc_live('probe_bm', 0, 0) AS doc0_live;
+ doc0_live 
+-----------
+ t
+(1 row)
+
+\set VERBOSITY default
+-- ------------------------------------------------------------ debug tokenizer
+-- bm25_tokenize's header claims it "shares the analyzer's character rules so a debug
+-- probe cannot disagree with the real tokenizer". It had drifted: no CHECK_FOR_INTERRUPTS
+-- and no term-length cap, while bm25_analyze has both at three sites. A word past
+-- BM25_MAX_TERM_BYTES (2047) is now dropped with the same NOTICE the analyzer emits,
+-- so the probe's token stream cannot contain a term the real path would have refused.
+-- Both the raw run and the FOLDED bytes are checked: a case fold can lengthen a term,
+-- which is why bm25_analyze re-checks after folding and why checking rawlen alone would
+-- leave the same drift one step further along.
+--
+-- The explicit-config overloads' SECOND argument is the TOKENIZER (#148 HDL-07). It
+-- was named `analyzer` in the C code, discarded, and accepted ANY string: passing
+-- nonsense returned stems and reported nothing -- the same accepted-and-ignored defect
+-- HDL-07 fixed on the reloption, sitting on the surface a test would have used to
+-- notice it. It now goes through bm25_validate_tokenizer, the SAME function the
+-- `tokenizer` reloption uses, so both surfaces accept exactly "standard".
+--
+-- Pinned here and not only at the reloption (expected/23_reloptions.out): the whole
+-- point is that the two doors give the same answer, and a pin on one door cannot show
+-- that. Both overloads are checked, because they take the argument independently.
+\set VERBOSITY terse
+SELECT bm25_debug_tokenize('die Katzen', 'german', 'default', 'german');        -- ERROR
+ERROR:  bm25: invalid tokenizer "german"; only "standard" is supported
+SELECT bm25_debug_analyze_positions('the fox', 'nonsense', 'none', 'english');  -- ERROR
+ERROR:  bm25: invalid tokenizer "nonsense"; only "standard" is supported
+\set VERBOSITY default
+-- ...and the value both surfaces DO accept still works, so the check is a filter and
+-- not a wall.
+SELECT bm25_debug_tokenize('die Katzen liefen', 'standard', 'default', 'german') AS still_works;
+ still_works 
+-------------
+ {katz,lief}
+(1 row)
+
+CREATE TABLE tok (id int primary key, body text);
+CREATE INDEX tok_bm ON tok USING bm25_native (body);
+-- 3000 bytes: over the cap, dropped with a NOTICE. The short words around it survive.
+SELECT bm25_debug_pending_append('tok_bm', 'before ' || repeat('x', 3000) || ' after');
+NOTICE:  bm25: word is too long to be indexed
+DETAIL:  Words longer than 2047 bytes are ignored.
+ bm25_debug_pending_append 
+---------------------------
+ 
+(1 row)
+
+-- The over-long word is absent from the index; the words on either side of it are not.
+SELECT bm25_seal('tok_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT term FROM bm25_debug_terms('tok_bm') ORDER BY 1;
+  term  
+--------
+ after
+ before
+(2 rows)
+
+DROP TABLE tok;
+DROP TABLE probe;
+DROP EXTENSION bm25_native;

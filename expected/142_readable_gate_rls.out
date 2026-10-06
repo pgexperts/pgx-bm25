@@ -1,0 +1,193 @@
+-- The readable gate under row-level security (#310 SURFACE-04, decision D24).
+--
+-- bm25_index_open_readable fronts bm25_stats (PUBLIC) and every read-only debug SRF
+-- (REVOKEd, but grantable). Its rule was "SELECT on the indexed table": the privilege
+-- that lets the caller see the underlying rows. Under a row-level security policy that
+-- stops being true -- SELECT then means "see the rows the policy allows" -- while
+-- everything behind the gate reports on the WHOLE index: corpus statistics over every
+-- row, or, through a debug grant, the dictionary of terms in rows the policy hides.
+-- The gate now refuses when RLS applies to the caller on the leaf heap
+-- (check_enable_rls == RLS_ENABLED), the way pg_stats omits RLS tables rather than
+-- filtering them. Leaf only: the gate's ACL is leaf-only too, and a parent's policy
+-- does not apply to direct access to a partition.
+--
+-- Every assertion below goes through s310_try, which reports SQLSTATE + message or
+-- 'ok', so the expected output pins the SQLSTATE (42501) as well as the wording.
+-- Before the fix every "refused" line read 'ok'.
+CREATE EXTENSION bm25_native;
+CREATE FUNCTION s310_try(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE q;
+    RETURN 'ok';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' ' || SQLERRM;
+END $$;
+CREATE ROLE bm25_s310_owner NOLOGIN;
+CREATE ROLE bm25_s310_bound NOLOGIN;
+CREATE ROLE bm25_s310_bypass NOLOGIN BYPASSRLS;
+GRANT USAGE, CREATE ON SCHEMA public TO bm25_s310_owner;
+GRANT USAGE ON SCHEMA public TO bm25_s310_bound, bm25_s310_bypass;
+-- A non-superuser owns the table: superusers bypass RLS unconditionally, so the
+-- owner's own exemption (and its loss under FORCE) needs a plain role.
+SET ROLE bm25_s310_owner;
+CREATE TABLE rlsd (id int PRIMARY KEY, who text, body text);
+INSERT INTO rlsd VALUES
+    (1, 'bm25_s310_bound', 'public alpha'),
+    (2, 'someone_else',    'classified zebra'),
+    (3, 'someone_else',    'classified yak');
+CREATE INDEX rlsd_bm25 ON rlsd USING bm25_native (body);
+SELECT bm25_seal('rlsd_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+GRANT SELECT ON rlsd TO bm25_s310_bound, bm25_s310_bypass;
+RESET ROLE;
+-- The debug SRF is REVOKEd from PUBLIC; hand it out explicitly, the way an ops
+-- role would get it.
+GRANT EXECUTE ON FUNCTION bm25_debug_segterms(regclass)
+  TO bm25_s310_bound, bm25_s310_bypass;
+-- ------------------------------------------------------------ no RLS yet
+-- Control: with SELECT and no policy in force, the gate admits the role.
+SET ROLE bm25_s310_bound;
+SELECT s310_try($$SELECT ndocs FROM bm25_stats('rlsd_bm25')$$) AS stats_no_rls;
+ stats_no_rls 
+--------------
+ ok
+(1 row)
+
+SELECT s310_try($$SELECT count(*) FROM bm25_debug_segterms('rlsd_bm25')$$)
+  AS segterms_no_rls;
+ segterms_no_rls 
+-----------------
+ ok
+(1 row)
+
+RESET ROLE;
+-- ------------------------------------------------------------ RLS enabled
+SET ROLE bm25_s310_owner;
+ALTER TABLE rlsd ENABLE ROW LEVEL SECURITY;
+CREATE POLICY rlsd_mine ON rlsd USING (who = current_user);
+RESET ROLE;
+-- The policy-bound role sees one row through the table...
+SET ROLE bm25_s310_bound;
+SELECT id FROM rlsd ORDER BY id;
+ id 
+----
+  1
+(1 row)
+
+-- ...so whole-index statistics (ndocs = 3) and the dictionary ('zebra', 'yak') are
+-- refused, not handed over.
+SELECT s310_try($$SELECT ndocs FROM bm25_stats('rlsd_bm25')$$) AS stats_bound;
+                                          stats_bound                                           
+------------------------------------------------------------------------------------------------
+ 42501 bm25: cannot report on index "rlsd_bm25": row-level security is enabled for table "rlsd"
+(1 row)
+
+SELECT s310_try($$SELECT count(*) FROM bm25_debug_segterms('rlsd_bm25')$$)
+  AS segterms_bound;
+                                         segterms_bound                                         
+------------------------------------------------------------------------------------------------
+ 42501 bm25: cannot report on index "rlsd_bm25": row-level security is enabled for table "rlsd"
+(1 row)
+
+-- row_security = off does not change the answer or its wording: check_enable_rls
+-- runs with noError, so core's own "would be affected by row-level security"
+-- error does not replace this one.
+SET row_security = off;
+SELECT s310_try($$SELECT ndocs FROM bm25_stats('rlsd_bm25')$$) AS stats_bound_rs_off;
+                                       stats_bound_rs_off                                       
+------------------------------------------------------------------------------------------------
+ 42501 bm25: cannot report on index "rlsd_bm25": row-level security is enabled for table "rlsd"
+(1 row)
+
+RESET row_security;
+RESET ROLE;
+-- BYPASSRLS, the owner (no FORCE) and a superuser are all exempt from the policy,
+-- so the gate admits them with the full corpus.
+SET ROLE bm25_s310_bypass;
+SELECT s310_try($$SELECT ndocs FROM bm25_stats('rlsd_bm25')$$) AS stats_bypassrls;
+ stats_bypassrls 
+-----------------
+ ok
+(1 row)
+
+SELECT s310_try($$SELECT count(*) FROM bm25_debug_segterms('rlsd_bm25')$$)
+  AS segterms_bypassrls;
+ segterms_bypassrls 
+--------------------
+ ok
+(1 row)
+
+RESET ROLE;
+SET ROLE bm25_s310_owner;
+SELECT ndocs AS owner_ndocs FROM bm25_stats('rlsd_bm25');
+ owner_ndocs 
+-------------
+           3
+(1 row)
+
+RESET ROLE;
+SELECT ndocs AS superuser_ndocs FROM bm25_stats('rlsd_bm25');
+ superuser_ndocs 
+-----------------
+               3
+(1 row)
+
+-- FORCE puts the owner under its own policy, and the gate follows.
+SET ROLE bm25_s310_owner;
+ALTER TABLE rlsd FORCE ROW LEVEL SECURITY;
+SELECT s310_try($$SELECT ndocs FROM bm25_stats('rlsd_bm25')$$) AS stats_owner_forced;
+                                       stats_owner_forced                                       
+------------------------------------------------------------------------------------------------
+ 42501 bm25: cannot report on index "rlsd_bm25": row-level security is enabled for table "rlsd"
+(1 row)
+
+ALTER TABLE rlsd NO FORCE ROW LEVEL SECURITY;
+RESET ROLE;
+-- ------------------------------------------------------------ leaf only
+-- A policy on the PARENT does not reach a role reading the leaf directly, and the
+-- gate's SELECT check is on the leaf, so the parent's RLS must not refuse here.
+-- Enabling RLS on the leaf itself does.
+SET ROLE bm25_s310_owner;
+CREATE TABLE rlsp (id int, body text) PARTITION BY RANGE (id);
+CREATE TABLE rlsp1 PARTITION OF rlsp FOR VALUES FROM (0) TO (100);
+INSERT INTO rlsp VALUES (1, 'leaf alpha'), (2, 'leaf beta');
+CREATE INDEX rlsp1_bm25 ON rlsp1 USING bm25_native (body);
+GRANT SELECT ON rlsp1 TO bm25_s310_bound;
+ALTER TABLE rlsp ENABLE ROW LEVEL SECURITY;
+RESET ROLE;
+SET ROLE bm25_s310_bound;
+SELECT s310_try($$SELECT ndocs + pending_ndocs FROM bm25_stats('rlsp1_bm25')$$)
+  AS stats_parent_rls_only;
+ stats_parent_rls_only 
+-----------------------
+ ok
+(1 row)
+
+RESET ROLE;
+SET ROLE bm25_s310_owner;
+ALTER TABLE rlsp1 ENABLE ROW LEVEL SECURITY;
+RESET ROLE;
+SET ROLE bm25_s310_bound;
+SELECT s310_try($$SELECT ndocs + pending_ndocs FROM bm25_stats('rlsp1_bm25')$$)
+  AS stats_leaf_rls;
+                                          stats_leaf_rls                                          
+--------------------------------------------------------------------------------------------------
+ 42501 bm25: cannot report on index "rlsp1_bm25": row-level security is enabled for table "rlsp1"
+(1 row)
+
+RESET ROLE;
+-- ------------------------------------------------------------ cleanup
+DROP TABLE rlsp;
+DROP TABLE rlsd;
+REVOKE EXECUTE ON FUNCTION bm25_debug_segterms(regclass)
+  FROM bm25_s310_bound, bm25_s310_bypass;
+REVOKE ALL ON SCHEMA public FROM bm25_s310_owner, bm25_s310_bound, bm25_s310_bypass;
+DROP FUNCTION s310_try(text);
+DROP ROLE bm25_s310_owner;
+DROP ROLE bm25_s310_bound;
+DROP ROLE bm25_s310_bypass;
+DROP EXTENSION bm25_native;

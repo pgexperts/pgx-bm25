@@ -1,0 +1,296 @@
+-- 106_drain_memory_budget: BUILD-04, the pending-drain half -- the third feeder of
+-- the same unbounded accumulator, and the one that reaches BOTH dangerous processes.
+-- bm25_vacuumcleanup seals BEFORE it merges, so an OOM here is an OOM in an
+-- autovacuum worker; and the opportunistic seal runs inside a user's INSERT under
+-- PG_TRY, so an ERROR here would wedge every subsequent insert past the threshold.
+-- The extension's own handler comment documents the reachable shape:
+-- `SET bm25_native.seal_threshold` high, bulk load, and an arbitrarily large pending
+-- list is left for "a VACUUM or a manual bm25_seal()" to drain in one accumulator.
+--
+-- WHAT WOULD BE OBSERVABLY BROKEN WITHOUT THE FIX: `nsegs > 1` after the seal
+-- returns f -- one drain was one segment, whatever its size. That is the A/B tooth.
+--
+-- The rest is about the two things that are silent when a chunked drain gets them
+-- wrong, both of which cost a correct answer rather than an error:
+--
+--   * A DOCUMENT SPANNING PAGES. Since v7 a document is stored as same-TID
+--     continuation records across pending pages, and the cut is a PAGE boundary. A
+--     doc still being assembled has contributed nothing to the accumulator yet, so
+--     it must land WHOLE in the next chunk; a version that split it would put the
+--     same TID in two segments, and the exhaustive scorer sums per-TID across
+--     segments with no dedup -- a double-score and a doubled @@@ result. The large
+--     document below is deliberately made of terms that occur nowhere else, so it
+--     appears exactly once or the assertion fails.
+--
+--   * THE KEYMAP. The drain learns key_type/key_size from the FIRST keyed document
+--     header it sees, which may be in an earlier chunk. A later chunk created
+--     without it writes no KEYMAP and its rows silently revert from key identity to
+--     ctid -- no error, just a NULL where a by-key score belongs.
+--
+-- SCALE: shrink the budget, never grow the corpus (sql/83's doctrine).
+-- DELIBERATELY NOT ASSERTED: how many segments a given budget buys.
+CREATE EXTENSION bm25_native;
+-- seal_threshold high so nothing seals opportunistically during the load: the
+-- pending list is meant to be large when bm25_seal() finally runs on it. This is
+-- the exact scenario bm25_handler.c's seal_threshold note describes.
+SET bm25_native.seal_threshold = '1GB';
+CREATE TABLE bmd (id int PRIMARY KEY, body text);
+CREATE INDEX bmd_bm ON bmd USING bm25_native (body) INCLUDE (id) WITH (key_field = 'id');
+SET enable_seqscan = off;
+INSERT INTO bmd
+SELECT i, 'alpha bravo pending ' || i || ' p' || i || ' q' || (i % 41)
+  FROM generate_series(1, 400) i;
+-- One document far larger than a pending page, so it is stored as same-TID
+-- continuation records and a page-boundary cut can fall in the middle of it. Its
+-- vocabulary is disjoint from every other row's.
+INSERT INTO bmd
+SELECT 9001, string_agg('zulu' || g, ' ') FROM generate_series(1, 4000) g;
+INSERT INTO bmd
+SELECT i, 'alpha bravo pending ' || i || ' p' || i || ' q' || (i % 41)
+  FROM generate_series(401, 800) i;
+-- Still entirely pending: nothing has been sealed.
+SELECT count(*) AS segments_before_seal FROM bm25_debug_segcat('bmd_bm');
+ segments_before_seal 
+----------------------
+                    0
+(1 row)
+
+SELECT pending_ndocs > 0 AS pending_before_seal FROM bm25_stats('bmd_bm');
+ pending_before_seal 
+---------------------
+ t
+(1 row)
+
+-- Read-your-writes through the pending list, before any seal.
+SELECT array_agg(id ORDER BY id) AS ids
+  FROM bmd WHERE body @@@ 'alpha' \gset pre_member_
+WITH r AS (SELECT id FROM bmd WHERE body @@@ 'alpha'
+             ORDER BY body &@@ 'alpha' LIMIT 25)
+SELECT array_agg(id) AS ids FROM r \gset pre_rank_
+SELECT array_agg(id ORDER BY id) AS spanning_before FROM bmd WHERE body @@@ 'zulu2500';
+ spanning_before 
+-----------------
+ {9001}
+(1 row)
+
+-- ------------------------------------------------------------- chunked seal
+SET bm25_native.debug_budget = '64kB';
+SELECT bm25_seal('bmd_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT count(*) > 1 AS seal_chunked FROM bm25_debug_segcat('bmd_bm');
+ seal_chunked 
+--------------
+ t
+(1 row)
+
+-- The pending list is fully detached in the SAME record that published the chunks.
+SELECT pending_ndocs AS pending_docs_after_seal FROM bm25_stats('bmd_bm');
+ pending_docs_after_seal 
+-------------------------
+                       0
+(1 row)
+
+-- Every document published exactly once, counting the oversized one.
+SELECT sum(live_ndocs) AS sealed_live_docs FROM bm25_debug_segcat('bmd_bm');
+ sealed_live_docs 
+------------------
+              801
+(1 row)
+
+-- ------------------------------------------------------- answers unchanged
+SELECT array_agg(id ORDER BY id) AS ids
+  FROM bmd WHERE body @@@ 'alpha' \gset post_member_
+WITH r AS (SELECT id FROM bmd WHERE body @@@ 'alpha'
+             ORDER BY body &@@ 'alpha' LIMIT 25)
+SELECT array_agg(id) AS ids FROM r \gset post_rank_
+-- Equality, not containment: a doc published in two chunks appears TWICE here.
+SELECT :'pre_member_ids'::int[] = :'post_member_ids'::int[] AS membership_unchanged;
+ membership_unchanged 
+----------------------
+ t
+(1 row)
+
+-- Single-key ORDER BY, no tiebreak column.
+SELECT :'pre_rank_ids'::int[] = :'post_rank_ids'::int[] AS ranked_order_unchanged;
+ ranked_order_unchanged 
+------------------------
+ t
+(1 row)
+
+-- The page-spanning document: intact, and present exactly once. A term from the
+-- FAR END of it is the one a truncated continuation loses.
+SELECT array_agg(id ORDER BY id) AS spanning_after FROM bmd WHERE body @@@ 'zulu2500';
+ spanning_after 
+----------------
+ {9001}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS spanning_last_term FROM bmd WHERE body @@@ 'zulu4000';
+ spanning_last_term 
+--------------------
+ {9001}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS spanning_first_term FROM bmd WHERE body @@@ 'zulu1';
+ spanning_first_term 
+---------------------
+ {9001}
+(1 row)
+
+-- The KEYMAP survived every chunk: rows from the far end of the corpus, which can
+-- only be in a late chunk, still resolve their score BY KEY.
+SELECT count(*) AS keyed_scores_present
+  FROM (SELECT id FROM bmd WHERE body @@@ 'q7' ORDER BY body &@@ 'q7') s
+ WHERE bm25_score_key(s.id) IS NOT NULL;
+ keyed_scores_present 
+----------------------
+                   20
+(1 row)
+
+-- Post-seal inserts still land in the pending list and are visible immediately, so
+-- the anchor the publish record reset is a usable one.
+INSERT INTO bmd VALUES (9002, 'alpha bravo freshly inserted row');
+SELECT array_agg(id ORDER BY id) AS after_insert FROM bmd WHERE body @@@ 'freshly';
+ after_insert 
+--------------
+ {9002}
+(1 row)
+
+-- A second seal drains the one new row -- the anchor is not left pointing at
+-- recycled pages, which is the failure mode that LATCHES (every later insert then
+-- writes over reclaimed pages).
+SELECT bm25_seal('bmd_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT pending_ndocs AS pending_docs_after_second_seal FROM bm25_stats('bmd_bm');
+ pending_docs_after_second_seal 
+--------------------------------
+                              0
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS after_second_seal FROM bmd WHERE body @@@ 'freshly';
+ after_second_seal 
+-------------------
+ {9002}
+(1 row)
+
+-- An empty drain is a no-op at any budget.
+SELECT bm25_seal('bmd_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT sum(live_ndocs) AS final_live_docs FROM bm25_debug_segcat('bmd_bm');
+ final_live_docs 
+-----------------
+             802
+(1 row)
+
+-- ------------------------------------------- more chunks than one catalog page
+-- All N chunks of one drain are published in ONE record, and N is NOT bounded by
+-- the entries one SEGCAT page holds (~203 at the default BLCKSZ). A batch too large
+-- for one page is laid on a fresh orphan CHAIN beforehand and prepended by pointing
+-- the chain's tail at the old root inside the flip record -- the same indirection
+-- the merge swap has always used, so the record still registers two buffers.
+--
+-- WHAT WOULD BE OBSERVABLY BROKEN WITHOUT THIS: the seal ERRORS. An earlier version
+-- of the chunked drain capped N at one page's worth on the reasoning that only a
+-- pathological bm25_native.debug_budget could exceed it. It was wrong twice.
+-- maintenance_work_mem is PGC_USERSET with a 1 MB floor and a few thousand large
+-- documents drained at that floor really do produce a thousand chunks. And the
+-- failure was not merely an error: every one of those chunks had already been built
+-- and WAL-logged as orphan pages before the check fired, the abort left the pending
+-- anchor untouched so the next seal did the same thing, and bm25_vacuumcleanup seals
+-- BEFORE it reclaims orphans, so the sweep that would have freed them was never
+-- reached. Measured on the capped version: 344 MB of stranded pages after two
+-- attempts, zero segments published, latching -- the same "index stops being
+-- maintained" wedge this whole issue exists to remove.
+--
+-- The budget here is the debug lever purely for SPEED: 250 documents reach a
+-- thousand-page-equivalent chunk count in milliseconds, where reproducing it through
+-- maintenance_work_mem's 1 MB floor needs thousands of large documents.
+CREATE TABLE bmd_cap (id int PRIMARY KEY, body text);
+CREATE INDEX bmd_cap_bm ON bmd_cap USING bm25_native (body);
+INSERT INTO bmd_cap
+SELECT i, (SELECT string_agg('k' || i || 'x' || g, ' ') FROM generate_series(1, 400) g)
+  FROM generate_series(1, 250) i;
+SET bm25_native.debug_budget = '1kB';
+SELECT bm25_seal('bmd_cap_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+-- Well past one page's worth of catalog entries, so the chain path ran.
+SELECT count(*) > 203 AS chained_catalog FROM bm25_debug_segcat('bmd_cap_bm');
+ chained_catalog 
+-----------------
+ t
+(1 row)
+
+-- Nothing lost: every document published exactly once, pending fully detached.
+SELECT sum(live_ndocs) AS chained_live_docs FROM bm25_debug_segcat('bmd_cap_bm');
+ chained_live_docs 
+-------------------
+               250
+(1 row)
+
+SELECT pending_ndocs AS chained_pending FROM bm25_stats('bmd_cap_bm');
+ chained_pending 
+-----------------
+               0
+(1 row)
+
+-- And the catalog is READABLE end to end, which is the part a mis-linked chain
+-- breaks: terms from the first and last documents both resolve, and each to exactly
+-- one row. A tail whose nextblk did not reach the old root would lose the older
+-- half of the catalog silently.
+SELECT array_agg(id ORDER BY id) AS chained_first FROM bmd_cap WHERE body @@@ 'k1x1';
+ chained_first 
+---------------
+ {1}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS chained_last FROM bmd_cap WHERE body @@@ 'k250x400';
+ chained_last 
+--------------
+ {250}
+(1 row)
+
+RESET bm25_native.debug_budget;
+-- A second seal over the same index appends in front of that chain without
+-- disturbing it.
+INSERT INTO bmd_cap VALUES (251, 'zebracrossing after the chain');
+SELECT bm25_seal('bmd_cap_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS chained_after_append
+  FROM bmd_cap WHERE body @@@ 'zebracrossing';
+ chained_after_append 
+----------------------
+ {251}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS chained_first_still FROM bmd_cap WHERE body @@@ 'k1x1';
+ chained_first_still 
+---------------------
+ {1}
+(1 row)
+
+DROP TABLE bmd_cap;
+RESET bm25_native.debug_budget;
+RESET bm25_native.seal_threshold;
+RESET enable_seqscan;
+DROP TABLE bmd;
+DROP EXTENSION bm25_native;

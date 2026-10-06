@@ -1,0 +1,84 @@
+-- 23_reloptions: verify bm25_options parsing -- defaults, all legal keywords,
+-- and validation rejection of unknown analyzer/language/tokenizer/stopwords
+-- values.
+--
+-- The analyzer and language halves are new with #148 HDL-07. Before it, those two
+-- string reloptions were the only ones registered with a NULL validate_string
+-- callback, and the two failure modes were different:
+--
+--   analyzer -- accepted ANY value and consumed none of them. There is one analyzer
+--   pipeline; analyzer_offset is read nowhere in the tree. So `WITH (analyzer =
+--   'german')` succeeded, stemmed in english, and did not even perturb the analyzer
+--   fingerprint, so require_analyzer_match could not fire either. Nothing anywhere
+--   told the user. (This suite itself used to pass analyzer = 'german' on the combo
+--   index below, as a demonstration of how invisible that was.)
+--
+--   language -- accepted any value and DEFERRED the failure. bm25_snowball_dict_oid
+--   resolves "<language>_stem" at scan/insert time with missing_ok = false, so
+--   `ALTER INDEX ... SET (language = 'klingon')` returned success and left an index
+--   that errored on the next query, with the DDL that broke it long since committed.
+CREATE EXTENSION bm25_native;
+CREATE TABLE docs (id int primary key, body text);
+
+-- Defaults: english / english / default / standard / true (parse, build empty index).
+CREATE INDEX idx_def ON docs USING bm25_native (body);
+
+-- Each keyword accepted with a legal value.
+CREATE INDEX idx_lang     ON docs USING bm25_native (body) WITH (language = 'french');
+CREATE INDEX idx_sw_none  ON docs USING bm25_native (body) WITH (stopwords = 'none');
+CREATE INDEX idx_sw_def   ON docs USING bm25_native (body) WITH (stopwords = 'default');
+CREATE INDEX idx_tok      ON docs USING bm25_native (body) WITH (tokenizer = 'standard');
+CREATE INDEX idx_analyzer ON docs USING bm25_native (body) WITH (analyzer = 'english');
+CREATE INDEX idx_norel    ON docs USING bm25_native (body) WITH (require_analyzer_match = false);
+CREATE INDEX idx_combo    ON docs USING bm25_native (body)
+  WITH (analyzer = 'english', language = 'german', stopwords = 'none',
+        tokenizer = 'standard', require_analyzer_match = false);
+-- A language is ASCII-folded before the dictionary lookup, exactly as the resolver
+-- folds it, so an upper-case spelling must validate rather than fail a lookup that
+-- would succeed later.
+CREATE INDEX idx_lang_case ON docs USING bm25_native (body) WITH (language = 'FRENCH');
+
+-- Bad values must ERROR (validate = true path).
+\set VERBOSITY terse
+CREATE INDEX idx_bad_tok ON docs USING bm25_native (body) WITH (tokenizer = 'bogus');     -- ERROR
+CREATE INDEX idx_bad_sw  ON docs USING bm25_native (body) WITH (stopwords = 'sometimes'); -- ERROR
+CREATE INDEX idx_bad_an  ON docs USING bm25_native (body) WITH (analyzer = 'german');     -- ERROR
+CREATE INDEX idx_bad_lng ON docs USING bm25_native (body) WITH (language = 'klingon');    -- ERROR
+\set VERBOSITY default
+-- Over-long language, checked separately from the resolution failure above because
+-- the consequence differs: bm25_analyzer_config_from_opts strlcpy's the value into a
+-- BM25_STEMMER_NAME_LEN (32) buffer, so without this check the name would be
+-- TRUNCATED to 31 bytes and could then resolve to a DIFFERENT dictionary than the one
+-- the user named -- a wrong answer rather than an error. VERBOSITY default here: the
+-- DETAIL carries the limit, and that is the part a user needs.
+CREATE INDEX idx_long_lng ON docs USING bm25_native (body)
+  WITH (language = 'englishenglishenglishenglishenglish');                               -- ERROR
+
+-- ALTER INDEX runs the same validate = true path, and it is the one that mattered
+-- most: a CREATE INDEX with a bad language at least failed at the first build, but
+-- an ALTER on an index that already had segments committed successfully and left the
+-- index unreadable. Assert the index still answers a query afterwards -- an ERROR
+-- alone would also be produced by an ALTER that failed halfway.
+--
+-- enable_seqscan = off is load-bearing, not tidiness: on a two-row table the same
+-- SELECT returns the same {1} with the index DROPPED ENTIRELY, because bm25_match's
+-- COST 5000 prices the seqscan filter out. Without this the assertion proves the
+-- ROWS are right, not that the INDEX survived, and one cost-model difference across
+-- the CI matrix turns it into a no-op.
+CREATE TABLE altdocs (id int primary key, body text);
+INSERT INTO altdocs VALUES (1, 'negligence and liability'), (2, 'contract terms');
+CREATE INDEX alt_bm ON altdocs USING bm25_native (body) WITH (language = 'english');
+\set VERBOSITY terse
+ALTER INDEX alt_bm SET (language = 'klingon');   -- ERROR
+ALTER INDEX alt_bm SET (analyzer = 'german');    -- ERROR
+\set VERBOSITY default
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM altdocs WHERE body @@@ 'negligence';
+SELECT array_agg(id ORDER BY id) FROM altdocs WHERE body @@@ 'negligence';
+RESET enable_seqscan;
+-- ...and a legal edit still goes through.
+ALTER INDEX alt_bm SET (language = 'french');
+DROP TABLE altdocs;
+
+DROP TABLE docs;
+DROP EXTENSION bm25_native;

@@ -1,0 +1,45 @@
+-- 22_format_v4: the generic format-version-mismatch rejection path, exercised here
+-- by forcing an OLD version (v3) against the current gate. A fresh index carries this
+-- build's BM25_FORMAT_VERSION;
+-- stamping the metapage back to format_version 3 makes every read ERROR with the
+-- backward-refuse message (format_version < BM25_OLDEST_READABLE). bm25_debug_stamp_version
+-- is a test-only helper that WAL-logs a forced format_version onto block 0 so we
+-- exercise the reject path without shipping a v3 on-disk fixture.
+CREATE EXTENSION bm25_native;
+CREATE TABLE docs (id int primary key, body text);
+CREATE INDEX docs_bm25 ON docs USING bm25_native (body);
+-- fresh build carries this build's BM25_FORMAT_VERSION
+SELECT format_version FROM bm25_stats('docs_bm25');
+ format_version 
+----------------
+              8
+(1 row)
+
+-- force the on-disk version back to 3, then any metapage read must reject it.
+-- min_read_version=5 keeps the forward gate (min_read_version > this build) from firing
+-- first, so the ERROR is unambiguously the backward-refuse one.
+SELECT bm25_debug_stamp_version('docs_bm25', 3, 5, 0);
+ bm25_debug_stamp_version 
+--------------------------
+ 
+(1 row)
+
+\set VERBOSITY terse
+SELECT format_version FROM bm25_stats('docs_bm25');  -- expect ERROR: this build reads >= 5
+ERROR:  bm25: index is format version 3; this build reads >= 5
+-- restore so DROP/cleanup works without tripping the gate
+SELECT bm25_debug_stamp_version('docs_bm25', 6, 5, 4);
+ bm25_debug_stamp_version 
+--------------------------
+ 
+(1 row)
+
+\set VERBOSITY default
+SELECT format_version FROM bm25_stats('docs_bm25');
+ format_version 
+----------------
+              6
+(1 row)
+
+DROP TABLE docs;
+DROP EXTENSION bm25_native;

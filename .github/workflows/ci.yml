@@ -1,0 +1,1771 @@
+name: CI
+
+# TRIGGERS -- manual only (workflow_dispatch). CI runs once at the end of a block
+# of work -- after a stack of PRs has landed on main -- not on every push or PR.
+# Per-PR runs on a serially landed stack bought little: each PR's checks were
+# superseded minutes later by the next merge, and the stack is verified as a
+# whole on main afterwards. Run it with:
+#
+#   gh workflow run CI --ref main
+#
+# and read the result with `gh run list --workflow CI --limit 1` / `gh run watch`.
+#
+# Consequences worth remembering:
+#   - Nothing runs CI automatically any more. A PR merged without a manual run
+#     afterwards is untested in CI; the local gates (build, regress, TAP on
+#     PG17/18/19) are what stand in for per-PR checks.
+#   - The macos job's promotion criterion ("observed green on main") now counts
+#     manual main runs only.
+#   - Branch protection cannot require these checks, since PRs no longer
+#     produce them.
+#
+# History: the trigger was previously `push: [main]` + `pull_request`, scoped so
+# that a push to a PR branch did not run the whole matrix twice (a bare `push:`
+# alongside `pull_request:` does; a concurrency key alone cannot dedupe them,
+# because a push's github.ref is refs/heads/<branch> and a pull_request's is
+# refs/pull/<N>/merge). Restoring automatic runs means restoring that scoped
+# pair, not a bare `push:`.
+on:
+  workflow_dispatch:
+
+# Serialize manual runs on the same ref, and never cancel one: a second
+# `gh workflow run` on main queues behind the first instead of killing it. A run
+# cancelled mid-hardening skips the cache-save post-step (leaving the shared
+# cassert PostgreSQL cache cold for longer), and a cancelled run reads in `gh`
+# like a plain failure with no sign it never ran a test.
+#
+# github.workflow is the workflow's display NAME, not a unique id -- a second file
+# also named "CI" would share this group. That is fine today (one workflow file).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least-privilege GITHUB_TOKEN (L4 #67.1). Without this block the workflow
+# inherits whatever the repository default is, and for a repo created before
+# GitHub's read-only default that is read/WRITE on every scope -- so any action
+# in the dependency chain, or any step that can be induced to echo $GITHUB_TOKEN,
+# holds a token that can push commits, move tags and edit releases. Nothing in
+# this file needs more than a checkout: actions/cache authenticates with the
+# runner's own ACTIONS_RUNTIME_TOKEN, not GITHUB_TOKEN, so the hardening job's
+# cache is unaffected.
+#
+# Declared at the WORKFLOW level on purpose: a job-level block would let a new
+# job silently opt back into the default by omitting one. A future job that
+# genuinely needs to write (publishing a release, commenting on a PR) should
+# widen it in that JOB's own permissions: block, never here.
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    # Explicit job name (issue #236). Without it, the UI derives a matrix job's
+    # name from whichever matrix keys are present in that COMBINATION -- the
+    # 17/18 legs only ever carry `pg`, so they already render as "(17)"/"(18)"
+    # and an `include`-only key added for a different leg does not touch that.
+    # Still pinned explicitly rather than relied on, because that naming rule
+    # is a UI behaviour, not a documented contract: this keeps the 17/18 check
+    # names ("build-and-test (17)", "build-and-test (18)") stable for branch
+    # protection even if that behaviour ever changed, and gives the beta leg a
+    # name that says why it is not required.
+    name: build-and-test (${{ matrix.pg }}${{ matrix.experimental && ', experimental' || '' }})
+    runs-on: ubuntu-latest
+    # A wedged installcheck (a scan that never returns, a cluster that never comes
+    # up) otherwise burns the 6-hour default before anyone notices. Generous
+    # enough that a slow runner is never the reason a leg goes red.
+    timeout-minutes: 30
+    # continue-on-error is false (absent) for 17/18 -- matrix.experimental is
+    # undefined for those legs, so the comparison is false -- and true only for
+    # the PG19 leg `include` adds below. This is what makes PG19 "non-blocking":
+    # a red run still shows in the checks list (for visibility) but cannot fail
+    # the required-checks gate the way a plain job failure would.
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [17, 18]
+        # PG19 (issue #236). apt.postgresql.org carries it pre-GA as 19~beta4
+        # in its own numbered component (`19`), not yet in `main`, and it is
+        # ahead of two header-level changes this extension has to track:
+        # funcapi.h no longer pulls in utils/tuplestore.h transitively, and
+        # PointerIsValid was removed from c.h (see bm25_handler.c and every
+        # file that gained an explicit utils/tuplestore.h include for this
+        # issue). A beta can also fail for ITS OWN pre-release bugs that have
+        # nothing to do with this extension, which is the real reason this
+        # leg must not gate merges -- `experimental: true` is read by
+        # continue-on-error above. `include` (rather than adding 19 to the
+        # `pg` list) is what keeps this key absent, and so falsy, on 17/18.
+        # Flip to a plain `pg: [17, 18, 19]` entry and drop the now-redundant
+        # `19` apt component below once PG19 reaches GA and lands in `main`.
+        include:
+          - pg: 19
+            experimental: true
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # Packaging identity (M3 #60.1, ADR 0052). Same reasoning as the floors
+      # below, one level out: META.json and .pgx-build.yml describe this
+      # extension to the outside world and NOTHING in the build or test path
+      # reads either of them, so no suite -- and no amount of green CI -- can
+      # notice when they rot. Both had: META.json still said pg_bm25_index
+      # 0.1.0 and named a script that has not existed since the rebrand, and
+      # .pgx-build.yml advertised 16+ against a hard PG17 #error floor. Cheap,
+      # needs no build, so it runs first and fails fast.
+      - name: Packaging identity
+        run: python3 test/check_packaging_identity.py
+
+      # Shipped-script ASCII (M3 #66.11). Not a style rule: CREATE EXTENSION
+      # validates the WHOLE of bm25_native--1.0.sql against the SERVER ENCODING
+      # before running any of it, and the script carried 11 comment lines of em
+      # dashes and a Sigma -- so the extension could not be installed in an
+      # EUC_JP database at all (E2 80 is not a legal EUC_JP sequence). LATIN1
+      # accepts those bytes (every byte is legal LATIN1), and every gate here is
+      # C/UTF8, which is exactly why it survived this long. t/018 is the
+      # behavioural half; this is the cheap half, and it runs before the build
+      # for the same reason the packaging check does. It also covers src/*.{c,h},
+      # where non-ASCII really is only cosmetic (a .c file's encoding never
+      # reaches a server) -- swept and gated together so the tree has one rule
+      # rather than a per-file judgement call. sql/ is deliberately NOT covered:
+      # several suites carry intentional multibyte test data.
+      - name: Source ASCII
+        run: python3 test/check_source_ascii.py
+
+      # C source house style (#66, ADR 0092). The tree deliberately does NOT run
+      # pgindent (an out-of-tree extension; a whole-tree reformat would rewrite
+      # blame for no behavioural gain), so the style is written down in
+      # ARCHITECTURE.md instead -- and the parts a script can decide without
+      # judgement are decided here: no tabs, no CR, no line over 120 columns, no
+      # trailing whitespace, "postgres.h" first in every .c and in no header, and
+      # errcode() inside every ereport that can raise an error (checked on the
+      # call's own balanced parens with comments and literals blanked, so a
+      # message that merely MENTIONS errcode cannot satisfy it). Static and
+      # cheap, so it runs before the build like the two checks above.
+      - name: Source style
+        run: python3 test/check_source_style.py
+
+      # Owned-gate coverage (#309). Every SQL entry point that opens its index
+      # through bm25_index_open_owned must be aimed at a btree in
+      # sql/63_debug_privileges, whose expected output pins the refusal. The list
+      # is derived from src/ (only the source knows which gate a function uses),
+      # so a new writer missing from the suite fails here. Static, before the build.
+      - name: Owned-gate coverage
+        run: python3 test/check_owned_gate_coverage.py
+
+      # Interrupt-check floor (H3, issue #43). Scan cancellability is a LATENCY
+      # property: a scan with no CHECK_FOR_INTERRUPTS still ends with the right
+      # error, just after the whole in-AM build has run, so pg_regress output
+      # cannot detect a regression here. sql/66_scan_interrupts pins that scans
+      # are interruptible at all; this step is what fails if the checks are
+      # deleted or a refactor drops them. Raise the floor when adding more.
+      - name: Interrupt-check floor
+        run: |
+          # Counted by ci/count_calls.py, not grep (#309 CI-14). It blanks comments
+          # and string literals first (the lexer test/check_source_style.py uses)
+          # and matches the call form at an identifier boundary, so neither a
+          # "/* CHECK_FOR_INTERRUPTS */" include comment nor a comment that writes
+          # the call form counts as a check. With floors set to exact counts, every
+          # comment a raw grep counted could pay for one deleted check (#67.13, ADR
+          # 0093). A missing file is an error, never a count of zero.
+          cfi() { python3 ci/count_calls.py 'CHECK_FOR_INTERRUPTS()' -- "$@"; }
+          both() { python3 ci/count_calls.py 'CHECK_FOR_INTERRUPTS()' 'BM25_VACUUM_DELAY_POINT()' -- "$@"; }
+          #
+          # BOTH FORMS COUNT (issue #147). BM25_VACUUM_DELAY_POINT() expands to
+          # vacuum_delay_point(), which calls CHECK_FOR_INTERRUPTS() internally, so a
+          # site carrying it is cancellable in exactly the way this gate exists to
+          # protect -- it additionally engages autovacuum's cost budget, which is the
+          # whole reason ADR 0025 requires it on VACUUM-path loops. Counting only the
+          # bare form made the two mutually exclusive: converting a VACUUM-path loop
+          # to the throttling form the project's own rule demands DECREMENTED the
+          # count and tripped a gate meant to catch deletions. #147 converted three
+          # loops in bm25_pending.c and the aggregate fell 70 -> 67 with cancellability
+          # unchanged and throttling gained.
+          #
+          # The floor moves 70 -> 75 rather than down to 67, and that is not slack:
+          # 75 is what the combined count ALREADY was before #147 (70 bare + 5
+          # BM25_VACUUM_DELAY_POINT call sites in bm25_handler.c and bm25_fsm.c), and
+          # it is what it is after (67 + 8). The conversion is invariant under the
+          # combined count, which is the property that makes it the right thing to
+          # count. Restricted to src/*.c so bm25.h's two #define lines -- the macro's
+          # definition, not a call -- are not counted as checks; no .c file defines it.
+          n=$(both src/*.c)
+          echo "interrupt checks (both forms) in src/*.c: $n"
+          # Floor 62. The maintenance-interrupts pass (VACUUM, merge, seal/build,
+          # pending drain, query-parse/glob) took the 42-check scan-path baseline
+          # (ADR 0024/0034/0035) to 61 across nine previously-zero-CFI files; the
+          # crash/replica-safety + nested-lock pass (fix 5, adversarial review,
+          # 2026-08) added one more, LIVE from the moment it landed: dropping the
+          # merge feed's DICT-page lock before each term's postings replay
+          # (bm25_seg_dict_iter_unlock, to stop that replay nesting under a second
+          # content lock) opened a genuine lock-free instant that didn't exist
+          # before, and bm25_accum_from_segments places its own check there --
+          # see bm25_merge.c's call site and bm25_seg_dict_iter_next's header
+          # comment (bm25_seg_dict.c) for why this one is live, not the same trap
+          # the paragraph below describes.
+          #
+          # 61 itself: the pass first reached 68, and the drop to 61 is the whole
+          # lesson of ADR 0041, not a regression. Seven of those checks were INERT: a
+          # buffer content lock is an LWLock, LWLockAcquire does HOLD_INTERRUPTS(),
+          # and ProcessInterrupts() returns immediately while InterruptHoldoffCount
+          # != 0 (see INTERRUPTS_CAN_BE_PROCESSED in miscadmin.h). The ChainWriter
+          # holds its tail buffer EXCL-locked ACROSS iterations, so eight in-loop
+          # checks in bm25_seg_build.c could never fire. They are replaced by ONE
+          # live check in chain_ensure, placed in the genuine lock-free gap
+          # chain_flush() opens before bm25_page_alloc() takes the next page -- so
+          # cancellation granularity is one page rotation, and it actually happens.
+          #
+          # This is the same "a consolidation can legitimately lower a count-based
+          # floor" case as the earlier 44->42 note, but sharper: a raw count cannot
+          # tell a LIVE check from a DEAD one, so the count alone was never evidence
+          # of cancellability. sql/80_maintenance_interrupts is what actually pins it,
+          # by cancelling a real seal and asserting it stops promptly.
+          # 62 -> 59 (ADR 0045). The scan-prologue dedup collapsed THREE df->idf
+          # copies into one bm25_term_idf (2 checks each in A and B, and ZERO in
+          # wand_debug_ctx_and_block's copy: 4 -> 2) and TWO phrase-positionless
+          # segment sweeps into one bm25_phrase_segments_have_positions (2 -> 1).
+          # Every -3 is in bm25_scan.c and every one is de-duplication: each former
+          # copy's call site now runs a helper that carries the check. Runtime
+          # cancellability strictly INCREASED, because the debug copy had none at all
+          # and now inherits both. This is the same "a consolidation legitimately
+          # lowers a count floor" case as 44->42 (ADR 0035) -- which is exactly why
+          # the per-file floors below exist: a raw aggregate cannot tell a check that
+          # was DE-DUPLICATED from one that was DELETED, so each shared chokepoint
+          # gets pinned by file as well.
+          # 59 -> 70 (issue #139, the phrase-cancellability pass). +11, and unlike
+          # every movement recorded above this one is a pure ADDITION -- nothing was
+          # de-duplicated, moved or deleted, so the aggregate and all three touched
+          # per-file floors move together. Where they went:
+          #   +5 src/bm25_seg_read.c  (9 -> 14)
+          #   +4 src/bm25_phrase.c    (0 -> 4, newly floored below)
+          #   +2 src/bm25_debug.c     (1 -> 3)
+          # The headline of that issue, though, is a check this count CANNOT see: the
+          # POS cursor and the POST page walk in bm25_seg_scan_postings now copy the
+          # page and unlock BEFORE decoding, which is what makes the two checks that
+          # were ALREADY there -- its per-posting-page one, and chain_read_at's -- stop
+          # being no-ops under HOLD_INTERRUPTS. Two checks went from dead to live with
+          # the count unchanged, in the exact mirror image of the 68 -> 61 drop above.
+          # The grep floor is a delete-detector, never evidence of cancellability;
+          # sql/66_scan_interrupts' phrase latency harness is what pins this one.
+          # 75 -> 82 (issue #145, the lock-hold-discipline pass). Two parts, and the
+          # second is arrears, exactly as PR-L's seg_read.c note describes:
+          #   +4 actual additions. bm25_segment.c 2 -> 4 (a per-DICT-ENTRY check in
+          #     each debug SRF, live only because those loops now decode a page COPY
+          #     with no content lock held) and bm25_seg_read.c 14 -> 16
+          #     (bm25_debug_segterms' entry loop plus the wildcard expander's new
+          #     per-DICT-PAGE check, both from the same copy-then-unlock restructure).
+          #   +3 slack that had accumulated. The tree was already at 78 against a
+          #     floor of 75, so three checks could have been deleted with no gate
+          #     noticing. Floors are set to the actual count, not below it.
+          # As with 59 -> 70, the headline is again something this count CANNOT see:
+          # the wildcard expander's per-term check and the debug SRFs' existing
+          # per-page ones went from DEAD to LIVE because the page lock is now dropped
+          # (or the page copied) before the work runs -- no count change for those,
+          # same mirror image as 68 -> 61. sql/80_maintenance_interrupts' new
+          # bm25_debug_postings harness is what pins the live half; sql/47_m6_wildcard's
+          # multi-page fixture pins that the page-copy walk returns the same answers
+          # across a DICT page boundary (mutation-checked: truncating the walk to one
+          # page moves its counts 676 -> 254 and 26 -> 0).
+          # 82 -> 87 (issue #184, the phrase alternative-group work). +5, and again a
+          # pure ADDITION with nothing de-duplicated or deleted:
+          #   +4 src/bm25_phrase.c  (4 -> 8, floor raised below) -- the k-way slot-member
+          #     merge's per-emitted-position check, the classification scan, and the two
+          #     the new bipartite-matching sweep needs (per window event, and per window
+          #     CONTRACTION, which the outer per-event check does not cover because one
+          #     event can contract many times).
+          #   +1 arrears. The tree was already at 83 against a floor of 82, so one check
+          #     could have been deleted with no gate noticing. Floors are set to the
+          #     actual count, not below it.
+          # 87 -> 86 (#67.13, ADR 0093): no check was removed. One of the 87 was a
+          #   comment in bm25_handler.c that wrote the delay macro in its call form, so
+          #   this grep counted it. The comment now names the macro without parentheses.
+          # 86 -> 88 (#67, arrears). The tree held 88 real checks against 86: #205 added
+          #   two (bm25_pending_keymeta's chain walk, and the pending walk in what is now
+          #   bm25_stats.c's bm25_ranked_keys_fill_from_pending) without raising a floor,
+          #   so two checks could have been deleted with no gate noticing. Floors are set
+          #   to the actual count, not below it.
+          # 88 -> 90 (#225): +1 arrears (main already held 89) and +1 in
+          #   bm25_debug_stamp_chain_next's chain walk (then bm25_seg_read.c; now
+          #   stamp_chain_target in bm25_seg_debug.c, shared with
+          #   bm25_debug_stamp_segcat_empty -- same one check).
+          # 90 -> 91 (#225): +1 in bm25_debug_seg_reader_diff's per-element loop.
+          # 91 -> 92 (#229): +1 in seg_livedocs_all_set's LIVEDOCS page walk
+          #   (bm25_seg_read.c).
+          # 92 -> 94 (#246): +2 in bm25_seg_key_cache_fill (bm25_keymap.c), one per
+          #   pass over the ranked rows' key requests.
+          # 94 -> 96 (#305 REGR-05/SURFACE-11): +2 in bm25_seg_debug.c, the two debug
+          #   SRF loops that had none. This moves the floor by those two only; the
+          #   tree's count from the other #302-#314 fixes is set at the end of that
+          #   batch.
+          # 96 -> 97 (#305 XCUT-07, 2026-10-05): +1 in bm25_wand.c's cursor-open loop.
+          # 97 -> 99 (2026-10-05 grind close: set to the post-batch count).
+          if [ "$n" -lt 99 ]; then
+            echo "::error::interrupt checks dropped to $n (floor 99, both forms) -- see ADR 0024, 0034, 0035, 0041, 0045, 0093 and issues #139, #145, #147, #184"
+            exit 1
+          fi
+          # bm25_pending.c: three of its four checks are in the throttling form (issue
+          # #147: mark_dead, drain and truncate, the three maintenance chain walkers),
+          # which a gate counting only the bare form would not see, and the aggregate
+          # above would still pass if they were deleted and checks added elsewhere --
+          # the same hole the other per-file floors exist to plug. mark_dead and drain
+          # also walk the whole chain doing per-page I/O and per-page WAL on the VACUUM
+          # path, so losing these is losing autovacuum's ability to be both cancelled
+          # and throttled through the pending list. The fourth, a bare check, is
+          # bm25_pending_keymeta's chain walk (#205, the scan-time key resolver).
+          # Floor 3 -> 4 (#67, arrears): #205 added that check without raising this.
+          p=$(both src/bm25_pending.c)
+          echo "interrupt checks in src/bm25_pending.c: $p"
+          if [ "$p" -lt 4 ]; then
+            echo "::error::bm25_pending.c interrupt checks dropped to $p (floor 4) -- see ADR 0025 and issues #147, #205"
+            exit 1
+          fi
+          # bm25_seg_build.c's single check is the seal/build path's ONLY cancellation
+          # point, and it is load-bearing precisely because it sits in the lock-free
+          # rotation gap. Moving it back inside a chain_write loop would restore the
+          # count while silently restoring the un-cancellable behaviour.
+          b=$(cfi src/bm25_seg_build.c)
+          if [ "$b" -lt 1 ]; then
+            echo "::error::bm25_seg_build.c lost its rotation-gap interrupt check -- see ADR 0041"
+            exit 1
+          fi
+          # bm25_seg_read.c owns the shared chain_read_at loop that all three dense
+          # per-docid chain readers now funnel through (ADR 0035). If its check goes, all
+          # three lose cancellability at once and the aggregate floor above would still
+          # pass as long as a check were added anywhere else.
+          # Floor 8 -> 9 (PR-L). The file had drifted to NINE checks while the floor
+          # stayed at ADR 0035's eight, so one could have been deleted and paid for by
+          # an addition anywhere else in src/ with no gate noticing -- the exact hole
+          # the per-file floors exist to plug, reopened by SLACK rather than by a
+          # missing floor. "Raise the floor when adding more" is stated three
+          # paragraphs up; this is the arrears. The nine, in file order:
+          # bm25_scan_snapshot, bm25_segcat_read, bm25_seg_dict_lookup,
+          # bm25_seg_dict_iter_next, bm25_dict_expand_wildcard (THREE -- its
+          # per-segment loop, its per-term dict iteration, and its pending page-chain
+          # walk), bm25_seg_scan_postings, and chain_read_at.
+          # Floor 9 -> 14 (issue #139). The five added, in file order:
+          # pos_cursor_next_page (the per-POS-page cancellation point the copy-then-
+          # unlock restructure made possible -- with the old cursor a check there
+          # would have been dead the moment it was written), then the four chain
+          # walks SEGREAD-07 found with NEITHER a check nor an extent bound:
+          # bm25_segcat_find_entry, bm25_livedocs_locate, bm25_segcat_locate_entry
+          # (on the VACUUM tombstone path, so a cyclic segcat chain wedged
+          # autovacuum), and bm25_debug_segterms. All four also gained the
+          # `blk < RelationGetNumberOfBlocks` backstop bm25_segment.c:99 documents;
+          # the check alone would make such a walk killable but still wrong.
+          # Floor 14 -> 16 (issue #145). Two added. The first is in bm25_debug_segterms'
+          # per-ENTRY loop, made possible by that loop moving onto a DICT page copy:
+          # it previously had a per-PAGE check only, and that check went dead the
+          # moment the page lock was taken, with a text palloc and a
+          # tuplestore_putvalues (which can spill to a temp file) per entry inside
+          # the window. The second is the
+          # wildcard expander's per-DICT-PAGE check: that walk moved OFF
+          # bm25_seg_dict_iter_* onto its own copy-then-unlock page loop (the
+          # iterator's unlock/relock pair is unsound for a reader on a hot standby
+          # without feedback -- see its header), and an open-coded page loop needs
+          # its own page-granularity check where the iterator used to supply one.
+          # Two further #145 conversions in this file are invariant under this count
+          # and are exactly the dead-to-live kind the aggregate note above says a
+          # count cannot witness: the expander's per-ENTRY check was dead under the
+          # old held DICT lock and is live now that the loop decodes a page copy, and
+          # bm25_seg_dict_iter_next's own check went from covering three callers to
+          # covering one (the merge feed).
+          # Floor 16 -> 18 (#225): +1 arrears (the file already held 17) and +1 in
+          # bm25_debug_stamp_chain_next's walk to the page whose link it forges (that
+          # walk now lives in stamp_chain_target, bm25_seg_debug.c).
+          # Floor 18 -> 19 (#229): +1 in seg_livedocs_all_set's LIVEDOCS page walk.
+          # Floor 19 -> 6 (#228, ADR 0101). No check was removed: the file was split
+          # four ways and thirteen of its nineteen checks MOVED, each pinned by its
+          # new file's own floor immediately below (bm25_seg_dict.c 6,
+          # bm25_seg_chain.c 3, bm25_seg_debug.c 4; 6 + 6 + 3 + 4 = 19). A split
+          # of a floored file, as PR-J and ADR 0093 were, with the same consequence: the
+          # aggregate floor above does not move and cannot see a check leave one of
+          # these files, so each file that holds checks gets its own floor. The
+          # shared chain_read_at loop named at the top of this note is now
+          # bm25_seg_chain.c's. The six that stayed here: the SEGCAT walkers (the
+          # sampled cores of bm25_scan_snapshot, bm25_segcat_read,
+          # bm25_segcat_find_entry -- reached only from bm25_debug_segcat_walk -- and
+          # bm25_segcat_locate_entry), bm25_livedocs_locate,
+          # and seg_livedocs_all_set.
+          # 6 -> 5 (2026-10-05, #313 XCUT-09): the check in scan_snapshot_sampled's
+          # catalog walk ran with the metapage SHARE content lock held, so interrupts
+          # were already held off there and the call could never service a cancel; it
+          # was removed as dead code, not a lost cancellation point.
+          c=$(cfi src/bm25_seg_read.c)
+          echo "interrupt checks in src/bm25_seg_read.c: $c"
+          if [ "$c" -lt 5 ]; then
+            echo "::error::bm25_seg_read.c interrupt checks dropped to $c (floor 5) -- see ADR 0035, 0024 addendum, 0101, issues #139, #145, #313"
+            exit 1
+          fi
+          # bm25_seg_dict.c (#228, ADR 0101) was split out of bm25_seg_read.c with six
+          # checks: bm25_seg_dict_lookup's per-page check, bm25_seg_dict_iter_next's
+          # (the merge feed's per-DICT-page floor, in the lock-free gap between
+          # pages), and four in bm25_dict_expand_wildcard -- its per-segment loop, its per-DICT-page
+          # and per-entry checks on the page copy (#145), and its pending page-chain
+          # walk. The wildcard expander runs on the query path, and a pattern that
+          # matches much of the dictionary makes it the longest DICT walk a query does.
+          sd=$(cfi src/bm25_seg_dict.c)
+          echo "interrupt checks in src/bm25_seg_dict.c: $sd"
+          if [ "$sd" -lt 6 ]; then
+            echo "::error::bm25_seg_dict.c interrupt checks dropped to $sd (floor 6) -- see ADR 0035, 0101, issues #139, #145"
+            exit 1
+          fi
+          # bm25_seg_chain.c (#228, ADR 0101) was split out of bm25_seg_read.c with
+          # three checks: chain_read_at's, the one ADR 0035 first floored the reader
+          # for, which every dense per-docid lookup (LIVEDOCS, DOCMAP, NORMS) funnels
+          # through, so losing it de-cancels all three at once;
+          # bm25_seg_scan_postings' per-POST-page check; and pos_cursor_next_page's
+          # per-POS-page check (#139). The last two are live only because both walks
+          # copy the page and unlock before decoding.
+          sc=$(cfi src/bm25_seg_chain.c)
+          echo "interrupt checks in src/bm25_seg_chain.c: $sc"
+          if [ "$sc" -lt 3 ]; then
+            echo "::error::bm25_seg_chain.c interrupt checks dropped to $sc (floor 3) -- see ADR 0035, 0101, issue #139"
+            exit 1
+          fi
+          # bm25_seg_debug.c (#228, ADR 0101) was split out of bm25_seg_read.c with
+          # four checks: bm25_debug_seg_chain_extent's walk, bm25_debug_segterms'
+          # per-page and per-entry checks (the per-entry one live because the loop
+          # decodes a page copy, #145), and stamp_chain_target's walk to the page whose
+          # link a corruption lever forges (#225; shared by bm25_debug_stamp_chain_next
+          # and bm25_debug_stamp_segcat_empty). All REVOKEd from PUBLIC; this is
+          # responsiveness, not a hang, as for bm25_debug.c below.
+          # Floor 4 -> 6 (#305 REGR-05/SURFACE-11): bm25_debug_block_impacts' per-block
+          # walk and bm25_debug_tombstone's per-document loop. No SQL test can see a
+          # missing check in a debug SRF, so this floor is their only test.
+          sg=$(cfi src/bm25_seg_debug.c)
+          echo "interrupt checks in src/bm25_seg_debug.c: $sg"
+          if [ "$sg" -lt 6 ]; then
+            echo "::error::bm25_seg_debug.c interrupt checks dropped to $sg (floor 6) -- see ADR 0101, issues #145, #225, #305"
+            exit 1
+          fi
+          # bm25_segment.c holds the two debug SRFs' checks and nothing else, so a
+          # floor here is the only gate that can see them: the aggregate would still
+          # pass if both per-entry checks were deleted and one added anywhere else in
+          # src/. They are the live half of SEGREAD-10 (issue #145) -- bm25_debug_terms
+          # and bm25_debug_postings decode a COPY of each DICT page with no content
+          # lock held, which is what makes a per-entry check fire at all. Moving either
+          # back inside a held DICT lock would restore the count while silently
+          # restoring the uncancellable behaviour, the same trap ADR 0041 records for
+          # bm25_seg_build.c above. sql/80_maintenance_interrupts' bm25_debug_postings
+          # harness is the behavioural half.
+          g=$(cfi src/bm25_segment.c)
+          echo "interrupt checks in src/bm25_segment.c: $g"
+          if [ "$g" -lt 4 ]; then
+            echo "::error::bm25_segment.c interrupt checks dropped to $g (floor 4) -- see issue #145 (SEGREAD-10)"
+            exit 1
+          fi
+          # bm25_scan.c is where the aggregate just dropped, so pin it by file too.
+          # Same reasoning as seg_read.c above: bm25_term_idf and
+          # bm25_phrase_segments_have_positions are now SHARED chokepoints -- three
+          # idf call sites and two phrase gates funnel through them -- so losing one
+          # check there silently de-cancels several paths at once, and the aggregate
+          # would still pass if a check were added anywhere else in src/.
+          # Floor 23 -> 22 (PR-J, #69.5): the debug SRFs moved to bm25_debug.c and
+          # took bm25_debug_cursor_scan's check with them. This is the "a refactor
+          # legitimately lowers a count floor" case AGAIN, but with a twist worth
+          # naming: a SPLIT, unlike the dedup cases above, moves a check rather than
+          # removing one, so the AGGREGATE floor above does not move at all (59 before,
+          # 59 after) and cannot witness the change. Only the per-file pair can --
+          # which is precisely why bm25_debug.c gets its own floor immediately below
+          # rather than being left to the aggregate.
+          # Floor 22 -> 16 (#67.13, ADR 0093). The statistics layer both ranking
+          # builders share moved to bm25_stats.c with six checks: pending_df,
+          # pending_df_by_field, bm25_term_idf's two per-segment loops,
+          # bm25_pending_score_term and bm25_ranked_keys_fill_from_pending.
+          # bm25_wand_score_pending moved to bm25_wand.c with one more. That is seven
+          # of the file's 23, leaving 16. The floor drops by six, not seven, because the
+          # file was already one over it: #205 added bm25_ranked_keys_fill_from_pending's
+          # check without raising the floor, and that check is one of the seven that
+          # moved. This is a second SPLIT, with the same consequence as PR-J: the
+          # aggregate count does not change, so only the per-file floors here, on
+          # bm25_stats.c below, and on bm25_wand.c can see the move. bm25_term_idf, one
+          # of the two chokepoints named above, is now pinned by bm25_stats.c's floor.
+          # Floor 16 -> 4 (#228, ADR 0101). The third split of this file, and again
+          # no check was removed: the ranking builders moved to bm25_scan_rank.c with
+          # ten and the phrase/AND-fallback filters to bm25_scan_match.c with two, each
+          # pinned by that file's own floor immediately below (4 + 10 + 2 = 16); the
+          # aggregate did not move. bm25_phrase_segments_have_positions, the other
+          # chokepoint named above, is now bm25_scan_rank.c's. The four that stayed
+          # are all bm25_load_if_needed's, the @@@ match-set build: its per-term and
+          # per-segment loops, its pending walk, and the copy-out loop of the branch
+          # that delegates a phrase or multi-leaf query to the exhaustive scorer.
+          s=$(cfi src/bm25_scan.c)
+          echo "interrupt checks in src/bm25_scan.c: $s"
+          if [ "$s" -lt 4 ]; then
+            echo "::error::bm25_scan.c interrupt checks dropped to $s (floor 4) -- see ADR 0024, 0045, 0053, 0093, 0101"
+            exit 1
+          fi
+          # bm25_scan_rank.c (#228, ADR 0101) was split out of bm25_scan.c with ten
+          # checks, the ranked-scan path's own: the corpus prologue's three pending and
+          # per-field walks (pending_global_stats, pending_stats_by_field,
+          # bm25_field_corpus_stats), bm25_phrase_segments_have_positions' segment
+          # sweep, and six in bm25_scan_build_ranking_exhaustive (its per-term and
+          # per-segment loops, the boolean phrase-group recheck over the stash, the
+          # accumulator drain, the key-discovery sweep over segments, and the
+          # per-ranked-row finalizer). The
+          # exhaustive scorer is what every phrase, boolean and wand_top_k = 0 query
+          # runs and what a WAND-capped scan's tail rebuild reruns, so these are the
+          # checks that make those queries cancellable.
+          # Floor 10 -> 12 (2026-10-05 grind close: set to the post-batch count).
+          sr=$(cfi src/bm25_scan_rank.c)
+          echo "interrupt checks in src/bm25_scan_rank.c: $sr"
+          if [ "$sr" -lt 12 ]; then
+            echo "::error::bm25_scan_rank.c interrupt checks dropped to $sr (floor 12) -- see ADR 0024, 0045, 0093, 0101"
+            exit 1
+          fi
+          # bm25_scan_match.c (#228, ADR 0101) was split out of bm25_scan.c with two
+          # checks: the pending-list walks of pending_phrase_stash and
+          # pending_and_stash, one page per iteration on a copy taken before decoding.
+          sm=$(cfi src/bm25_scan_match.c)
+          echo "interrupt checks in src/bm25_scan_match.c: $sm"
+          if [ "$sm" -lt 2 ]; then
+            echo "::error::bm25_scan_match.c interrupt checks dropped to $sm (floor 2) -- see ADR 0101, issue #139"
+            exit 1
+          fi
+          # bm25_stats.c (#67.13, ADR 0093) was split out of bm25_scan.c with six
+          # checks, so it gets its own floor immediately. The aggregate did not move and
+          # cannot see a check leave this file if another is added anywhere else. All six
+          # are on the ranked-scan path, exhaustive or WAND: the pending df walks
+          # (pending_df, pending_df_by_field), bm25_term_idf's single-field and
+          # multi-field per-segment loops, the pending-arm scorer
+          # bm25_pending_score_term, and bm25_ranked_keys_fill_from_pending's pending
+          # walk. bm25_term_idf is the shared idf chokepoint: losing its check stops
+          # cancellation in the exhaustive scorer, the WAND driver and the debug probes
+          # at once.
+          # Floor 6 -> 7 (2026-10-05 grind close: set to the post-batch count).
+          st=$(cfi src/bm25_stats.c)
+          echo "interrupt checks in src/bm25_stats.c: $st"
+          if [ "$st" -lt 7 ]; then
+            echo "::error::bm25_stats.c interrupt checks dropped to $st (floor 7) -- see ADR 0024, 0053, 0093"
+            exit 1
+          fi
+          # bm25_debug.c held exactly one check: bm25_debug_cursor_scan's per-docid
+          # cursor loop, which walks a whole segment's postings and is the only
+          # unbounded loop among the debug SRFs. A floor of 1 was not ceremony -- a
+          # file at zero has nothing for the aggregate to miss, and this check landing
+          # here (not being deleted) is the whole content of the 23 -> 22 drop above.
+          # Floor 1 -> 3 (issue #139, HDL-09). The two added are the loops that
+          # should have had one all along, for the same reason that one does:
+          # bm25_debug_cursor_skip's ground-truth linear walk (driven to a
+          # caller-supplied int32 target, so it can traverse a whole term's run in
+          # one uninterruptible stretch) and wand_debug_ctx_and_block's per-segment
+          # dict-lookup loop. Both are REVOKEd from PUBLIC and both terminate, so
+          # this is responsiveness, not a hang.
+          # Floor 3 -> 4 (#225): bm25_debug_seg_reader_diff's loop over a
+          # caller-supplied docid array, each read through both the reader and the
+          # one-shot accessor.
+          d=$(cfi src/bm25_debug.c)
+          echo "interrupt checks in src/bm25_debug.c: $d"
+          if [ "$d" -lt 4 ]; then
+            echo "::error::bm25_debug.c interrupt checks dropped to $d (floor 4) -- see ADR 0053, issue #139"
+            exit 1
+          fi
+          # bm25_phrase.c (issue #139, XCUT-04). Floored for the first time here; the
+          # file had ZERO checks in ~394 lines. It is worth its own floor for a reason
+          # none of the files above share: it runs entirely UNLOCKED (the scorer
+          # copies positions into its own stash first), so a check here is live by
+          # construction and can never become the inert kind ADR 0041 describes.
+          # The original four: ordered_match's candidate loop, and unordered_match's
+          # grouping, merge-fill and minimum-window-sweep loops. All four are sized by
+          # TERM FREQUENCY, i.e. user data -- the "m is tiny" comment this pass deleted
+          # was the same wrong premise that justified the quadratic insertion sort now
+          # replaced by pg_qsort.
+          # Floor 4 -> 8 (issue #184). bm25_phrase_merge_lists' per-emitted-position
+          # check (it folds a slot's member lists, so it is term-frequency-sized like
+          # every loop above); unordered_match's overlap classification scan; and TWO in
+          # the bipartite-matching sweep -- one per window event and one per window
+          # CONTRACTION. The second is not redundant: a single event can contract the
+          # window many times, each contraction doing an augmenting search, so the
+          # per-event check alone would leave that work uncancellable.
+          p=$(cfi src/bm25_phrase.c)
+          echo "interrupt checks in src/bm25_phrase.c: $p"
+          if [ "$p" -lt 8 ]; then
+            echo "::error::bm25_phrase.c interrupt checks dropped to $p (floor 8) -- see issues #139, #184"
+            exit 1
+          fi
+          # The tokenizer's own word-run loop and the @@@ standalone evaluator's probe
+          # loop are the two added by ADR 0034. bm25_analyze is the one every ingest and
+          # query path funnels through, so losing its check un-cancels all of them.
+          # Floor 1 -> 2 (#67, arrears). Of the two ADR 0034 checks named above, only
+          # bm25_analyze's lives in this file (the @@@ probe loop is bm25_match's, in
+          # bm25_handler.c, floored there); the file's second check is bm25_tokenize's
+          # debug-tokenizer loop (#149). A floor of 1 let either be deleted unnoticed.
+          t=$(cfi src/bm25_tokenize.c)
+          if [ "$t" -lt 2 ]; then
+            echo "::error::bm25_tokenize.c interrupt checks dropped to $t (floor 2: bm25_analyze's word-run loop and bm25_tokenize's debug loop) -- see ADR 0034 and issue #149"
+            exit 1
+          fi
+          # bm25_wand.c (PR-L). Floored for the first time here, and the omission was
+          # the least defensible one in this step: WAND is the DEFAULT ranked-scan path
+          # (bm25_wand_top_k > 0 out of the box), so these five are the checks an
+          # ordinary user's ORDER BY actually executes, while every other file pinned
+          # above is a maintenance or debug path. The five: wand_cursor_sweep_global_ub
+          # (walks a term's whole block chain to establish the global upper bound),
+          # bm25_wand_cursor_next_geq (the skip loop, which can consume a long run of
+          # blocks without ever emitting a candidate), bm25_wand_segment (the WAND
+          # driver loop itself -- bounded by k only AFTER the heap fills, so a
+          # low-selectivity query walks the entire posting space inside it), and two in
+          # bm25_wand_build_ranking (its two per-segment passes).
+          # Floor 5 -> 6 (#67.13, ADR 0093): bm25_wand_score_pending moved here from
+          # bm25_scan.c with its check, which is in the loop that offers each scored
+          # pending document to the top-k heap. That loop runs once per matching pending
+          # document, so the check is as live as the five above. Leaving the floor at 5
+          # would give this file one check of slack.
+          # Floor 6 -> 5 (2026-10-05, #303.I): the per-builder key-config discovery loop
+          # and its check moved into bm25_ranked_key_config (bm25_stats.c, which gains
+          # one); no loop lost its check.
+          # Floor 5 -> 6 (#305 XCUT-07, 2026-10-05): bm25_wand_segment_scan's
+          # cursor-open loop, one check per cursor. A bag-of-words query's term count
+          # is uncapped, and each open sets up two readers and loads a block.
+          w=$(cfi src/bm25_wand.c)
+          echo "interrupt checks in src/bm25_wand.c: $w"
+          if [ "$w" -lt 6 ]; then
+            echo "::error::bm25_wand.c interrupt checks dropped to $w (floor 6) -- see ADR 0024, 0034, 0093, issue #305"
+            exit 1
+          fi
+          # bm25_handler.c (PR-L). The comment above names the @@@ standalone
+          # evaluator's probe loop as one of ADR 0034's two additions, but only the
+          # tokenizer half was ever floored -- bm25_match's per-token bsearch loop lived
+          # under the aggregate alone. The other is bm25_bulkdelete's per-SEGMENT loop,
+          # which is distinct from the BM25_VACUUM_DELAY_POINT floored below: the delay
+          # point honours the vacuum cost budget, the interrupt check is what makes
+          # pg_cancel_backend land.
+          h=$(cfi src/bm25_handler.c)
+          echo "interrupt checks in src/bm25_handler.c: $h"
+          if [ "$h" -lt 2 ]; then
+            echo "::error::bm25_handler.c interrupt checks dropped to $h (floor 2) -- see ADR 0025, 0034"
+            exit 1
+          fi
+          # VACUUM needs the throttling form, not a bare check: dropping it
+          # silently bypasses the autovacuum cost-delay budget (ADR 0025), and no
+          # regression suite can observe that.
+          # Over src/*.c only, so the macro's own #define in bm25.h is not a call
+          # site (no .c file defines it).
+          # Floor 1 -> 7 (2026-10-05 grind close: set to the post-batch count).
+          v=$(python3 ci/count_calls.py 'BM25_VACUUM_DELAY_POINT()' -- src/*.c)
+          echo "vacuum_delay_point call sites in src/: $v"
+          if [ "$v" -lt 7 ]; then
+            echo "::error::vacuum_delay_point call sites dropped to $v (floor 7) -- see ADR 0025"
+            exit 1
+          fi
+          # Per-file floors for the nine files this pass brought up from zero. The
+          # aggregate floor above catches a net loss but not a file losing all of its
+          # checks while another file happens to gain enough elsewhere to cover for
+          # it -- these are the same "which file" backstop as the seg_read.c/
+          # tokenize.c assertions above, just for the maintenance side instead of the
+          # scan side.
+          # bm25_seg_build.c and bm25_merge.c were 1 and 2, not 8 and 3, after ADR
+          # 0041 -- the two files the dead-check fix there actually touched.
+          # bm25_seg_build.c's 8 per-item checks were dead (a locked ChainWriter
+          # tail buffer holds off interrupts) and collapsed to chain_ensure's ONE
+          # live rotation-gap check; bm25_merge.c's per-term dict-iteration check
+          # was equally dead and was replaced by bm25_seg_dict_iter_next's own
+          # check (bm25_seg_dict.c since #228, floored separately above), not by
+          # another check in bm25_merge.c itself -- so bm25_merge.c netted out at
+          # its other 2 (accum_from_segments' per-doc loop, bm25_merge_maybe's
+          # per-pass loop).
+          #
+          # bm25_merge.c is 3, not 2, as of the crash/replica-safety + nested-lock
+          # pass (fix 5, adversarial review, 2026-08): accum_from_segments gained
+          # its OWN live per-term check, placed in the genuine lock-free instant
+          # bm25_seg_dict_iter_unlock opens before the postings replay -- see the
+          # aggregate-floor comment above and bm25_merge.c's call site. This is a
+          # THIRD, independent check, not the dead one ADR 0041 already accounted
+          # for by moving it into bm25_seg_dict_iter_next.
+          #
+          # Floors of 8/3 for bm25_seg_build.c/bm25_merge.c's ADR-0041-era counts
+          # would never re-pass after a clean checkout of that pass and would only
+          # be satisfiable by re-introducing the dead checks -- the same "a raw
+          # count cannot tell live from dead" trap the aggregate-floor comment
+          # above warns about, one level down.
+          #
+          # Arrears closed (#67, ADR 0093): bm25_fsm.c 4 -> 8, bm25_pending.c 3 -> 4 and
+          # bm25_segment.c 2 -> 4. The files had grown to those counts without these
+          # entries being raised, and "floors are set to the actual count, not below
+          # it" applies here as much as to the aggregate.
+          declare -A maint_floor=(
+            [src/bm25_fsm.c]=8
+            [src/bm25_pending.c]=4
+            [src/bm25_segment.c]=4
+            [src/bm25_keymap.c]=5   # 2 -> 5 (2026-10-05 grind close: set to the post-batch count)
+            [src/bm25_merge.c]=3
+            [src/bm25_analyzer.c]=1
+            [src/bm25_meta.c]=1
+            [src/bm25_query.c]=2
+            [src/bm25_seg_build.c]=1
+          )
+          # Both forms here too, for the reason given at the top of this step: these
+          # are the MAINTENANCE-path files, i.e. exactly the ones ADR 0025 wants on
+          # the throttling form, so a bare-form-only count penalises the conversion it
+          # is supposed to encourage. Issue #147 converted all three of bm25_pending.c's
+          # walkers, taking its bare count to 0 while its real count stayed 3; #205
+          # then added a bare check in bm25_pending_keymeta, so it is 4, one bare.
+          #
+          # ci/count_calls.py prints 0 for a file with no checks, so a zero count
+          # reaches the ::error:: below; it exits nonzero only for a file that does
+          # not exist, which aborts the step under GitHub's `bash -e` -- the right
+          # outcome for a floor naming a file that is gone. (This replaced a grep
+          # with an `|| true` guard whose rationale ADR 0058 corrects.)
+          for f in "${!maint_floor[@]}"; do
+            want=${maint_floor[$f]}
+            got=$(both "$f")
+            echo "interrupt checks in $f: $got (floor $want)"
+            if [ "$got" -lt "$want" ]; then
+              echo "::error::$f interrupt checks dropped to $got (floor $want) -- maintenance-interrupts pass"
+              exit 1
+            fi
+          done
+
+      # Same reasoning as the interrupt floor: the tokenizer scratch contexts are a
+      # memory-FOOTPRINT fix, so deleting them changes no query output and no
+      # pg_regress suite can see it. sql/73_tokenizer_scratch pins that resetting
+      # under the accumulator is safe; this step is what fails if either context is
+      # dropped in a refactor. See ADR 0033.
+      - name: Tokenizer scratch-context floor
+        run: |
+          # The build callback must RESET its per-tuple arena, and bm25_insert must
+          # DELETE its per-row one. Match the operations, not the names, so renaming
+          # a context does not silently satisfy the floor.
+          # Counted in code only (ci/count_calls.py, #309 CI-14), so a comment that
+          # quotes either call cannot stand in for it.
+          r=$(python3 ci/count_calls.py 'MemoryContextReset(bs->tupcxt)' -- src/bm25_build.c)
+          d=$(python3 ci/count_calls.py 'MemoryContextDelete(scratch)' -- src/bm25_build.c)
+          echo "build per-tuple resets: $r; insert scratch deletes: $d"
+          if [ "$r" -lt 1 ]; then
+            echo "::error::bm25_build_callback lost its per-tuple context reset -- see ADR 0033"
+            exit 1
+          fi
+          # Two exits from bm25_insert reach the delete: the all-NULL early return
+          # and the normal path.
+          if [ "$d" -lt 2 ]; then
+            echo "::error::bm25_insert has $d scratch deletes (need 2, one per exit) -- see ADR 0033"
+            exit 1
+          fi
+
+      # H17: the scan snapshot leak is a memory-FOOTPRINT defect, invisible in
+      # pg_regress output, and the fix is an ORDERING property -- the scratch context
+      # must exist BEFORE bm25_scan_snapshot palloc's its catalog copy, or that copy
+      # lands in es_query_cxt / the subxact context and lives to end of query. grep
+      # cannot express "A before B within a function", so this checks it directly.
+      # Verified to FAIL on the pre-fix tree for all three call sites. See ADR 0036.
+      - name: Scan scratch-context ordering floor
+        run: python3 ci/check_scan_scratch.py
+
+      # Install PostgreSQL from the PGDG apt repo so we get exact version
+      # binaries and dev headers.  libipc-run-perl is required by the TAP
+      # harness (prove / PostgreSQL::Test::Cluster internals use IPC::Run).
+      # The postgresql-server-dev-NN package ships the PostgreSQL::Test::*
+      # Perl modules in its pgxs tree, so no source clone is needed.
+      #
+      # The trailing `${{ matrix.pg }}` component (issue #236) is what makes
+      # PG19 installable at all: apt.postgresql.org carries a pre-GA major in
+      # its OWN numbered component, not in `main`. It is a no-op for 17/18 --
+      # both are released majors and apt.postgresql.org still serves them from
+      # `main`, so `main 17`/`main 18` just point apt at one extra, redundant
+      # package index -- so one line covers all three legs rather than
+      # forking this step on matrix.experimental. Drop this component once
+      # PG19 reaches GA and moves into `main` (see the matrix comment above).
+      - name: Install PostgreSQL ${{ matrix.pg }} and dev headers
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main ${{ matrix.pg }}" \
+            > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            postgresql-${{ matrix.pg }} \
+            postgresql-server-dev-${{ matrix.pg }} \
+            libipc-run-perl
+
+      # Build and install into the system pkglibdir/sharedir.
+      #
+      # COPT=-Werror is the compiler-warning gate (L4 #67.1). Before it, the build
+      # failed only on a hard error: a -Wmaybe-uninitialized on a scan-state field
+      # or a -Wformat mismatch inside an ereport emitted its warning, exited 0, and
+      # the pipeline went green with nothing inspecting the log. This promotes an
+      # EXISTING, curated warning set rather than inventing one -- PGXS already
+      # compiles every TU with PostgreSQL's own -Wall -Wmissing-prototypes
+      # -Wpointer-arith -Wdeclaration-after-statement ... list (pg_config --cflags).
+      #
+      # It lives here and NOT in the Makefile deliberately. COPT is the PGXS hook
+      # for exactly this (Makefile.global:770 appends it to CFLAGS, CXXFLAGS and
+      # LDFLAGS), and
+      # keeping it out of the tree means someone building the extension against a
+      # compiler we have never seen is not blocked by a warning we could not have
+      # anticipated -- their build still succeeds, only ours is strict. The cost is
+      # that a runner compiler bump can turn this red on code that did not change;
+      # that is the deliberate trade. Fix the warning, or add a targeted -Wno-...
+      # to this line with a note saying which compiler forced it. Do not delete
+      # the gate.
+      #
+      # On BOTH matrix legs, because the warning may come from a server header we
+      # do not control and PG 17 and PG 18 ship different ones.
+      - name: Build and install
+        run: |
+          make PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config COPT=-Werror
+          sudo make PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config install
+
+      # Stats-layer call direction (#67.13, ADR 0093). bm25_stats.c holds the code both
+      # ranking builders share, and it exists so that calls run one way: the scanner ->
+      # bm25_wand.c -> bm25_stats.c, and the scanner -> bm25_stats.c. Before it, the
+      # WAND driver called back into bm25_scan.c, the file that had just called it. The
+      # extension links and every suite passes whichever way those calls run, so no
+      # test can see the cycle come back. This step checks the object files the build
+      # just produced:
+      #   (1) nothing bm25_stats.o leaves undefined may be defined in the scanner's
+      #       objects or bm25_wand.o;
+      #   (2) nothing bm25_wand.o leaves undefined may be defined in the scanner's
+      #       objects.
+      # Both sets are empty. "The scanner" is three objects since #228 (ADR 0101):
+      # bm25_scan.o (the AM callbacks), bm25_scan_rank.o (the ranking builders, which
+      # call the WAND driver) and bm25_scan_match.o (the phrase/AND filters). Both
+      # sides of each comparison come from the same nm, so the leading underscore
+      # Mach-O adds on macOS needs no special handling when this is run locally.
+      - name: Stats-layer call direction
+        run: |
+          defs() { nm -g --defined-only "$@" | awk 'NF >= 3 { print $NF }' | sort -u; }
+          undefs() { nm -u "$1" | awk 'NF >= 1 { print $NF }' | sort -u; }
+          scan_objs="src/bm25_scan.o src/bm25_scan_rank.o src/bm25_scan_match.o"
+          # Canary first. An empty intersection is also what a missing object file or an
+          # nm output format this awk cannot parse would produce -- nm's error vanishes
+          # inside the process substitutions below -- so require edges that must exist
+          # and that between them read all five objects: bm25_stats.o defines
+          # bm25_term_idf and bm25_wand.o uses it; bm25_wand.o defines
+          # bm25_wand_build_ranking and bm25_scan_rank.o uses it; bm25_scan_match.o
+          # defines phrase_recheck_tid and bm25_scan_rank.o uses it; bm25_scan_rank.o
+          # defines bm25_scan_build_ranking and bm25_scan.o uses it.
+          if ! defs src/bm25_stats.o | grep -Eqx '_?bm25_term_idf' ||
+             ! undefs src/bm25_wand.o | grep -Eqx '_?bm25_term_idf' ||
+             ! defs src/bm25_wand.o | grep -Eqx '_?bm25_wand_build_ranking' ||
+             ! undefs src/bm25_scan_rank.o | grep -Eqx '_?bm25_wand_build_ranking' ||
+             ! defs src/bm25_scan_match.o | grep -Eqx '_?phrase_recheck_tid' ||
+             ! undefs src/bm25_scan_rank.o | grep -Eqx '_?phrase_recheck_tid' ||
+             ! defs src/bm25_scan_rank.o | grep -Eqx '_?bm25_scan_build_ranking' ||
+             ! undefs src/bm25_scan.o | grep -Eqx '_?bm25_scan_build_ranking'; then
+            echo "::error::cannot read the bm25_stats.o/bm25_wand.o/scanner symbol tables (a required edge was not found) -- the layering check below would pass vacuously, see ADR 0093, 0101"
+            exit 1
+          fi
+          up=$(comm -12 <(undefs src/bm25_stats.o) <(defs $scan_objs src/bm25_wand.o))
+          back=$(comm -12 <(undefs src/bm25_wand.o) <(defs $scan_objs))
+          echo "bm25_stats.o -> scanner/bm25_wand.o: ${up:-none}"
+          echo "bm25_wand.o -> scanner: ${back:-none}"
+          if [ -n "$up" ]; then
+            echo "::error::bm25_stats.o uses symbols defined in the scanner or bm25_wand.o:" $up "-- the stats layer must call nothing above it, see ADR 0093"
+            exit 1
+          fi
+          if [ -n "$back" ]; then
+            echo "::error::bm25_wand.o uses symbols defined in the scanner:" $back "-- the WAND driver must not call back into the scanner, see ADR 0093"
+            exit 1
+          fi
+
+      # bm25_phrase.c's matcher is a pure function with a standalone assert-only
+      # main() behind -DBM25_PHRASE_SELFTEST, and it is the ONLY harness for the
+      # alternative-group overlap paths (#184): a slot's members can only share a
+      # document position once the analyzer emits per-run positions, so no SQL query
+      # can construct the input that separates the exact matching sweep from the
+      # counting one. Built with -O2 and assertions ON regardless of how the
+      # extension itself was configured, because every case in there is an assert.
+      - name: Phrase matcher selftest (gating)
+        run: |
+          cc -DBM25_PHRASE_SELFTEST -O2 -Wall -Werror \
+             -I src \
+             -I "$(/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config --includedir-server)" \
+             -x c src/bm25_phrase.c -o /tmp/bm25_phrase_selftest
+          /tmp/bm25_phrase_selftest
+
+      # Single gating step: pg_virtualenv spins a throwaway cluster, then
+      # make installcheck runs both the SQL regression suites and the TAP tests
+      # (t/*.pl) in one shot.  The PostgreSQL::Test modules come from the
+      # server-dev package; libipc-run-perl satisfies IPC::Run.
+      # Every diagnostic below is `|| true`, and that is load-bearing, not noise.
+      # GitHub runs `run:` under `bash -e`, and the brace group is the command
+      # following the final `||`, so -e is IN FORCE inside it: the first diagnostic
+      # whose file does not exist kills the shell and every later one is skipped.
+      # The step still fails, silently. That is not hypothetical -- it is exactly
+      # the TAP-half failure, where the SQL suites passed so regression.diffs was
+      # never written, and the server log (the one artifact that would explain it)
+      # was the thing being suppressed. 2>/dev/null hides the message, not the
+      # exit status. Do not remove these.
+      #
+      # TAP-ran canary (#309 CI-07). On a server built without --enable-tap-tests,
+      # PGXS replaces the whole TAP tier with an echo and installcheck still exits 0,
+      # so this leg would pass having run no crash or replica suite. The output is
+      # tee'd to a log and ci/check_tap_ran.sh requires prove's "Files=N" summary
+      # there, with N equal to the number of t/*.pl files. `set -o pipefail` is what
+      # keeps make's failure visible through the tee (GitHub's `bash -e` has no
+      # pipefail of its own, ADR 0070).
+      - name: Run regression and TAP tests (gating)
+        run: |
+          set -o pipefail
+          pg_virtualenv make \
+            PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config \
+            installcheck 2>&1 | tee installcheck.log \
+          || { cat regression.diffs 2>/dev/null || true; \
+               find tmp_check/log -name "*.log" -exec echo "=== {} ===" \; -exec cat {} \; 2>/dev/null || true; \
+               exit 1; }
+          bash ci/check_tap_ran.sh installcheck.log
+
+  # Report-only benchmark trend job (BLD-03, issue #156). These numbers are
+  # NEVER a pass/fail signal, and nothing else in this workflow depends on
+  # this job: continue-on-error is set at JOB level (not only per-step), so a
+  # red or timed-out run here cannot block a PR or main. Per the project's
+  # standing CI policy (see the permissions comment above and bench/README.md)
+  # shared GitHub Actions runners are too noisy to gate on -- a throttled or
+  # noisy-neighbour VM can swing an allocation-heavy benchmark 2x+ on
+  # byte-identical code, and no sigma threshold absorbs that without going
+  # blind to a real regression. These CSVs exist so a trend across many runs
+  # can be eyeballed later, never so this one run's number means anything by
+  # itself.
+  #
+  # Installs a plain (non-cassert, non-sanitized) PostgreSQL 18 from the PGDG
+  # apt repo -- the same method build-and-test and folding-collation use
+  # above -- rather than the hardening/asan jobs' from-source build: a timing
+  # run wants a representative optimized build, not a debug/instrumented one,
+  # and skipping the source compile keeps this job's own cost down, which
+  # matters because nothing gates on it to justify hardening's 90-minute
+  # budget.
+  #
+  # All four bench/*.sh scripts run with their sizes turned DOWN from each
+  # script's own defaults, via each script's own CLI arguments -- the scripts
+  # themselves are untouched, so a real local run still exercises their true
+  # defaults. wand_vs_exhaustive.sh and wand_global_ub.sh take both corpus size
+  # and rep count as arguments, so both are cut here. decoupled_score_hash.sh and
+  # index_build.sh only expose rep count (their corpus size / scale sweep is
+  # fixed in the script), so index_build.sh's 1M-doc cell still runs once --
+  # that cell is the whole reason that script exists, and one rep of it still
+  # fits comfortably inside the timeout below.
+  #
+  # CSVs go to an uploaded artifact, NOT into bench/baselines/: a shared,
+  # noisy runner is exactly the untrustworthy source bench/README.md says not
+  # to promote to a recorded baseline. Updating a baseline still means running
+  # these scripts locally, at their own defaults, on real hardware.
+  bench:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    env:
+      PG_MAJOR: "18"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install PostgreSQL and dev headers
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            postgresql-"$PG_MAJOR" \
+            postgresql-server-dev-"$PG_MAJOR"
+
+      - name: Build and install
+        run: |
+          make PG_CONFIG="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config"
+          sudo make PG_CONFIG="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config" install
+
+      # Same initdb/start shape as the hardening/folding-collation/asan/macos
+      # jobs above, split into its own step (rather than folded into the
+      # benchmark step) because PGDATA/PGPORT/PATH need to survive into three
+      # separate later steps -- GITHUB_ENV is what carries them across steps;
+      # a plain shell `export` here would not.
+      - name: Start cluster
+        run: |
+          export PATH="/usr/lib/postgresql/$PG_MAJOR/bin:$PATH"
+          export PGDATA="$RUNNER_TEMP/pgdata-bench" PGPORT=55595
+          initdb -D "$PGDATA" -A trust --no-locale -E UTF8
+          pg_ctl -D "$PGDATA" -l "$RUNNER_TEMP/pg-bench.log" \
+            -o "-p $PGPORT -k /tmp -c fsync=off" -w start
+          {
+            echo "PATH=/usr/lib/postgresql/$PG_MAJOR/bin:$PATH"
+            echo "PGHOST=/tmp"
+            echo "PGPORT=$PGPORT"
+          } >> "$GITHUB_ENV"
+
+      # Each script creates and drops its own throwaway database, so all four
+      # can run back to back against the one cluster started above. Each gets
+      # its own step, and 'continue-on-error: true' at STEP level (the
+      # per-step counterpart to the job-level setting above), so a failure in
+      # one script -- report-only, never gating -- does not stop its siblings
+      # or the cleanup/upload steps below from running.
+      #
+      # Redirected with a plain `>`, not piped through `tee`: this step's
+      # shell is `bash -e` with no `pipefail` (ADR 0070 -- GitHub's actual
+      # default, not `bash -eo pipefail`), so a script's failure inside a
+      # pipe would be masked by `tee`'s own always-zero exit status. A plain
+      # redirection is not a pipeline, so -e still sees the script's real
+      # exit code.
+      - name: Benchmark -- WAND vs exhaustive (report-only, scaled down)
+        continue-on-error: true
+        run: |
+          mkdir -p bench-out
+          ./bench/wand_vs_exhaustive.sh 2000 1 > bench-out/wand_vs_exhaustive.csv
+
+      - name: Benchmark -- decoupled score hash (report-only, scaled down)
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p bench-out
+          ./bench/decoupled_score_hash.sh 1 > bench-out/decoupled_score_hash.csv
+
+      - name: Benchmark -- index build (report-only, scaled down)
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p bench-out
+          ./bench/index_build.sh 1 > bench-out/index_build.csv
+
+      - name: Benchmark -- WAND buffer profile (report-only, scaled down)
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p bench-out
+          ./bench/wand_global_ub.sh 2000 1 > bench-out/wand_global_ub.csv
+
+      - name: Stop cluster
+        if: always()
+        run: |
+          export PATH="/usr/lib/postgresql/$PG_MAJOR/bin:$PATH"
+          pg_ctl -D "$RUNNER_TEMP/pgdata-bench" stop -m immediate 2>/dev/null || true
+
+      # Empty-output canary (#309 CI-15). The steps above cannot fail the job by
+      # design, so without this a script that errors leaves a green job and a CSV
+      # holding at most its comment and header lines. Prints each CSV's row count and
+      # raises a ::warning:: for a missing or data-less one. Report-only like the rest
+      # of this job: it never compares numbers, to a baseline or to anything else.
+      - name: Check benchmark outputs (report-only)
+        if: always()
+        run: |
+          bash ci/check_bench_csvs.sh bench-out wand_vs_exhaustive.csv \
+            decoupled_score_hash.csv index_build.csv wand_global_ub.csv
+
+      - name: Upload benchmark CSVs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-csv-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bench-out/*.csv
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Hardening gate: a source-built cassert+debug PostgreSQL plus a UBSan-
+  # instrumented extension, run through the full installcheck. Catches the
+  # assert / use-after-free / misaligned-access class the PGDG build cannot.
+  # Extension-only UBSan (bm25_*.c), not PostgreSQL. Gates.
+  #
+  # ONE LEG PER SUPPORTED MAJOR, at its current minor (#309 CI-06). This used to be
+  # PG 18.0 alone, on the theory that these classes are version-independent. They
+  # are not: an Assert is a property of the server's code, and #244's PG19 buffer
+  # re-lock assert was caught only by a hand-built cassert PG19. PG17 is the
+  # supported floor and had no assert run at all. Bump each pg_ver when a new minor
+  # ships; the cache key carries it, so a bump is a one-time source build. A PG19
+  # beta cassert leg is a deliberate residual (#309 D28): a beta can assert on its
+  # own bugs, and build-and-test already carries PG19 as a non-gating leg.
+  #
+  # WAL CONSISTENCY (#309 CI-01). Every bm25 page write is Generic WAL, whose rmgr
+  # has a mask function, so wal_consistency_checking makes REDO compare each page
+  # it rebuilds with an image the primary logged. A page dirtied outside
+  # GenericXLog, or a buffer left out of a record, then stops recovery with
+  # "inconsistent page found". Query answers do not see that class at all.
+  # Verified both ways (2026-10-05, PG 18.6), with a plant in the pending-append
+  # path (bm25_pending.c) that set the metapage's reserved_tail_pad after
+  # GenericXLogFinish. Without the setting the 16 crash/replica TAPs and all 148
+  # suites passed. With it, "inconsistent page found ... blkno 0" stopped
+  # t/004_crash_orphan's crash recovery and t/005_replica_reuse's standby, and
+  # the regression standby below. The
+  # check runs only where WAL is REPLAYED, so it is wired twice: TEMP_CONFIG puts
+  # it in every TAP node's postgresql.conf (their crash restarts and standbys
+  # replay), and the pg_regress cluster streams to a standby that replays the
+  # whole run (ci/wal_check_standby.sh says why a standby and not a crash restart).
+  # 'all' rather than 'generic' as the deliberate cheap superset: the regression
+  # run is about 21 GB of WAL with it. The standby replays it far more slowly
+  # than the primary writes it, so it is synchronous (remote_apply) and the run
+  # proceeds at replay speed; an unthrottled standby fell over 4 GB behind on the
+  # 2-core runner and lost its slot.
+  hardening:
+    name: hardening (PG ${{ matrix.pg_ver }})
+    runs-on: ubuntu-latest
+    # Higher than the other two: a cache MISS source-builds PostgreSQL here, and
+    # a UBSan-instrumented installcheck is several times slower than a plain one.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_ver: ["17.11", "18.6"]
+    env:
+      PG_VER: ${{ matrix.pg_ver }}
+      PG_PREFIX: ${{ github.workspace }}/pg-cassert
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential bison flex \
+            libreadline-dev zlib1g-dev libipc-run-perl
+
+      - name: Cache cassert PostgreSQL
+        id: pgcache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.PG_PREFIX }}
+          key: cassert-pg-${{ env.PG_VER }}-cassert-debug-tap-noicu-${{ runner.os }}
+
+      - name: Build cassert PostgreSQL (cache miss only)
+        if: steps.pgcache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://ftp.postgresql.org/pub/source/v${PG_VER}/postgresql-${PG_VER}.tar.bz2" -o pg.tar.bz2
+          tar xf pg.tar.bz2
+          cd "postgresql-${PG_VER}"
+          ./configure --prefix="$PG_PREFIX" --enable-cassert --enable-debug \
+            --enable-tap-tests --without-icu
+          make -j"$(nproc)"
+          make install
+
+      - name: Build + install extension with UBSan
+        run: |
+          make PG_CONFIG="$PG_PREFIX/bin/pg_config" \
+            PG_CFLAGS="-ffp-contract=off -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g" \
+            PG_LDFLAGS="-fsanitize=undefined"
+          make PG_CONFIG="$PG_PREFIX/bin/pg_config" \
+            PG_LDFLAGS="-fsanitize=undefined" install
+
+      - name: Run installcheck under cassert + UBSan (gating)
+        run: |
+          export PATH="$PG_PREFIX/bin:$PATH"
+          export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+          # Read by PostgreSQL::Test::Cluster->init for every TAP node (not by
+          # pg_regress, whose server is the one started below).
+          echo "wal_consistency_checking = 'all'" > "$RUNNER_TEMP/wcc.conf"
+          export TEMP_CONFIG="$RUNNER_TEMP/wcc.conf"
+          export PGDATA="$RUNNER_TEMP/pgdata" PGPORT=55599 PGHOST=/tmp
+          STANDBY="$RUNNER_TEMP/pgdata-standby" SPORT=55593 SLOG="$RUNNER_TEMP/pg-standby.log"
+          initdb -D "$PGDATA" -A trust --no-locale -E UTF8
+          # The script makes the standby synchronous under remote_apply, so its lag
+          # is bounded by the transactions in flight, not by runner speed or disk,
+          # and it owns the slot cap (max_slot_wal_keep_size), dropping it to 0
+          # when its watchdog finds the standby gone so a dead standby's slot does
+          # not pin the run's WAL. Do not set synchronous_* or
+          # max_slot_wal_keep_size here: the watchdog's ALTER SYSTEM could not
+          # override a command-line setting.
+          pg_ctl -D "$PGDATA" -l "$RUNNER_TEMP/pg.log" \
+            -o "-p $PGPORT -k /tmp -c fsync=off -c wal_consistency_checking=all" -w start
+          bash ci/wal_check_standby.sh start "$STANDBY" "$SPORT" "$SLOG"
+          make PG_CONFIG="$PG_PREFIX/bin/pg_config" installcheck \
+            PGHOST=/tmp PGPORT="$PGPORT" \
+          || { echo "=== regression.diffs ==="; cat regression.diffs 2>/dev/null || true; \
+               echo "=== server log ==="; cat "$RUNNER_TEMP/pg.log" 2>/dev/null || true; \
+               echo "=== standby log ==="; cat "$SLOG" 2>/dev/null || true; \
+               find tmp_check/log -name '*.log' -exec echo "=== {} ===" \; -exec cat {} \; 2>/dev/null || true; \
+               pg_ctl -D "$STANDBY" stop -m immediate 2>/dev/null || true; \
+               pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true; exit 1; }
+          bash ci/wal_check_standby.sh verify "$SPORT" "$SLOG" \
+          || { pg_ctl -D "$STANDBY" stop -m immediate 2>/dev/null || true; \
+               pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true; exit 1; }
+          pg_ctl -D "$STANDBY" stop -m immediate
+          pg_ctl -D "$PGDATA" stop -m immediate
+
+  # Folding-collation gate (PR-L, from PR-F / ADR 0046). Every other gate in this
+  # file runs a C-locale cluster -- build-and-test through pg_virtualenv, hardening
+  # through initdb --no-locale -- and under LC_CTYPE=C nothing in the analyzer ever
+  # folds a non-ASCII character. That is not a cosmetic difference. The fold happens
+  # BEFORE the stemmer sees the word, so a collation that folds also decides whether
+  # the stemmer ENGAGES, and a stemmer that engages rewrites the term: german_stem
+  # stems and transliterates an already-lowercased accented word but its rules miss
+  # the uppercase form, so the whole word is stored instead. The bytes written to
+  # the index therefore differ STRUCTURALLY between a C cluster and a folding one --
+  # which is why the obvious defence (compare lower(term) against lower(word) so the
+  # fold cancels) does not work, and why sql/82_encoding_aware_tokens asserts
+  # octet_length over words whose fold is length-stable in both directions.
+  #
+  # PR-F's adversarial review found sql/82 failing on a UTF-8 cluster precisely
+  # because no gate ran one. It was fixed and hand-verified under C, en_US.UTF-8 and
+  # ICU, but that invariance has been held by discipline ever since. This job is the
+  # machinery. Gates.
+  #
+  # C.UTF-8 and not en_US.UTF-8 on purpose: its LC_CTYPE is full Unicode, so the fold
+  # is exercised, while its LC_COLLATE stays codepoint order, so every ORDER BY
+  # across 92 suites keeps the ordering the expected output is pinned against. That
+  # isolates the single variable under test. (Verified 2026-08-11 that the suites
+  # also survive the harder case -- a full installcheck against an en_US.UTF-8
+  # cluster, which perturbs collation as well as ctype, is 92/92.)
+  #
+  # PG 18 only: the property is analyzer-level and version-independent, and
+  # build-and-test already covers both server versions under C.
+  #
+  # SCOPE, precisely: the pg_regress half runs on this cluster. The TAP half does
+  # NOT -- PostgreSQL::Test::Cluster->init runs its own `initdb --no-sync --pgdata
+  # ... --auth trust` with no locale argument, so every t/*.pl cluster takes the
+  # runner's environment locale instead, outside this job's canary. Running the
+  # TAP suites here is therefore duplicated coverage, not folding coverage, and
+  # t/018_snippet_encoding.pl in particular stays un-exercised under a folding
+  # ctype. Closing that means setting LANG for the job (Utils.pm deletes LC_ALL
+  # but not LANG) and re-verifying every TAP suite under it; deliberately left as
+  # follow-up rather than done blind. See ADR 0057.
+  folding-collation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PG_MAJOR: "18"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install PostgreSQL and dev headers
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            postgresql-"$PG_MAJOR" \
+            postgresql-server-dev-"$PG_MAJOR" \
+            libipc-run-perl
+
+      - name: Build and install
+        run: |
+          make PG_CONFIG="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config"
+          sudo make PG_CONFIG="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config" install
+
+      # initdb/start/canary/run in ONE step because $PGDATA has to survive between
+      # them and step-scoped exports do not. Same shape as the hardening job above.
+      - name: Run installcheck on a folding cluster (gating)
+        run: |
+          export PATH="/usr/lib/postgresql/$PG_MAJOR/bin:$PATH"
+          export PGDATA="$RUNNER_TEMP/pgdata-folding" PGPORT=55598
+          initdb -D "$PGDATA" -A trust -E UTF8 --locale=C.UTF-8
+          pg_ctl -D "$PGDATA" -l "$RUNNER_TEMP/pg.log" \
+            -o "-p $PGPORT -k /tmp -c fsync=off" -w start
+
+          # CANARY -- before a single suite runs. "installcheck passed on the folding
+          # cluster" is ALSO satisfied by a cluster that quietly is not one: if this
+          # image's C.UTF-8 were missing or initdb normalised it away, pg_regress
+          # would build contrib_regression from a C template0 and this whole job
+          # would be an expensive duplicate of build-and-test reporting green
+          # forever. So assert the MECHANISM is live first, and assert the property
+          # (does lower() actually fold?) rather than the configuration (is datctype
+          # spelled the way I expect?) -- the property is what the analyzer consumes.
+          # chr(201)/chr(233) are U+00C9/U+00E9 written 7-bit so this file stays
+          # ASCII; see the Source ASCII step. Verified to FAIL against a C cluster.
+          ctype=$(psql -X -At -h /tmp -p "$PGPORT" -d postgres \
+                    -c "SELECT datctype FROM pg_database WHERE datname = 'template0'")
+          folds=$(psql -X -At -h /tmp -p "$PGPORT" -d postgres \
+                    -c "SELECT lower(chr(201)) = chr(233)")
+          echo "template0 ctype: $ctype; lower(U+00C9) folds to U+00E9: $folds"
+          if [ "$folds" != "t" ]; then
+            echo "::error::cluster ctype '$ctype' does not fold non-ASCII -- this job is not testing what it claims to and would silently duplicate build-and-test. See ADR 0057 (and 0046 for the analyzer mechanism)."
+            pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null
+            exit 1
+          fi
+
+          make PG_CONFIG="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config" installcheck \
+            PGHOST=/tmp PGPORT="$PGPORT" \
+          || { echo "=== regression.diffs ==="; cat regression.diffs 2>/dev/null || true; \
+               echo "=== server log ==="; cat "$RUNNER_TEMP/pg.log" 2>/dev/null || true; \
+               find tmp_check/log -name '*.log' -exec echo "=== {} ===" \; -exec cat {} \; 2>/dev/null || true; \
+               pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true; exit 1; }
+          pg_ctl -D "$PGDATA" stop -m immediate
+
+  # Stats-less plans (#242). Every other installcheck runs with autovacuum on, so
+  # a suite's tables usually have statistics by the time its queries plan, and a
+  # check can pass only because of the plan those statistics buy. That is not
+  # hypothetical: sql/53's JOIN checks passed under the Nested Loop that stats
+  # produced and failed under the Hash Join a stats-less table gets, with a real
+  # wrong-score bug underneath. This job runs the same SQL suites with
+  # autovacuum off, so a table no suite ANALYZEs keeps reltuples = -1 and plans
+  # the other way. Verified on the pre-#242 tree: sql/53 was the only suite to fail
+  # here.
+  #
+  # A server-start -c and not TEMP_CONFIG/--temp-config: those configure only a
+  # pg_regress --temp-instance, and PGXS installcheck runs against a server this
+  # job starts itself (the folding-collation job's shape). The TAP half is left out
+  # for the reason that job gives: every t/*.pl initdbs its own cluster, which
+  # would not see this setting. PG 18 only; plan choice here is not
+  # version-specific, and build-and-test covers both server versions.
+  autovacuum-off:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PG_MAJOR: "18"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install PostgreSQL and dev headers
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            postgresql-"$PG_MAJOR" \
+            postgresql-server-dev-"$PG_MAJOR"
+
+      - name: Build and install
+        run: |
+          make PG_CONFIG="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config"
+          sudo make PG_CONFIG="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config" install
+
+      # initdb/start/canary/run in ONE step: $PGDATA must survive between them.
+      - name: Run installcheck with autovacuum off (gating)
+        run: |
+          export PATH="/usr/lib/postgresql/$PG_MAJOR/bin:$PATH"
+          export PGDATA="$RUNNER_TEMP/pgdata-noav" PGPORT=55597
+          initdb -D "$PGDATA" -A trust -E UTF8 --no-locale
+          pg_ctl -D "$PGDATA" -l "$RUNNER_TEMP/pg.log" \
+            -o "-p $PGPORT -k /tmp -c fsync=off -c autovacuum=off" -w start
+
+          # CANARY: a server that silently ignored the setting would make this job
+          # a slower copy of build-and-test that reports green forever.
+          av=$(psql -X -At -h /tmp -p "$PGPORT" -d postgres -c "SHOW autovacuum")
+          echo "autovacuum: $av"
+          if [ "$av" != "off" ]; then
+            echo "::error::autovacuum is '$av', not off -- this job is not testing stats-less plans (#242)"
+            pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null
+            exit 1
+          fi
+
+          make PG_CONFIG="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config" installcheck \
+            TAP_TESTS= PGHOST=/tmp PGPORT="$PGPORT" \
+          || { echo "=== regression.diffs ==="; cat regression.diffs 2>/dev/null || true; \
+               echo "=== server log ==="; cat "$RUNNER_TEMP/pg.log" 2>/dev/null || true; \
+               pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true; exit 1; }
+          pg_ctl -D "$PGDATA" stop -m immediate
+
+  # AddressSanitizer gate (BLD-02, issue #142). UBSan (the `hardening` job above)
+  # and ASan catch DISJOINT classes: UBSan finds signed overflow, misaligned
+  # access and invalid enum values -- all WITHIN a valid object -- while ASan
+  # finds reads and writes PAST an object's end, use-after-free, and heap
+  # corruption. That second set is precisely what a hand-written page and varbyte
+  # decoder is exposed to, and it is the class the 2026-08 review kept finding: an
+  # unvalidated field_count bounding a 32-element stack array (#133, which crashes
+  # the backend on demand once a corrupt page is fed to it), an unbounded
+  # reachable[] write (#134), an unbounded pending append (#136).
+  #
+  # Why no SQL suite can substitute. sql/69_decode_boundary,
+  # sql/78_trust_boundary_bounds and sql/79_page_content_bounds are three suites
+  # built entirely around "a torn or hostile page can carry a bound small enough
+  # to underflow", and they drive hand-written bm25_debug_* probes precisely
+  # because a regression suite cannot fabricate a corrupt page. So a real
+  # corrupt-page overread is only ever caught by ASan or by a crash -- never by
+  # pg_regress diffing output. Gates.
+  #
+  # Shares the hardening job's cassert PostgreSQL and its cache key, so on a cache
+  # hit this job costs an extension rebuild plus one instrumented installcheck.
+  # PostgreSQL itself is NOT instrumented -- only the extension is -- so libasan
+  # must be preloaded into the postmaster before it allocates anything, hence the
+  # LD_PRELOAD below. detect_leaks is OFF deliberately: PostgreSQL frees memory by
+  # resetting contexts and by exiting, so leak detection here reports the server's
+  # design rather than this extension's defects, and would bury the bounds errors
+  # this job exists to surface. The bounds checks stay fully on.
+  #
+  # The same per-major matrix as hardening (#309 CI-06), so each leg finds the
+  # cassert build its hardening sibling cached.
+  asan:
+    name: asan (PG ${{ matrix.pg_ver }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_ver: ["17.11", "18.6"]
+    env:
+      PG_VER: ${{ matrix.pg_ver }}
+      PG_PREFIX: ${{ github.workspace }}/pg-cassert
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential bison flex \
+            libreadline-dev zlib1g-dev libipc-run-perl
+
+      # Same key as the hardening job on purpose: whichever job runs first pays
+      # the source build, the other gets a hit.
+      - name: Cache cassert PostgreSQL
+        id: pgcache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.PG_PREFIX }}
+          key: cassert-pg-${{ env.PG_VER }}-cassert-debug-tap-noicu-${{ runner.os }}
+
+      - name: Build cassert PostgreSQL (cache miss only)
+        if: steps.pgcache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://ftp.postgresql.org/pub/source/v${PG_VER}/postgresql-${PG_VER}.tar.bz2" -o pg.tar.bz2
+          tar xf pg.tar.bz2
+          cd "postgresql-${PG_VER}"
+          ./configure --prefix="$PG_PREFIX" --enable-cassert --enable-debug \
+            --enable-tap-tests --without-icu
+          make -j"$(nproc)"
+          make install
+
+      - name: Build + install extension with ASan
+        run: |
+          make PG_CONFIG="$PG_PREFIX/bin/pg_config" \
+            PG_CFLAGS="-ffp-contract=off -fsanitize=address -fno-omit-frame-pointer -g" \
+            PG_LDFLAGS="-fsanitize=address"
+          make PG_CONFIG="$PG_PREFIX/bin/pg_config" \
+            PG_LDFLAGS="-fsanitize=address" install
+
+      - name: Run installcheck under ASan (gating)
+        run: |
+          export PATH="$PG_PREFIX/bin:$PATH"
+          # The extension is a shared library dlopen'd by a postmaster that was NOT
+          # built with ASan, so the runtime has to be resident before the backend
+          # loads it. Preloading on the SERVER (not this shell) is what matters.
+          ASAN_LIB="$(gcc -print-file-name=libasan.so)"
+          echo "libasan: $ASAN_LIB"
+          # CANARY, before a single suite runs, in the shape the folding-collation
+          # job established. "installcheck passed under ASan" is ALSO satisfied by a
+          # build that quietly is not instrumented -- if PG_CFLAGS were dropped or
+          # renamed upstream, this job would become an expensive duplicate of the
+          # hardening leg and report green forever. Assert the MECHANISM: the
+          # shipped module must carry ASan's interceptors.
+          MODULE="$($PG_PREFIX/bin/pg_config --pkglibdir)/bm25_native.so"
+          if ! nm -D "$MODULE" 2>/dev/null | grep -q '__asan_'; then
+            echo "::error::$MODULE carries no __asan_* symbols -- the extension was NOT built with AddressSanitizer, so this job would test nothing. Check PG_CFLAGS/PG_LDFLAGS in the build step."
+            exit 1
+          fi
+          echo "canary: module is ASan-instrumented"
+          export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=0:print_stacktrace=1
+          # EXPORTED, not scoped to the pg_ctl below. The TAP tier starts its OWN
+          # postmasters through PostgreSQL::Test::Cluster, which inherit this step's
+          # environment and nothing else -- a preload attached only to the pg_regress
+          # cluster's pg_ctl left every t/*.pl backend dying at CREATE EXTENSION with
+          # "ASan runtime does not come first in initial library list", while the
+          # pg_regress half ran fine. Preloading the runtime into a non-instrumented
+          # host binary is exactly the configuration ASan's own diagnostic asks for.
+          export LD_PRELOAD="$ASAN_LIB"
+          export PGDATA="$RUNNER_TEMP/pgdata-asan" PGPORT=55597
+          initdb -D "$PGDATA" -A trust --no-locale -E UTF8
+          pg_ctl -D "$PGDATA" -l "$RUNNER_TEMP/pg-asan.log" \
+            -o "-p $PGPORT -k /tmp -c fsync=off" -w start
+          # An ASan report kills the backend, which pg_regress reports only as a
+          # lost connection -- the report itself is in the SERVER log, so that log
+          # is the load-bearing diagnostic here, not regression.diffs.
+          make PG_CONFIG="$PG_PREFIX/bin/pg_config" installcheck \
+            PGHOST=/tmp PGPORT="$PGPORT" \
+          || { echo "=== regression.diffs ==="; cat regression.diffs 2>/dev/null || true; \
+               echo "=== server log (ASan reports land HERE) ==="; \
+               cat "$RUNNER_TEMP/pg-asan.log" 2>/dev/null || true; \
+               find tmp_check/log -name '*.log' -exec echo "=== {} ===" \; -exec cat {} \; 2>/dev/null || true; \
+               pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true; exit 1; }
+          pg_ctl -D "$PGDATA" stop -m immediate
+
+  # macOS / non-glibc leg (BLD-01, issue #142). Every other job here is
+  # ubuntu-latest, so the ctype divergence this project documents IN ITS OWN
+  # REGRESSION SUITE has zero automated coverage. sql/82_encoding_aware_tokens.sql
+  # states it plainly: on a platform whose single-byte ctype table covers 0x80-0xFF
+  # (BSD/macOS) under a UTF-8 LC_CTYPE, isalnum(0xC3) is TRUE and tolower(0xC3) is
+  # 0xE3 -- the lead byte of every Latin-1-range character is "lowercased" as if it
+  # were Latin-1 -- while glibc treated 0x80-0xFF as separators instead. Same code,
+  # two behaviours, neither correct, and CI could never see the first. That bug was
+  # found by manual off-CI testing; this leg is the machinery.
+  #
+  # FIRST-RUN RESULT (2026-08-18), recorded so this job's status means something to
+  # whoever reads it next: 93 of 94 suites PASS on macos-latest. Notably
+  # sql/82_encoding_aware_tokens -- the ctype divergence this leg exists for --
+  # is among the PASSES, so that BSD/glibc fold difference is not currently a live
+  # defect. The single failure is a `canceling statement due to statement timeout`
+  # mismatch: a TIMING assertion on a slower runner, not a correctness divergence.
+  # That is a different problem from the one this leg was added to find, and it was
+  # for a while what stood between this leg and gating.
+  #
+  # THAT BLOCKER IS GONE (issue #156). The two interrupt suites no longer assert a
+  # wall-clock boundary; they bound the WORK a cancelled scan or seal got through,
+  # which is a fact about the code and not about the runner. They were excluded from
+  # this leg for a while (ADR 0070); as of #156 this leg runs the FULL REGRESS list
+  # again. Promotion to gating is now purely a question of observing this job green
+  # on main, with no suite-level prerequisite left.
+  #
+  # REPORT-ONLY (continue-on-error) for now, deliberately. A first-run failure here
+  # is a REAL pre-existing platform difference, not a regression introduced by the
+  # PR that adds the job, and blocking on it would be the wrong trade. Promote to
+  # gating -- delete continue-on-error -- once it has been observed green on main;
+  # if it is red, that failure IS the finding and gets its own issue.
+  #
+  # SCOPE: the pg_regress half only. Homebrew does not ship PostgreSQL::Test, so
+  # the TAP suites cannot run here -- the same scope note the folding-collation job
+  # carries. A Linux aarch64 runner would separately help with alignment-sensitive
+  # code (this codebase casts page bytes to structs) but does NOT address the ctype
+  # table, since aarch64 Linux is still glibc.
+  macos:
+    runs-on: macos-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install PostgreSQL 18
+        run: |
+          brew install postgresql@18
+          echo "$(brew --prefix postgresql@18)/bin" >> "$GITHUB_PATH"
+
+      - name: Build and install
+        run: |
+          PG_CONFIG="$(brew --prefix postgresql@18)/bin/pg_config"
+          echo "PG_CONFIG=$PG_CONFIG" >> "$GITHUB_ENV"
+          make PG_CONFIG="$PG_CONFIG"
+          make PG_CONFIG="$PG_CONFIG" install
+
+      - name: Run installcheck (report-only)
+        run: |
+          export PGDATA="$RUNNER_TEMP/pgdata-macos" PGPORT=55596
+          initdb -D "$PGDATA" -A trust -E UTF8
+          pg_ctl -D "$PGDATA" -l "$RUNNER_TEMP/pg-macos.log" \
+            -o "-p $PGPORT -k /tmp -c fsync=off" -w start
+
+          # THE FULL REGRESS LIST, with nothing subsetted out (issue #156). This leg
+          # used to exclude sql/66_scan_interrupts and sql/80_maintenance_interrupts
+          # through a `SKIP=` variable plus a `make print-regress` filter, because
+          # those two asserted that a cancelled scan/seal stopped within a WALL-CLOCK
+          # boundary -- a property of the runner, not of the code, which macos-latest
+          # blew intermittently on an unchanged tree. Both suites now bound the WORK
+          # a cancelled statement got through instead, as a fraction of the same
+          # operation's uncancelled work, which a descheduled backend does not move:
+          # a stall burns milliseconds without advancing one loop iteration.
+          #
+          # That alone was NOT enough, and this leg proved it: the cancel was still
+          # delivered by a 10 ms statement_timeout, and the work a timed cancel
+          # reports is the work rate times the moment the timer is serviced. Here
+          # 10 ms timers were serviced at 13-56 ms, so 66's phrase assertion failed
+          # 5 of 6 runs on main and 80's seal assertion failed on PR #352. Since
+          # 2026-10-06 the suites inject the cancel at a fixed mid-loop step with
+          # bm25_native.debug_cancel_at/_after, so the count depends on no clock at
+          # all. ADR 0070 records the exclusion and its addenda the lift and this fix.
+          #
+          # Nothing replaces the filter: the whole point is that there is no longer a
+          # list to maintain, so `make print-regress` and the drop-count assertion
+          # that guarded it are gone too rather than left as a vestigial no-op. The
+          # target itself stays in the Makefile -- it is generally useful to a leg
+          # that needs a subset, and removing it is a separate decision.
+          #
+          # REGRESS is left unset, so PGXS uses the Makefile's own list. That is also
+          # what closes the failure mode the old block had to assert its way around:
+          # `REGRESS=` with an empty value runs ZERO suites and exits 0 -- green,
+          # having tested nothing -- which is only reachable when the workflow
+          # computes the list at all.
+          #
+          # REGRESS only: no TAP_TESTS, since PostgreSQL::Test is absent here.
+          make PG_CONFIG="$PG_CONFIG" installcheck TAP_TESTS= \
+            PGHOST=/tmp PGPORT="$PGPORT" \
+          || { echo "=== regression.diffs ==="; cat regression.diffs 2>/dev/null || true; \
+               echo "=== server log ==="; cat "$RUNNER_TEMP/pg-macos.log" 2>/dev/null || true; \
+               pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true; exit 1; }
+          pg_ctl -D "$PGDATA" stop -m immediate
+
+  # Report-only coverage measurement (BLD-06, issue #156). Nothing gates on this
+  # job -- continue-on-error is set at JOB level, matching the bench job's own
+  # policy, because the repo has never measured what fraction of src/*.c the SQL
+  # suites + TAP suites exercise, so there is no established baseline to set
+  # a floor against. This job exists to start a trend and to make a PR that adds
+  # a wholly untested code path visible without anyone having to notice it by
+  # eye; a coverage FLOOR is a later decision once a few runs establish what
+  # "normal" looks like here.
+  #
+  # Installs the plain PGDG apt PostgreSQL package -- the same method
+  # build-and-test uses above -- rather than the hardening/asan jobs'
+  # from-source cassert build: gcov instrumentation needs neither cassert nor a
+  # source-built server, only the EXTENSION compiled with
+  # -fprofile-arcs -ftest-coverage (which `--coverage` expands to, plus the
+  # link-time gcov runtime), so paying for a from-scratch PostgreSQL build here
+  # would be pure waste with nothing to show for it.
+  #
+  # PG_CFLAGS: -ffp-contract=off is load-bearing (Makefile's own comment -- the
+  # WAND/exhaustive-scorer bit-identity contract) and this job APPENDS
+  # --coverage to it rather than replacing it. Verified against the installed
+  # Makefile.global (via `pg_config --pgxs`), not assumed: it reads
+  # `ifdef PG_CFLAGS / override CFLAGS := $(CFLAGS) $(PG_CFLAGS)` -- PGXS
+  # concatenates whatever PG_CFLAGS carries onto CFLAGS, so both flags survive
+  # in the order given, and PG_LDFLAGS is prepended onto LDFLAGS the same way.
+  #
+  # ONE instrumented `installcheck` run (SQL + TAP, same scope as build-and-test)
+  # produces every .gcda; the suite does not run twice. The cluster is started
+  # BY HAND (initdb + pg_ctl), the same shape the hardening/asan/
+  # folding-collation jobs use above, and deliberately NOT build-and-test's
+  # `pg_virtualenv`: pg_virtualenv creates and runs its cluster as the system
+  # `postgres` user via internal sudo, which could neither write .gcda files
+  # back into this job's own checkout nor leave them readable by the runner
+  # user that has to summarise them afterward. Running the cluster as the same
+  # user that checked out the repo keeps every .gcda both writable at runtime
+  # and readable by the lcov step.
+  coverage:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 40
+    env:
+      PG_MAJOR: "18"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install PostgreSQL, dev headers and lcov
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            postgresql-"$PG_MAJOR" \
+            postgresql-server-dev-"$PG_MAJOR" \
+            libipc-run-perl \
+            lcov
+
+      # Same PG_CFLAGS/PG_LDFLAGS injection route the hardening/asan jobs use
+      # (PGXS's PG_CFLAGS/PG_LDFLAGS hooks), just with `--coverage` instead of a
+      # sanitizer flag. Only the extension is instrumented; PostgreSQL itself is
+      # the stock PGDG binary, which is fine for gcov (unlike ASan, gcov needs no
+      # LD_PRELOAD -- the coverage runtime is pulled in by the linker at build
+      # time via PG_LDFLAGS).
+      - name: Build + install extension with coverage instrumentation
+        run: |
+          make PG_CONFIG="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config" \
+            PG_CFLAGS="-ffp-contract=off --coverage" \
+            PG_LDFLAGS="--coverage"
+          sudo make PG_CONFIG="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config" \
+            PG_LDFLAGS="--coverage" install
+
+      # installcheck runs SQL + TAP once, same as build-and-test. Each backend
+      # process flushes its own .gcda at normal exit (gcov's atexit handler),
+      # and installcheck spawns one backend per connection, so the whole suite's
+      # coverage accumulates into the .gcda files under src/ by the time this
+      # step ends. continue-on-error at step level (redundant with the job's own
+      # continue-on-error, but matching bench's belt-and-braces style) so a
+      # suite failure still lets the lcov/upload steps below run and publish
+      # whatever coverage was captured before the failure.
+      #
+      # C.UTF-8, not C (#309 CI-03): under a C ctype the analyzer never folds a
+      # non-ASCII character, so the folding-only paths (the analyzer's and snippet's
+      # Unicode conversions, the tokenizer's keptlen NOTICE) read 0% here although
+      # the folding-collation job runs them. C.UTF-8 keeps codepoint collation, so
+      # the expected output is the same one that job gates on.
+      - name: Run installcheck under coverage instrumentation (report-only)
+        continue-on-error: true
+        run: |
+          export PATH="/usr/lib/postgresql/$PG_MAJOR/bin:$PATH"
+          export PGDATA="$RUNNER_TEMP/pgdata-coverage" PGPORT=55594
+          initdb -D "$PGDATA" -A trust -E UTF8 --locale=C.UTF-8
+          pg_ctl -D "$PGDATA" -l "$RUNNER_TEMP/pg-coverage.log" \
+            -o "-p $PGPORT -k /tmp -c fsync=off" -w start
+          make PG_CONFIG="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config" installcheck \
+            PGHOST=/tmp PGPORT="$PGPORT" \
+          || { echo "=== regression.diffs ==="; cat regression.diffs 2>/dev/null || true; \
+               echo "=== server log ==="; cat "$RUNNER_TEMP/pg-coverage.log" 2>/dev/null || true; \
+               find tmp_check/log -name "*.log" -exec echo "=== {} ===" \; -exec cat {} \; 2>/dev/null || true; \
+               pg_ctl -D "$PGDATA" stop -m immediate 2>/dev/null || true; exit 1; }
+          pg_ctl -D "$PGDATA" stop -m immediate
+
+      # No coverage FLOOR (per the job header): --ignore-errors tolerates the
+      # handful of lcov warning classes a PGXS-built tree commonly trips (e.g. an
+      # unused .gcno from a TU with no exercised lines) without turning a
+      # report-only job into a broken one over lcov's own strictness rather than
+      # this extension's coverage.
+      - name: Summarize coverage with lcov
+        if: always()
+        run: |
+          lcov --capture --directory src --output-file coverage.info \
+            --ignore-errors inconsistent,negative,unused,empty \
+          || echo "::warning::lcov capture reported errors; see above -- report-only, not gating"
+          lcov --list coverage.info || true
+          genhtml coverage.info --output-directory coverage-html \
+            --ignore-errors inconsistent,negative,unused,empty,source \
+          || echo "::warning::genhtml reported errors; see above -- report-only, not gating"
+          # Canary and summary (#309 CI-03): warns when fewer objects wrote counters
+          # than were compiled with them (an empty or partial report would otherwise
+          # be a green job), and puts the line-coverage figure on the run summary.
+          # Never fails the step; no number here is a floor (ADR 0098).
+          bash ci/coverage_summary.sh src coverage.info
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            coverage.info
+            coverage-html/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Report-only static analysis (BLD-07, issue #156). cppcheck, not clang-tidy:
+  # clang-tidy needs a real compile_commands.json to see each TU's actual
+  # include paths and defines, and PGXS's hand-written Makefile.global does not
+  # emit one (no `bear`/`compiledb` step exists anywhere in this tree); cppcheck
+  # takes -I flags directly and needs no compilation database, which is the
+  # whole reason it is the choice here.
+  #
+  # continue-on-error at JOB level, and nothing downstream depends on this job,
+  # because THE FINDING COUNT IS UNKNOWN. Neither cppcheck nor clang-tidy is
+  # installed on the maintainer's machine or in any agent sandbox that has
+  # touched this repo, so nobody has measured this codebase's noise level under
+  # it -- the first CI run IS the measurement. Gating on an unmeasured tool
+  # would risk blocking every future PR on findings nobody has triaged.
+  # Promoting this job to gating is a later decision, made once a few runs show
+  # whether it is quiet.
+  #
+  # Only installs postgresql-server-dev (for pg_config and the server headers)
+  # -- no runtime PostgreSQL package and no cluster, because cppcheck reads
+  # source text, it does not link or execute anything.
+  static-analysis:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    env:
+      PG_MAJOR: "18"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install cppcheck and PostgreSQL server headers
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            postgresql-server-dev-"$PG_MAJOR" \
+            cppcheck
+
+      # No --error-exitcode: cppcheck's own exit status must never fail this
+      # step, findings or not -- that is what makes this report-only rather than
+      # a gate with a threshold of zero. `|| true` after the invocation is
+      # belt-and-braces on top of that (this step's shell is `bash -e {0}`, ADR
+      # 0070, so a nonzero exit from any earlier command would otherwise abort
+      # the step before the summary below could print).
+      #
+      # -I src plus the server include dir (not a full compile_commands.json --
+      # see the job header) is enough for cppcheck's own analysis, which does
+      # not need to fully preprocess and compile the way clang-tidy would.
+      - name: Run cppcheck over src/*.c (report-only, noise level not yet measured)
+        run: |
+          PG_CONFIG="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config"
+          INCLUDE_SERVER="$("$PG_CONFIG" --includedir-server)"
+          echo "server include dir: $INCLUDE_SERVER"
+          cppcheck \
+            --enable=warning,style,performance,portability \
+            --inline-suppr \
+            --template='{file}:{line}: [{severity}] {id}: {message}' \
+            -I src \
+            -I "$INCLUDE_SERVER" \
+            src/*.c \
+            > cppcheck-report.txt 2>&1 || true
+
+          echo "=== cppcheck findings by severity ==="
+          total=0
+          for sev in error warning style performance portability information; do
+            n=$(grep -c "\[$sev\]" cppcheck-report.txt 2>/dev/null || echo 0)
+            echo "$sev: $n"
+            total=$((total + n))
+          done
+          echo "total findings: $total"
+          echo "=== full report (also uploaded as an artifact) ==="
+          cat cppcheck-report.txt
+
+      - name: Upload cppcheck report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cppcheck-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: cppcheck-report.txt
+          if-no-files-found: warn
+          retention-days: 30

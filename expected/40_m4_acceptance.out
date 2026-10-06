@@ -1,0 +1,295 @@
+-- 40_m4_acceptance.sql — end-to-end M4 acceptance on a realistic multi-field index
+-- (spec format-v4 §10 M4 bars; ROADMAP §M4). One consolidated suite proving the M4
+-- query surface on a single multi-field, keyed, POSITION-BEARING index (positions on
+-- by default) over a small legal-brief-like corpus:
+--   (1) EXACT phrase "product liability" matches ONLY docs with the adjacent bigram,
+--       not docs carrying both words apart or reversed;
+--   (2) proximity: "a b"~3 (unordered W/3) matches within 3 in ANY order; "a b"~>3
+--       (ordered PRE/3) is order-sensitive (a reversed pair matches ~3 but NOT ~>3);
+--   (3) bm25_snippet(body,'<mark>','</mark>',300) returns a bounded, tag-wrapped excerpt
+--       for a body hit and SQL NULL for a no-body-hit row;
+--   (4) key_field: the ranked results / scoring return the user `id` (not ctid), via
+--       bm25_score_key(id) matching bm25_score(ctid) on every ranked row;
+--   (5) a plain BAG-OF-WORDS @@@/&@@ query over this SAME position-bearing index returns
+--       correct RANKED results — positions do not disturb the docid/tf scoring path.
+--
+-- (5) is the "bag-of-words does NOT fault BM25_PAGE_POS" bar. There is no page-access /
+-- page-kind counter SRF in the extension (bm25_debug_seg_positions dumps positions but
+-- counts nothing), so the no-fault property is asserted by CONSTRUCTION + correctness:
+-- the phrase/proximity recheck is the ONLY consumer of the POS chain, and it runs only
+-- when a phrase is parsed onto the scan (pos_cb is non-NULL only then). A bare term /
+-- bag-of-words query parses no phrase, so pos_cb stays NULL and the lockstep POS cursor
+-- (hence pos_root / the BM25_PAGE_POS chain) is never opened. We therefore prove the
+-- bag-of-words path is (a) correct and (b) unchanged by the presence of positions: the
+-- ranked bag-of-words order over the position-bearing index is exactly the score order,
+-- with no phrase machinery on the scan.
+--
+-- PORTABILITY (PG 16/17/18): every discriminating query pairs the @@@ boolean key with
+-- the &@@ order-by on the SAME literal, BOTH anchored on the LEADING indexed column
+-- (title) — the ONLY shape the planner can satisfy via the bm25_native ordered index scan
+-- (where the recheck + the scored scan slot the snippet/score read live). The opclass
+-- anchor is the first index column; @@@/&@@ on a NON-leading column (e.g. body) does not
+-- match the index and falls to a Seq Scan -> no scan slot -> NULL score/snippet and no
+-- recheck (the CI trap; witnessed during authoring). Field/phrase scope lives in the RHS
+-- text, never in the anchor column. No secondary ORDER BY key after &@@ and no CROSS JOIN
+-- (either lets PG16 pick a bitmap scan with no active scan slot). Bodies have DISTINCT
+-- lengths so every candidate's BM25 score is DISTINCT -> deterministic row order with NO
+-- secondary sort key. Where an outer id-ordering is wanted it nests a
+-- `FROM (SELECT ... ORDER BY &@@)` subquery (the 16_pending_ryw idiom). Distinct,
+-- stem-stable tokens so positions are hand-predictable and no ordering depends on the
+-- english_stem catalog OID.
+--
+-- EXCEPTION (bar 6, #132): that convention is also what HID a whole-path bug for the
+-- entire life of the suite. `ORDER BY … &@@` is exactly what routes a query to the
+-- SCORING path — the one that applied the phrase filter — so a bare `@@@` phrase with
+-- no ORDER BY, which takes the non-scoring path, was structurally never exercised and
+-- silently returned the OR-union of the phrase's tokens. Bar 6 therefore deliberately
+-- writes the un-paired shape, and recovers determinism the other way: `array_agg(id
+-- ORDER BY id)` gives a total order with no sort key on the scan, so the assertions are
+-- immune to the row order the scan emits (which the fix also changes, from
+-- TID-ascending to score-descending).
+CREATE EXTENSION bm25_native;
+-- The corpus: (title, body), key_field='id' as an INCLUDE column,
+-- boost_title=5.0 / boost_body=1.0, positions ON by default. `signal` pads the bodies so
+-- the phrase recheck must FILTER (not merely rely on co-occurrence). 'product' +
+-- 'liability' sit at KNOWN positions per doc so adjacency / proximity are hand-predictable;
+-- the three candidate bodies have DISTINCT lengths (2 / 4 / 7 tokens) so their BM25 scores
+-- are DISTINCT -> deterministic ranked order.
+CREATE TABLE briefs (id int PRIMARY KEY, title text, body text)
+    WITH (autovacuum_enabled = off);
+INSERT INTO briefs VALUES
+    (1, 'tort brief',     'product liability'),                                      -- prod@0 liab@1 : ADJACENT (exact)
+    (2, 'tort brief',     'signal product signal liability'),                        -- prod@1 liab@3 : gap 2 (ordered, span 2)
+    (3, 'tort brief',     'signal signal liability signal signal product signal'),   -- liab@2 prod@5 : REVERSED (span 3)
+    (4, 'contract brief', 'signal signal signal signal');                            -- neither term: never a candidate
+CREATE INDEX briefs_bm25 ON briefs USING bm25_native (title, body) INCLUDE (id)
+    WITH (key_field = 'id', boost_title = '5.0', boost_body = '1.0');
+-- Sanity: the field-config page carries the two indexed content fields (title, body);
+-- key_field='id' is the key column, not a scored field. field_count is OID-independent.
+SELECT field_count FROM bm25_stats('briefs_bm25');
+ field_count 
+-------------
+           2
+(1 row)
+
+SET enable_seqscan = off;
+-- ============================================================================
+-- Bar (1) — EXACT phrase "product liability": only the ADJACENT bigram (doc 1),
+-- NOT doc 2 (words apart) or doc 3 (reversed). A bare phrase OR-matches across fields
+-- (D6); only body carries the terms, so it lands in body. @@@/&@@ on the LEADING column
+-- (title) forces the bm25_native ordered index scan; the phrase lives in the RHS literal.
+-- ============================================================================
+SELECT id FROM briefs
+ WHERE title @@@ '"product liability"'
+ ORDER BY title &@@ '"product liability"';
+ id 
+----
+  1
+(1 row)
+
+-- ============================================================================
+-- Bar (2) — proximity: unordered "~3" (W/3) vs ordered "~>3" (PRE/3).
+-- ============================================================================
+-- "product liability"~3 (UNORDERED W/3): doc 1 (span 1), doc 2 (span 2), doc 3
+-- (reversed, span |5-2|=3) all have window span <= (2-1)+3 = 4 -> all three match.
+SELECT id FROM briefs
+ WHERE title @@@ '"product liability"~3'
+ ORDER BY title &@@ '"product liability"~3';
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+-- "product liability"~>3 (ORDERED PRE/3): product must PRECEDE liability. Doc 3
+-- (liability before product) is EXCLUDED; docs 1, 2 (ordered, within slop) kept.
+-- The reversed doc 3's ABSENCE here vs its PRESENCE in the ~3 result is the
+-- order-sensitivity witness AND the ~>-parsed-before-~ precedence witness.
+SELECT id FROM briefs
+ WHERE title @@@ '"product liability"~>3'
+ ORDER BY title &@@ '"product liability"~>3';
+ id 
+----
+  1
+  2
+(2 rows)
+
+-- ============================================================================
+-- Bar (3) — bm25_snippet(body,'<mark>','</mark>',300): a bounded, tag-wrapped
+-- excerpt for a body hit, and SQL NULL for a no-body-hit row.
+-- ============================================================================
+-- 'product' is BOTH the scored term and the snippet term. Docs 1,2,3 carry it in body
+-- (distinct body lengths -> distinct scores -> deterministic order); each excerpt wraps
+-- <mark>product</mark> and its ORIGINAL-text length (tags/ellipses stripped) is <= 300.
+SELECT id,
+       bm25_snippet(body, '<mark>', '</mark>', 300) LIKE '%<mark>product</mark>%' AS body_marked,
+       length(replace(replace(replace(
+              bm25_snippet(body, '<mark>', '</mark>', 300),
+              '<mark>', ''), '</mark>', ''), '…', '')) <= 300 AS within_budget
+  FROM briefs
+ WHERE title @@@ 'product'
+ ORDER BY title &@@ 'product';
+ id | body_marked | within_budget 
+----+-------------+---------------
+  1 | t           | t
+  2 | t           | t
+  3 | t           | t
+(3 rows)
+
+-- A no-body-hit row -> SQL NULL. 'contract' hits only doc 4's TITLE; bm25_snippet(body)
+-- finds no 'contract' in doc 4's body -> NULL (the zero-hit NULL-drop convention).
+SELECT id, bm25_snippet(body, '<mark>', '</mark>', 300) IS NULL AS body_snip_null
+  FROM briefs
+ WHERE title @@@ 'title:contract'
+ ORDER BY title &@@ 'title:contract';
+ id | body_snip_null 
+----+----------------
+  4 | t
+(1 row)
+
+-- ============================================================================
+-- Bar (4) — key_field: results / scoring return the user `id` (not ctid).
+-- bm25_score_key(id) resolves a ranked row by the USER KEY and must equal
+-- bm25_score(ctid) for every ranked row (had the scorer keyed on ctid, by_key would
+-- diverge or find no row). Both need an active &@@ scoring scan. 'liability' hits the
+-- body of docs 1,2,3 with DISTINCT scores (differing body lengths) -> stable order.
+-- ============================================================================
+SELECT id,
+       round(bm25_score(ctid)::numeric, 6)     AS by_ctid,
+       round(bm25_score_key(id)::numeric, 6)   AS by_key
+  FROM briefs
+ WHERE title @@@ 'liability'
+ ORDER BY title &@@ 'liability';
+ id | by_ctid  |  by_key  
+----+----------+----------
+  1 | 0.455278 | 0.455278
+  2 | 0.365470 | 0.365470
+  3 | 0.282022 | 0.282022
+(3 rows)
+
+-- The debug SRF projects the key column directly: bm25_debug_rank_key returns the user
+-- id (key_int4), not a ctid, for the ranked set (distinct scores -> stable order).
+SELECT key_int4, round(score::numeric, 6) AS score
+  FROM bm25_debug_rank_key('briefs_bm25', 'liability')
+ ORDER BY score DESC, key_int4;
+ key_int4 |  score   
+----------+----------
+        1 | 0.455278
+        2 | 0.365470
+        3 | 0.282022
+(3 rows)
+
+-- ============================================================================
+-- Bar (5) — a plain BAG-OF-WORDS query over the SAME position-bearing index returns
+-- correct RANKED results (positions do not perturb the docid/tf path; the POS chain is
+-- never opened for a non-phrase scan -> BM25_PAGE_POS is not faulted). No phrase, no
+-- slop: just a bare term. The ranked id order is the score order, returned by the key.
+-- ============================================================================
+-- 'liability' (bare term, bag-of-words) ranks the three body-liability docs by score.
+-- Identical result set + order to bar (4)'s scored scan proves the bag-of-words path is
+-- correct and unaffected by the presence of positions. Nested so the outer projection is
+-- the ranked (score) order with no secondary &@@ sort key.
+SELECT id FROM (
+    SELECT id FROM briefs
+     WHERE title @@@ 'liability'
+     ORDER BY title &@@ 'liability'
+) ranked;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+-- Recall check: the bag-of-words term matches exactly the docs that contain it (docs
+-- 1,2,3 carry 'liability' in body; doc 4 does not) — a plain unordered @@@ boolean
+-- match, no ORDER BY, no phrase machinery, over the position-bearing index.
+SELECT count(*) FROM briefs WHERE title @@@ 'liability';
+ count 
+-------
+     3
+(1 row)
+
+-- ============================================================================
+-- Bar (6) — #132: a BARE phrase `@@@` with NO `ORDER BY` is filtered, not unioned.
+-- ============================================================================
+-- The non-scoring @@@ load path used to answer any text phrase with the flat OR-union
+-- of its tokens. The OR-union over this corpus is {1,2,3} (doc 4 carries neither term),
+-- so each assertion below is labelled with whether it can tell the two apart:
+--
+--   (6a) exact  "product liability"        -> {1}     vs OR-union {1,2,3}  DISCRIMINATING
+--   (6b) unord. "product liability"~3      -> {1,2,3} vs OR-union {1,2,3}  *** COINCIDES ***
+--   (6c) ord.   "product liability"~>3     -> {1,2}   vs OR-union {1,2,3}  DISCRIMINATING
+--   (6d) scoped body:"product liability"   -> {1}     vs OR-union {1,2,3}  DISCRIMINATING
+--   (6e) bag-of-words 'product'            -> {1,2,3} unchanged by the fix  CONTROL
+--
+-- (6b) is NOT discriminating on its own — its slop is wide enough to admit every
+-- candidate, so it matches the OR-union by coincidence on this corpus. It is kept
+-- because it is the unordered half of the (6b)/(6c) pair: (6c)'s exclusion of the
+-- reversed doc 3 is only meaningful against (6b)'s inclusion of it.
+--
+-- (6d) is a SECOND, INDEPENDENT witness: the flat-OR path DID honor the `body:` field
+-- scope (it threads so->qfield into its collector) while dropping the phrase entirely,
+-- so a scoped bare phrase proved the phrase — not the scope — was the missing filter.
+-- Plan guard. It pins 6a's literal ONLY -- 6b-6e carry different literals with
+-- different selectivity, so this is not a guarantee for the whole bar. Without a
+-- &@@ sort key nothing forces the bm25_native index scan, and a fall to another
+-- plan re-routes @@@ through bm25_match. Since #132 that is no longer silent:
+-- bm25_match REFUSES a phrase, so 6a/6c/6d fail loudly rather than quietly
+-- returning the union. 6b and 6e would still pass (they coincide with the union,
+-- and with a bare term, respectively), which is why they are labelled above and
+-- are not load-bearing. enable_seqscan is already off; this pins the plan so a
+-- regression names its cause.
+EXPLAIN (COSTS OFF)
+SELECT array_agg(id ORDER BY id) FROM briefs WHERE title @@@ '"product liability"';
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Aggregate
+   ->  Sort
+         Sort Key: id
+         ->  Index Scan using briefs_bm25 on briefs
+               Index Cond: (title @@@ '"product liability"'::text)
+(5 rows)
+
+-- (6a) EXACT: only the adjacent bigram (doc 1). Docs 2 (apart) and 3 (reversed) are
+-- candidates for the OR-union and must be filtered out by the positional recheck.
+SELECT array_agg(id ORDER BY id) FROM briefs WHERE title @@@ '"product liability"';
+ array_agg 
+-----------
+ {1}
+(1 row)
+
+-- (6b) UNORDERED ~3: span bound (2-1)+3 = 4 admits docs 1 (span 1), 2 (span 2) and 3
+-- (reversed, span 3). Coincides with the OR-union here — see the note above.
+SELECT array_agg(id ORDER BY id) FROM briefs WHERE title @@@ '"product liability"~3';
+ array_agg 
+-----------
+ {1,2,3}
+(1 row)
+
+-- (6c) ORDERED ~>3: product must PRECEDE liability, so the reversed doc 3 drops out.
+SELECT array_agg(id ORDER BY id) FROM briefs WHERE title @@@ '"product liability"~>3';
+ array_agg 
+-----------
+ {1,2}
+(1 row)
+
+-- (6d) FIELD-SCOPED bare phrase: scoped to body (the only field carrying the terms),
+-- still only the adjacent doc 1.
+SELECT array_agg(id ORDER BY id) FROM briefs WHERE title @@@ 'body:"product liability"';
+ array_agg 
+-----------
+ {1}
+(1 row)
+
+-- (6e) NEGATIVE CONTROL: a bag-of-words bare term parses no phrase, so it keeps taking
+-- the flat OR-union path unchanged — docs 1,2,3 carry 'product', doc 4 does not.
+SELECT array_agg(id ORDER BY id) FROM briefs WHERE title @@@ 'product';
+ array_agg 
+-----------
+ {1,2,3}
+(1 row)
+
+DROP TABLE briefs;
+DROP EXTENSION bm25_native;

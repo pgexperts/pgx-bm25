@@ -1,0 +1,364 @@
+-- 38_phrase.sql — phrase / proximity query surface (M4 C-MATCH, D5/D6/D7/D9).
+--
+-- Grammar (after the M5 field: split, D6). The quoted phrase + optional slop is ONE
+-- string literal (SQL parses a bare ~ as the regex operator, so the tilde lives
+-- INSIDE the string): '"a b"' EXACT (ordered slop 0), '"a b"~n' UNORDERED W/n,
+-- '"a b"~>n' ORDERED PRE/n, 'field:"a b"' field-scoped. The matcher (D5) is a
+-- POST-ACCUMULATION recheck (D4): the OR-sum scorer produces candidate TIDs + BM25F
+-- scores, then a per-(TID,field) positional test DROPS non-matching TIDs (filter-only,
+-- D9 — survivors keep their score). A bare phrase OR-matches across fields (D6);
+-- field:"a b" scopes to one field. A phrase on a position-less segment / off field
+-- degrades (D7): ERROR by default, WARN + AND-of-terms under phrase_fallback='and'.
+--
+-- Every discriminating query is forced onto the bm25_native index by pairing the @@@ boolean
+-- key (Index Cond) with the &@@ order-by on the SAME literal — that makes the planner
+-- run the bm25_native ordered scan (where the recheck lives). Phrase is index-scan-only (the
+-- M5/M4 lesson: a bare @@@ can fall to bm25_match, which has no positions). Distinct,
+-- stem-stable NATO tokens throughout so positions are hand-predictable and there are
+-- no score ties to break CI portability across PG majors.
+
+CREATE EXTENSION bm25_native;
+SET enable_seqscan = off;
+
+-- ============================================================================
+-- Part 1 — EXACT phrase: "a b" matches only ADJACENT (ordered, slop 0)
+-- ============================================================================
+-- 'signal' pads a shared low-idf term so every alpha/bravo doc is a scorer
+-- candidate — proving the recheck FILTERS, not that the terms merely co-occur.
+CREATE TABLE ph (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO ph VALUES
+    (1, 'alpha bravo signal'),          -- alpha@0 bravo@1  : adjacent  -> EXACT match
+    (2, 'alpha signal bravo'),          -- alpha@0 bravo@2  : gap 2     -> no exact, ~1+ ordered
+    (3, 'bravo alpha signal'),          -- bravo@0 alpha@1  : reversed  -> unordered only
+    (4, 'signal signal signal');        -- neither term     -> never a candidate
+CREATE INDEX ph_bm25 ON ph USING bm25_native (body) WITH (language = 'english');
+
+-- EXACT "alpha bravo": only the adjacent doc 1.
+SELECT id FROM ph WHERE body @@@ '"alpha bravo"' ORDER BY body &@@ '"alpha bravo"';
+
+-- ============================================================================
+-- Part 2 — proximity: unordered "~n" vs ordered "~>n" honor slop AND order
+-- ============================================================================
+-- "alpha bravo"~3 (UNORDERED W/3): matches 1,2,3 (all spans <= 1+3).
+SELECT id FROM ph WHERE body @@@ '"alpha bravo"~3' ORDER BY body &@@ '"alpha bravo"~3';
+
+-- "alpha bravo"~>3 (ORDERED PRE/3): the reversed doc 3 is EXCLUDED (alpha must
+-- precede bravo); docs 1,2 included (ordered, within slop).
+SELECT id FROM ph WHERE body @@@ '"alpha bravo"~>3' ORDER BY body &@@ '"alpha bravo"~>3';
+
+-- Precedence (D5): '"alpha bravo"~>3' parses as ORDERED slop 3, NOT unordered ">3".
+-- The reversed doc 3's ABSENCE above (vs its PRESENCE in the ~3 result) is the witness.
+
+-- ============================================================================
+-- Part 2b — 3-term proximity (exercises the min-window matcher, not a naive sweep)
+-- ============================================================================
+-- Three distinct terms whose closest co-occurring window decides the match.
+-- charlie/delta/echo at KNOWN positions; 'signal' pads so all are scorer candidates.
+CREATE TABLE tri (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO tri VALUES
+    (1, 'charlie delta echo signal'),           -- c@0 d@1 e@2 : span 2 (EXACT)
+    (2, 'charlie signal delta signal echo'),    -- c@0 d@2 e@4 : span 4
+    (3, 'echo delta charlie signal'),           -- e@0 d@1 c@2 : reversed, span 2
+    (4, 'charlie signal signal delta echo');    -- c@0 d@3 e@4 : span 4
+CREATE INDEX tri_bm25 ON tri USING bm25_native (body) WITH (language = 'english');
+-- EXACT "charlie delta echo": only doc 1 (consecutive).
+SELECT id FROM tri WHERE body @@@ '"charlie delta echo"' ORDER BY body &@@ '"charlie delta echo"';
+-- "charlie delta echo"~2 (UNORDERED W/2): span bound (3-1)+2 = 4. docs 1 (span 2),
+-- 2 (span 4), 3 (reversed, span 2), 4 (span 4) all qualify.
+SELECT id FROM tri WHERE body @@@ '"charlie delta echo"~2' ORDER BY body &@@ '"charlie delta echo"~2';
+-- "charlie delta echo"~>1 (ORDERED PRE/1): bound (3-1)+1 = 3, strictly increasing.
+-- doc 1 (0<1<2, span 2) matches; doc 3 (reversed) excluded; docs 2,4 (span 4 > 3)
+-- excluded — order AND slop both discriminate.
+SELECT id FROM tri WHERE body @@@ '"charlie delta echo"~>1' ORDER BY body &@@ '"charlie delta echo"~>1';
+
+-- ============================================================================
+-- Part 3 — single-term phrase == plain term
+-- ============================================================================
+-- "alpha" (a one-word phrase) matches every doc containing alpha (docs 1,2,3),
+-- identical to a bare alpha term; doc 4 has no alpha.
+SELECT id FROM ph WHERE body @@@ '"alpha"' ORDER BY body &@@ '"alpha"';
+
+-- ============================================================================
+-- Part 4 — repeated-term phrase "kilo kilo": needs TWO distinct positions
+-- ============================================================================
+CREATE TABLE rep (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO rep VALUES
+    (1, 'kilo kilo signal'),            -- kilo@0 kilo@1 : two ADJACENT -> EXACT match
+    (2, 'kilo signal kilo'),            -- kilo@0 kilo@2 : gap 2        -> no exact
+    (3, 'kilo signal signal');          -- kilo@0 only   : ONE occurrence -> can never match
+CREATE INDEX rep_bm25 ON rep USING bm25_native (body) WITH (language = 'english');
+
+-- EXACT "kilo kilo": only doc 1 (two adjacent occurrences).
+SELECT id FROM rep WHERE body @@@ '"kilo kilo"' ORDER BY body &@@ '"kilo kilo"';
+-- "kilo kilo"~2 (unordered): doc 1 (span 1) and doc 2 (span 2 <= 1+2); doc 3 fails
+-- (a single occurrence cannot supply two DISTINCT positions).
+SELECT id FROM rep WHERE body @@@ '"kilo kilo"~2' ORDER BY body &@@ '"kilo kilo"~2';
+
+-- ============================================================================
+-- Part 5 — cross-field OR (bare phrase) vs field:"..." scope (D6);
+--          same term in two fields
+-- ============================================================================
+CREATE TABLE mf (id int PRIMARY KEY, title text, body text)
+    WITH (autovacuum_enabled = off);
+INSERT INTO mf VALUES
+    (1, 'delta echo padding', 'echo delta scatter'),  -- adjacent in TITLE only
+    (2, 'echo delta padding', 'delta echo scatter'),  -- adjacent in BODY only
+    (3, 'echo delta padding', 'echo delta scatter'),  -- adjacent in NEITHER
+    (4, 'delta padding one',  'delta padding two');    -- 'delta' in both, no 'echo' after
+CREATE INDEX mf_bm25 ON mf USING bm25_native (title, body) WITH (language = 'english');
+
+-- Bare "delta echo": OR across fields — matches iff adjacent in SOME single field.
+-- doc 1 (title), doc 2 (body). doc 3 (reversed both) + doc 4 (no echo): excluded.
+SELECT id FROM mf WHERE title @@@ '"delta echo"' ORDER BY title &@@ '"delta echo"';
+
+-- title:"delta echo" — scoped to TITLE: just doc 1. doc 2's body-adjacency must NOT
+-- leak into a title-scoped phrase. The scope is in the WHERE as well as the ORDER BY:
+-- the scan returns the WHERE set (#290), so the WHERE is what selects the rows.
+SELECT id FROM mf WHERE title @@@ 'title:"delta echo"' ORDER BY title &@@ 'title:"delta echo"';
+
+-- body:"delta echo" — scoped to BODY: just doc 2.
+SELECT id FROM mf WHERE title @@@ 'body:"delta echo"' ORDER BY title &@@ 'body:"delta echo"';
+
+-- The old spelling, scope in the ORDER BY only, is a different query under SQL
+-- semantics (#290): the WHERE set is the unscoped phrase's {1,2}, and the row the
+-- scoped ORDER BY query does not match follows the ranked one at distance Infinity.
+SELECT id, title &@@ 'title:"delta echo"' = 'Infinity' AS unmatched
+  FROM mf WHERE title @@@ '"delta echo"' ORDER BY title &@@ 'title:"delta echo"';
+SELECT id, title &@@ 'body:"delta echo"' = 'Infinity' AS unmatched
+  FROM mf WHERE title @@@ '"delta echo"' ORDER BY title &@@ 'body:"delta echo"';
+
+-- ============================================================================
+-- Part 6 — parse errors: a '~' with a non-numeric / empty tail ERRORs (fail loud)
+-- ============================================================================
+-- Pair the @@@ key with the &@@ order-by (same literal) so the bm25_native index scan runs
+-- and bm25_rescan reaches the phrase parse — a bare ORDER BY would Seq-Scan and never
+-- parse. The error fires in the parse (before any positional work).
+-- non-numeric tail after ~
+SELECT id FROM ph WHERE body @@@ '"alpha bravo"~x' ORDER BY body &@@ '"alpha bravo"~x';
+-- empty tail after ~
+SELECT id FROM ph WHERE body @@@ '"alpha bravo"~' ORDER BY body &@@ '"alpha bravo"~';
+-- empty tail after ~>
+SELECT id FROM ph WHERE body @@@ '"alpha bravo"~>' ORDER BY body &@@ '"alpha bravo"~>';
+-- junk after the closing quote (not a slop suffix)
+SELECT id FROM ph WHERE body @@@ '"alpha bravo"zzz' ORDER BY body &@@ '"alpha bravo"zzz';
+-- unterminated quote
+SELECT id FROM ph WHERE body @@@ '"alpha bravo' ORDER BY body &@@ '"alpha bravo';
+
+-- ============================================================================
+-- Part 7 — read-your-writes: an INSERTed-but-unsealed doc is phrase-matched (D4)
+-- ============================================================================
+-- Insert AFTER the build so the rows live in the PENDING list (unsealed). Their true
+-- posblob positions must feed the phrase recheck (the 16_pending_ryw invariant).
+INSERT INTO ph VALUES (5, 'alpha bravo pending');   -- alpha@0 bravo@1 : adjacent
+INSERT INTO ph VALUES (6, 'bravo alpha pending');   -- reversed : no exact
+-- EXACT "alpha bravo" now includes the unsealed adjacent doc 5, still excludes doc 6.
+SELECT id FROM ph WHERE body @@@ '"alpha bravo"' ORDER BY body &@@ '"alpha bravo"';
+
+-- ============================================================================
+-- Part 8 — degradation (D7): a store_positions=false field ERRORs; an index-wide
+--          off index + phrase_fallback='and' WARNs and falls back to AND-of-terms
+-- ============================================================================
+-- (8a) A per-field off column: a phrase scoped to it errors; the on field still works.
+CREATE TABLE offf (id int PRIMARY KEY, title text, body text)
+    WITH (autovacuum_enabled = off);
+INSERT INTO offf VALUES (1, 'foxtrot golf here', 'foxtrot golf there');
+CREATE INDEX offf_bm25 ON offf USING bm25_native (title, body)
+    WITH (language = 'english', store_positions_title = false);
+-- title positions OFF: a title-scoped phrase must ERROR (D7 default). The @@@ key
+-- forces the bm25_native index scan so the degradation check in the scorer runs.
+SELECT id FROM offf WHERE title @@@ 'title:"foxtrot golf"' ORDER BY title &@@ 'title:"foxtrot golf"';
+-- body still has positions: a body-scoped phrase works (adjacent -> doc 1). The WHERE
+-- carries the scope too: an unscoped WHERE phrase also searches the off title field
+-- and errors exactly as the title-scoped phrase above does (#290 evaluates the WHERE).
+SELECT id FROM offf WHERE title @@@ 'body:"foxtrot golf"' ORDER BY title &@@ 'body:"foxtrot golf"';
+SELECT id FROM offf WHERE title @@@ '"foxtrot golf"' ORDER BY title &@@ 'body:"foxtrot golf"';
+
+-- (8b) An index-wide position-less index + phrase_fallback='and': WARNING + AND-of-
+-- terms. docs 1,2 (both terms) match regardless of adjacency; doc 3 (missing india)
+-- excluded. No positional test is applied.
+CREATE TABLE noposn (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO noposn VALUES
+    (1, 'hotel india signal'),          -- both terms, adjacent
+    (2, 'india signal hotel'),          -- both terms, NOT adjacent
+    (3, 'hotel signal signal');         -- only hotel: fails AND-of-terms
+CREATE INDEX noposn_bm25 ON noposn USING bm25_native (body)
+    WITH (language = 'english', store_positions = false, phrase_fallback = 'and');
+SELECT id FROM noposn WHERE body @@@ '"hotel india"' ORDER BY body &@@ '"hotel india"';
+
+-- (8c) The default 'error' path on a position-less index: ERROR, no fallback.
+CREATE TABLE noposn2 (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO noposn2 VALUES (1, 'juliet lima signal');
+CREATE INDEX noposn2_bm25 ON noposn2 USING bm25_native (body)
+    WITH (language = 'english', store_positions = false);
+SELECT id FROM noposn2 WHERE body @@@ '"juliet lima"' ORDER BY body &@@ '"juliet lima"';
+
+-- (8d) reloption validation: an invalid phrase_fallback value is rejected at DDL.
+CREATE TABLE badopt (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+CREATE INDEX badopt_bm25 ON badopt USING bm25_native (body)
+    WITH (language = 'english', phrase_fallback = 'maybe');
+
+-- ============================================================================
+-- Part 9 — BARE (unscoped) phrase on a MIXED index (D6 + D12 + D7): the off field
+--          would silently drop docs whose phrase holds only there, so a bare phrase
+--          on a mixed index degrades exactly like a field-scoped one. An ALL-ON index
+--          is unaffected (regression). Distinct NATO tokens (mike/november/...).
+-- ============================================================================
+-- (9a) Mixed index, bare phrase -> ERROR (default 'error'). title positions OFF, body
+-- ON. The phrase is adjacent in TITLE for doc 1 and in BODY for doc 2. A bare phrase
+-- OR-matches across fields, but the title (off) field stashes no positions, so the
+-- recheck would silently return ONLY the body doc. The degradation gate must ERROR
+-- instead. (Pre-fix: this returned doc 2 with no error — the silent false negative.)
+CREATE TABLE mix (id int PRIMARY KEY, title text, body text)
+    WITH (autovacuum_enabled = off);
+INSERT INTO mix VALUES
+    (1, 'mike november here', 'scatter padding one'),   -- adjacent in TITLE (off field)
+    (2, 'padding scatter two', 'mike november there');   -- adjacent in BODY (on field)
+CREATE INDEX mix_bm25 ON mix USING bm25_native (title, body)
+    WITH (language = 'english', store_positions_title = false);
+-- Bare "mike november": ANY field is positions-off -> ERROR (never a silent drop of doc 1).
+-- @@@/&@@ on the LEADING indexed column (title) so the bm25_native index scan runs (Part 5 idiom).
+SELECT id FROM mix WHERE title @@@ '"mike november"' ORDER BY title &@@ '"mike november"';
+
+-- (9b) Same mixed index with phrase_fallback='and': WARNING + AND-of-terms. Both docs
+-- contain mike AND november (regardless of field/adjacency) -> both returned.
+CREATE TABLE mixand (id int PRIMARY KEY, title text, body text)
+    WITH (autovacuum_enabled = off);
+INSERT INTO mixand VALUES
+    (1, 'oscar papa here', 'scatter padding one'),      -- both terms in TITLE (off)
+    (2, 'padding scatter two', 'oscar papa there'),      -- both terms in BODY (on)
+    (3, 'oscar padding three', 'scatter padding four');  -- only oscar: fails AND-of-terms
+CREATE INDEX mixand_bm25 ON mixand USING bm25_native (title, body)
+    WITH (language = 'english', store_positions_title = false, phrase_fallback = 'and');
+SELECT id FROM mixand WHERE title @@@ '"oscar papa"' ORDER BY title &@@ '"oscar papa"';
+
+-- (9c) Regression: an ALL-ON index bare phrase still OR-matches across fields (D6),
+-- unaffected by the new mixed-index gate (no off field -> no degrade). Adjacent in
+-- title (doc 1) OR body (doc 2); reversed-both doc 3 excluded.
+CREATE TABLE allon (id int PRIMARY KEY, title text, body text)
+    WITH (autovacuum_enabled = off);
+INSERT INTO allon VALUES
+    (1, 'quebec romeo here', 'scatter padding one'),    -- adjacent in TITLE
+    (2, 'padding scatter two', 'quebec romeo there'),    -- adjacent in BODY
+    (3, 'romeo quebec here', 'romeo quebec there');      -- reversed in BOTH -> excluded
+CREATE INDEX allon_bm25 ON allon USING bm25_native (title, body)
+    WITH (language = 'english');
+SELECT id FROM allon WHERE title @@@ '"quebec romeo"' ORDER BY title &@@ '"quebec romeo"';
+
+-- ============================================================================
+-- Part 10 — #132: the BARE `@@@` phrase (no ORDER BY) takes the non-scoring load
+--           path, which used to return the OR-union of the phrase's tokens.
+-- ============================================================================
+-- Every phrase assertion above pairs @@@ with `ORDER BY … &@@`, which is what routes
+-- the query to the SCORING path — the path that always applied the recheck. A bare @@@
+-- goes through bm25_load_if_needed instead, and that is the shape this suite never had.
+-- It now delegates a phrase to the same exhaustive scorer, so the two paths agree.
+-- `array_agg(id ORDER BY id)` keeps the assertions deterministic without a &@@ sort key
+-- (the delegation also changes the emitted row order to score-descending).
+-- The two shapes 40_m4_acceptance cannot reach — unsealed pending docs, and a
+-- positions-less index — are the two below.
+
+-- (10a) READ-YOUR-WRITES on UNCOMMITTED pending docs. Docs 5/6 are already unsealed
+-- (Part 7); add a reversed and an adjacent pair inside an open transaction, so the
+-- rows are visible only to this backend and live nowhere but the pending list. The
+-- bare phrase must include the adjacent ones (1, 5, 8) and exclude the reversed ones
+-- (6, 7) — the OR-union would have returned 1,2,3,5,6,7,8. This is the pending phrase
+-- stash + pending-wins dedup being carried by the delegation, not re-implemented.
+-- Plan guard, as in 40_m4_acceptance bar 6: these fixtures all declare
+-- `id int PRIMARY KEY`, so a competing btree exists and
+-- `Index Scan using <t>_pkey ... Filter: (body @@@ ...)` is reachable even with
+-- enable_seqscan = off. Since #132 a fall is self-announcing (bm25_match refuses
+-- a phrase), but pin the plan so the failure names its cause, not just a symptom.
+EXPLAIN (COSTS OFF)
+SELECT array_agg(id ORDER BY id) FROM ph WHERE body @@@ '"alpha bravo"';
+
+BEGIN;
+INSERT INTO ph VALUES (7, 'bravo alpha uncommitted');   -- reversed : must NOT match
+INSERT INTO ph VALUES (8, 'alpha bravo uncommitted');   -- adjacent : MUST match
+SELECT array_agg(id ORDER BY id) FROM ph WHERE body @@@ '"alpha bravo"';
+COMMIT;
+
+-- (10b) POSITION-LESS index, default phrase_fallback='error' (noposn2, store_positions
+-- =false): a bare @@@ phrase now raises the SAME error the &@@ form raised at Part 8c.
+-- BEHAVIOUR CHANGE, and the intended one: before the fix this query silently returned
+-- the OR-union (doc 1) off an index that cannot answer a phrase at all.
+SELECT array_agg(id ORDER BY id) FROM noposn2 WHERE body @@@ '"juliet lima"';
+
+-- (10c) POSITION-LESS index with phrase_fallback='and' (noposn): the same WARNING and
+-- the same AND-of-terms set the &@@ form produces at Part 8b — docs 1,2 (both terms,
+-- adjacency irrelevant), doc 3 excluded (no 'india'). The fallback policy reaches this
+-- path because it is the same code, not a second copy of it.
+SELECT array_agg(id ORDER BY id) FROM noposn WHERE body @@@ '"hotel india"';
+
+-- (10d) THE TEXT/JSONB DIVERGENCE, pinned in both directions (#62 M5).
+--
+-- phrase_fallback is honoured on the TEXT query surface and NOT in a jsonb query
+-- tree. That asymmetry is deliberate and is a CAPABILITY limit, not a policy choice:
+-- the AND-of-terms fallback rides PhraseAndEnt's single uint64 mask, whose two uses
+-- are mutually exclusive (a bit is a phrase TERM in fallback mode, a LEAF in boolean
+-- mode), so degrading one leaf of a boolean tree needs a second presence structure.
+-- See the comment at the jsonb gate in bm25_scan_rank.c.
+--
+-- It is pinned here because NOTHING pinned it before: sql/38 contained no
+-- bm25_phrase() call at all, and sql/46_m6_boolean's positions-free index uses the
+-- default phrase_fallback, so a change making jsonb honour the reloption -- or making
+-- text STOP honouring it -- would have broken no test. Both halves are asserted, so
+-- the pair fails if either surface moves.
+--
+-- The same index and the same phrase as (10c), which degrades there:
+SELECT array_agg(id ORDER BY id) FROM noposn
+ WHERE body @@@ bm25_phrase('body', 'hotel india', 0, false);
+
+-- ...and the hint that names the reloption. An operator who set phrase_fallback='and'
+-- has been told this index degrades rather than fails; without the hint the bare error
+-- reads as the setting being ignored or broken. It is emitted ONLY when the reloption
+-- is actually set, so the default-index error below stays clean.
+SELECT array_agg(id ORDER BY id) FROM noposn
+ WHERE body @@@ bm25_phrase('body', 'hotel india', 2, false);
+
+-- The same jsonb query on the DEFAULT-fallback index errors with no hint: there is no
+-- setting to explain, and a hint about a reloption the user never set is noise.
+SELECT array_agg(id ORDER BY id) FROM noposn2
+ WHERE body @@@ bm25_phrase('body', 'juliet lima', 0, false);
+
+-- ============================================================================
+-- Part 11 -- the phrase predicate must classify identically on both paths.
+-- ============================================================================
+-- #132 is only closed if the scan's micro-parser and bm25_match agree about what
+-- counts as a phrase. They share one predicate for that reason, but "shared" was
+-- not sufficient: the two callers see the RHS at different STAGES. bm25_match gets
+-- the raw value; the scan's parser gets a remainder from which the scope prefix has
+-- already been stripped. An adversarial review found two divergences that shape
+-- caused, and these pin both.
+--
+-- bm25_match is exercised DIRECTLY here (a bare `text @@@ text`, no index), which is
+-- precisely the off-index path where a misclassification returns the silent
+-- OR-union instead of erroring. A phrase must ERROR; a bare term must not.
+\set VERBOSITY terse
+
+-- Baseline: unscoped and scoped phrases are refused off-index.
+SELECT 'alpha bravo charlie' @@@ '"alpha bravo"' AS unscoped_phrase_refused;
+SELECT 'alpha bravo charlie' @@@ 'body:"alpha bravo"' AS scoped_phrase_refused;
+
+-- THE DIVERGENCE (finding 1): a space after the scope separator. The scan strips
+-- `body:` and its parser then skips the space and sees a phrase; bm25_match used to
+-- stop at the space, call it a bare term, and silently union the tokens -- #132's
+-- own failure mode on a shape the index path filters positionally.
+SELECT 'alpha bravo charlie' @@@ 'body: "alpha bravo"' AS spaced_scoped_phrase_refused;
+
+-- A bare term must still evaluate normally rather than erroring. A SCOPED bare term
+-- is refused off-index since #298 -- with the field-scope error, not the phrase one,
+-- so it is still not misclassified as a phrase (sql/123 covers the scope refusal).
+SELECT 'alpha bravo charlie' @@@ 'alpha' AS bare_term_ok;
+SELECT 'alpha bravo charlie' @@@ 'body:alpha' AS scoped_bare_term_refused;
+
+-- Finding 2: the scope skip must happen ONCE, not once per caller. The scan already
+-- stripped `body:`, so its parser must NOT strip `x:` as a second prefix --
+-- `body:x:"alpha bravo"` is a bare term there, as it was before the predicate was
+-- shared. Off-index, bm25_match skips only the one prefix it is given the raw RHS
+-- for, so `x:"alpha bravo"` is not a phrase to it either: it raises the #298
+-- field-scope error, not the phrase error.
+SELECT 'alpha bravo charlie' @@@ 'body:x:"alpha bravo"' AS double_scope_is_not_a_phrase;
+\set VERBOSITY default
+
+DROP TABLE ph, tri, rep, mf, offf, noposn, noposn2, badopt, mix, mixand, allon;
+DROP EXTENSION bm25_native;

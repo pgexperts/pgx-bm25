@@ -1,0 +1,332 @@
+-- 129_where_orderby_sql_semantics -- an index scan with a WHERE @@@ key and an
+-- ORDER BY &@@ key returns the SQL answer (#290).
+--
+-- The result of `WHERE body @@@ w ORDER BY body &@@ o` is the rows matching w --
+-- an ORDER BY never removes a row -- ordered by the &@@ distance of o, with the
+-- w rows that o does not match last at distance Infinity, the value &@@ gives
+-- every row off the index. It used to be o's rows: the ORDER BY key was the scan's
+-- whole query and the WHERE key was never read, so the result could be disjoint
+-- from the true one, and a seqscan plan of the same query returned another set.
+--
+-- Several WHERE keys are intersected. A WHERE key byte-identical to the ORDER BY
+-- key is the common case and keeps its old plan (WAND included); any other forces
+-- the exhaustive scorer, under one snapshot for every set.
+--
+-- Ranked sequences use a single ORDER BY key (no tiebreak). Assertions avoid pinned
+-- floats: an unmatched row is shown as `d = 'Infinity'`.
+CREATE EXTENSION bm25_native;
+
+SET enable_seqscan = off;
+
+-- EXPLAIN lines for a query, for the plan guards below.
+CREATE FUNCTION wo_plan(q text) RETURNS SETOF text LANGUAGE plpgsql AS
+$$ BEGIN RETURN QUERY EXECUTE 'EXPLAIN (COSTS OFF) ' || q; END $$;
+
+CREATE TABLE d (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO d VALUES
+  (1, 'the cat sat'),
+  (2, 'the dog ran'),
+  (3, 'cat and dog'),
+  (4, 'bird flew'),
+  (5, 'cat dog dog'),
+  (6, 'a cat in the hat'),
+  (7, 'dog days');
+CREATE INDEX d_bm ON d USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id', language = 'english');
+SELECT bm25_seal('d_bm') IS NOT NULL AS sealed;
+-- One more row after the seal, so the WHERE set spans a segment and the pending list.
+INSERT INTO d VALUES (8, 'cat sat on the dog mat');
+
+-- ===========================================================================
+-- Part 1: the issue's repro. WHERE 'cat' ORDER BY 'dog'.
+-- ===========================================================================
+-- Plan guard: one bm25 index scan carrying both keys, so the answers below come
+-- from the scan and not from a Filter.
+SELECT count(*) FILTER (WHERE l ~ 'Index Scan using d_bm') AS bm25_index_scan,
+       count(*) FILTER (WHERE l ~ 'Index Cond: \(body @@@') AS where_key,
+       count(*) FILTER (WHERE l ~ 'Order By: \(body &@@') AS orderby_key,
+       count(*) FILTER (WHERE l ~ 'Filter') AS filters
+FROM wo_plan($q$ SELECT id FROM d WHERE body @@@ 'cat' ORDER BY body &@@ 'dog' $q$) l;
+
+-- The 'cat' rows {1,3,5,6,8}: the 'dog' matches ranked first (5: two dogs in a short
+-- doc; 3; 8: a longer doc), then 1 and 6 at Infinity. Row 2 and 7 ('dog' but no
+-- 'cat') are not returned. Before the fix: {2,3,5,7,8}.
+SELECT id, body &@@ 'dog' = 'Infinity' AS unmatched
+  FROM d WHERE body @@@ 'cat' ORDER BY body &@@ 'dog';
+
+-- With LIMIT: inside the ranked prefix, and reaching into the Infinity rows.
+SELECT id FROM d WHERE body @@@ 'cat' ORDER BY body &@@ 'dog' LIMIT 2;
+SELECT id FROM d WHERE body @@@ 'cat' ORDER BY body &@@ 'dog' LIMIT 4;
+
+-- A WHERE that matches nothing returns nothing, whatever the ORDER BY matches.
+SELECT id FROM d WHERE body @@@ 'zzz' ORDER BY body &@@ 'dog';
+
+-- Ground truth for the row set: the same query on a seqscan (bm25_match, default
+-- english analyzer -- the index's own here).
+SELECT array_agg(id ORDER BY id) AS index_set
+  FROM (SELECT id FROM d WHERE body @@@ 'cat' ORDER BY body &@@ 'dog') s;
+SET enable_indexscan = off;
+SET enable_seqscan = on;
+SELECT array_agg(id ORDER BY id) AS seqscan_set
+  FROM (SELECT id FROM d WHERE body @@@ 'cat' ORDER BY body &@@ 'dog') s;
+RESET enable_indexscan;
+SET enable_seqscan = off;
+
+-- The identical-RHS form is unchanged: the WHERE set IS the ranked set.
+SELECT id, body &@@ 'dog' = 'Infinity' AS unmatched
+  FROM d WHERE body @@@ 'dog' ORDER BY body &@@ 'dog';
+
+-- ===========================================================================
+-- Part 2: the score accessors. A ranked row has its score; an Infinity row has
+-- none, because the ORDER BY query did not score it.
+-- ===========================================================================
+SELECT id,
+       body &@@ 'dog' = 'Infinity' AS unmatched,
+       bm25_score(ctid) IS NULL AS score_null,
+       bm25_score(ctid, 'dog') IS NULL AS score_q_null,
+       bm25_score_key(id) IS NULL AS key_null,
+       bm25_score(ctid) = -(body &@@ 'dog') AS score_is_distance
+  FROM d WHERE body @@@ 'cat' ORDER BY body &@@ 'dog';
+
+-- ===========================================================================
+-- Part 3: other WHERE shapes against a different ORDER BY.
+-- ===========================================================================
+-- A boolean filter, cat but not dog -> {1,6}, ranked by 'sat' (only 1 has it).
+SELECT id, body &@@ 'sat' = 'Infinity' AS unmatched
+  FROM d
+ WHERE body @@@ bm25_boolean(must => ARRAY[bm25_match_terms('body', 'cat')],
+                             must_not => ARRAY[bm25_match_terms('body', 'dog')])
+ ORDER BY body &@@ 'sat';
+
+-- The issue's boolean shape: the must_not row (3, has 'dog') stays out.
+SELECT array_agg(id ORDER BY id) AS ids
+  FROM (SELECT id FROM d
+         WHERE body @@@ bm25_boolean(must => ARRAY[bm25_match_terms('body', 'cat')],
+                                     must_not => ARRAY[bm25_match_terms('body', 'dog')])
+         ORDER BY body &@@ 'cat') s;
+
+-- A phrase filter with a bag-of-words ranking: only the adjacent "cat sat" rows
+-- (1, 8), though 'cat sat' as words matches five.
+SELECT array_agg(id ORDER BY id) AS ids
+  FROM (SELECT id FROM d WHERE body @@@ '"cat sat"' ORDER BY body &@@ 'cat sat') s;
+
+-- A jsonb WHERE with a text ORDER BY.
+SELECT id, body &@@ 'dog' = 'Infinity' AS unmatched
+  FROM d WHERE body @@@ bm25_match_terms('body', 'sat') ORDER BY body &@@ 'dog';
+
+-- ===========================================================================
+-- Part 4: several WHERE keys, with and without an ORDER BY.
+-- ===========================================================================
+-- cat AND dog -> {3,5,8}, ranked by 'mat' (only 8 has it), the rest at Infinity.
+SELECT id, body &@@ 'mat' = 'Infinity' AS unmatched
+  FROM d WHERE body @@@ 'cat' AND body @@@ 'dog' ORDER BY body &@@ 'mat';
+
+-- One WHERE key identical to the ORDER BY key, one not. The identical key gets no
+-- set of its own, but its condition still applies: the result is dog AND sat = {8},
+-- and since every row then matches the ORDER BY query there is no Infinity tail.
+SELECT id, body &@@ 'dog' = 'Infinity' AS unmatched
+  FROM d WHERE body @@@ 'dog' AND body @@@ 'sat' ORDER BY body &@@ 'dog';
+
+-- The same with a wider second key: dog AND cat = {3,5,8}, all ranked. Rows 1 and 6
+-- (cat, no dog) must not appear, in either key order.
+SELECT id, body &@@ 'dog' = 'Infinity' AS unmatched
+  FROM d WHERE body @@@ 'dog' AND body @@@ 'cat' ORDER BY body &@@ 'dog';
+SELECT id, body &@@ 'dog' = 'Infinity' AS unmatched
+  FROM d WHERE body @@@ 'cat' AND body @@@ 'dog' ORDER BY body &@@ 'dog';
+-- Ground truth for that row set on a seqscan.
+SET enable_indexscan = off;
+SET enable_seqscan = on;
+SELECT array_agg(id ORDER BY id) AS seqscan_set
+  FROM d WHERE body @@@ 'dog' AND body @@@ 'cat';
+RESET enable_indexscan;
+SET enable_seqscan = off;
+
+-- No ORDER BY: the plain intersection (was: ERROR, only one bm25 qualifier).
+SELECT id FROM d WHERE body @@@ 'cat' AND body @@@ 'dog' ORDER BY id;
+SELECT id FROM d WHERE body @@@ 'cat' AND body @@@ '"cat sat"' ORDER BY id;
+
+-- Two ORDER BY keys stay an ERROR: two rankings have no combined order. The
+-- message no longer recommends a function-form workaround.
+SELECT id FROM d WHERE body @@@ 'cat' ORDER BY body &@@ 'dog', body &@@ 'cat';
+
+-- ===========================================================================
+-- Part 5: an invalid WHERE RHS raises even beside a valid ORDER BY key (it used to
+-- be accepted unread).
+-- ===========================================================================
+SELECT id FROM d WHERE body @@@ 'nosuch:cat' ORDER BY body &@@ 'dog';
+SELECT id FROM d WHERE body @@@ '"cat sat' ORDER BY body &@@ 'dog';
+SELECT id FROM d
+ WHERE body @@@ bm25_boolean(must => ARRAY[bm25_match_terms('body', 'cat')],
+                             must_not => ARRAY[bm25_phrase('body', 'cat sat')])
+ ORDER BY body &@@ 'dog';
+-- ...and beside another WHERE key.
+SELECT id FROM d WHERE body @@@ 'cat' AND body @@@ 'nosuch:cat';
+
+-- ===========================================================================
+-- Part 6: NULL WHERE keys. Any NULL @@@ key means no row (bm25_match is STRICT
+-- and the WHERE is the AND of the keys). Runtime keys need a generic plan.
+-- ===========================================================================
+SET plan_cache_mode = force_generic_plan;
+PREPARE wn(text) AS SELECT id FROM d WHERE body @@@ $1 ORDER BY body &@@ 'dog';
+EXECUTE wn('cat');
+EXECUTE wn(NULL);
+PREPARE wn2(text) AS SELECT id FROM d WHERE body @@@ 'cat' AND body @@@ $1 ORDER BY id;
+EXECUTE wn2('dog');
+EXECUTE wn2(NULL);
+DEALLOCATE wn;
+DEALLOCATE wn2;
+RESET plan_cache_mode;
+
+-- A rescan with a different WHERE per outer row re-parses and re-applies it.
+SELECT o.q,
+       (SELECT array_agg(id) FROM (SELECT id FROM d WHERE body @@@ o.q
+                                   ORDER BY body &@@ 'dog') s) AS ids
+  FROM (VALUES ('cat'), ('bird'), ('dog')) o(q);
+
+-- ===========================================================================
+-- Part 6b: live-docs. Row 6 ('cat') lives in the sealed segment. Delete and vacuum
+-- it, then insert a row that reuses its line pointer: the segment's 'cat' posting
+-- for that TID is tombstoned, so the new row (no 'cat') must not join the WHERE set,
+-- and the unmatched tail must not pick it up either.
+-- ===========================================================================
+SELECT ctid AS row6_tid FROM d WHERE id = 6 \gset
+DELETE FROM d WHERE id = 6;
+-- VACUUM hands bulkdelete only REMOVABLE tuples. Another backend in this database
+-- holding an older snapshot (in installcheck, an autovacuum worker's ANALYZE) leaves
+-- the rows deleted above "recently dead": bulkdelete never sees them and nothing is
+-- tombstoned. Each VACUUM that depends on reclaiming them waits for no other backend
+-- here to hold an xmin first; sql/17_delete documents the mechanism and why the wait
+-- is sufficient, not just a narrower race.
+CREATE FUNCTION pg_temp.wait_for_xmin_horizon() RETURNS void AS $$
+DECLARE
+  deadline timestamptz := clock_timestamp() + interval '30 seconds';
+BEGIN
+  LOOP
+    PERFORM pg_stat_clear_snapshot();   -- else pg_stat_activity is cached per xact
+    EXIT WHEN NOT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND backend_xmin IS NOT NULL);
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION
+        'xmin horizon still held by another backend after 30s; VACUUM cannot reclaim';
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+SELECT pg_temp.wait_for_xmin_horizon();
+VACUUM d;
+INSERT INTO d VALUES (9, 'bird song');
+SELECT ctid = :'row6_tid'::tid AS line_pointer_reused FROM d WHERE id = 9;
+SELECT id, body &@@ 'dog' = 'Infinity' AS unmatched
+  FROM d WHERE body @@@ 'cat' ORDER BY body &@@ 'dog';
+SELECT id FROM d WHERE body @@@ 'cat' AND body @@@ 'bird' ORDER BY id;
+
+-- ===========================================================================
+-- Part 7: a filtered set larger than wand_top_k. The filtered build never takes
+-- WAND, so every qualifying row comes back, in the ORDER BY rank order.
+-- Oracle: the unfiltered exhaustive 'dog' ranking, restricted to the 'cat' rows,
+-- then the 'cat' rows without 'dog' in TID order.
+-- ===========================================================================
+CREATE TABLE w (id int PRIMARY KEY, body text);
+INSERT INTO w SELECT g, CASE WHEN g % 2 = 0 THEN 'cat ' ELSE 'bird ' END
+                        || repeat('dog ', g % 5) || 'x' || g
+  FROM generate_series(1, 60) g;
+CREATE INDEX w_bm ON w USING bm25_native (body) WITH (language = 'english');
+SELECT bm25_seal('w_bm') IS NOT NULL AS sealed;
+
+SET bm25_native.wand_top_k = 0;
+CREATE TABLE w_rank AS
+  SELECT id, row_number() OVER () AS rn
+    FROM (SELECT id FROM w WHERE body @@@ 'dog' ORDER BY body &@@ 'dog') s;
+CREATE TABLE w_oracle AS
+  SELECT id, row_number() OVER (ORDER BY grp, k) AS rn
+    FROM (SELECT r.id, 0 AS grp, r.rn AS k FROM w_rank r JOIN w USING (id)
+           WHERE w.id % 2 = 0
+          UNION ALL
+          SELECT w.id, 1, w.id FROM w
+           WHERE w.id % 2 = 0 AND w.id NOT IN (SELECT id FROM w_rank)) u;
+RESET bm25_native.wand_top_k;
+
+SET bm25_native.wand_top_k = 2;
+CREATE TABLE w_out AS
+  SELECT id, row_number() OVER () AS rn
+    FROM (SELECT id FROM w WHERE body @@@ 'cat' ORDER BY body &@@ 'dog') s;
+SELECT (SELECT count(*) FROM w_out) AS out_rows,
+       (SELECT count(*) FROM w_oracle) AS oracle_rows,
+       (SELECT count(*) FROM w_out o JOIN w_oracle r USING (id)
+         WHERE o.rn <> r.rn) AS order_mismatches;
+SELECT array_agg(id) = (SELECT array_agg(id ORDER BY rn) FROM w_oracle WHERE rn <= 7)
+         AS limit7_is_oracle_prefix
+  FROM (SELECT id FROM w WHERE body @@@ 'cat' ORDER BY body &@@ 'dog' LIMIT 7) s;
+RESET bm25_native.wand_top_k;
+DROP TABLE w_out, w_oracle, w_rank, w;
+
+-- ===========================================================================
+-- Part 8: a partitioned parent (Merge Append, #252). Each child's unmatched rows
+-- carry distance Infinity, so the merge keeps every ranked row ahead of them.
+-- ===========================================================================
+SET enable_sort = off;
+CREATE TABLE pp (id int, body text) PARTITION BY RANGE (id);
+CREATE TABLE pp1 PARTITION OF pp FOR VALUES FROM (1) TO (13);
+CREATE TABLE pp2 PARTITION OF pp FOR VALUES FROM (13) TO (25);
+-- The 'pad' run makes every document length distinct, so no two rows tie and
+-- "the top 5" below is well defined.
+INSERT INTO pp SELECT g, CASE WHEN g % 3 <> 0 THEN 'cat ' ELSE '' END
+                         || repeat('dog ', g % 4) || 'x' || g || ' ' || repeat('pad ', g)
+  FROM generate_series(1, 24) g;
+CREATE INDEX pp_i ON pp USING bm25_native (body) WITH (language = 'english');
+SELECT bm25_seal('pp1_body_idx') IS NOT NULL AS sealed_1,
+       bm25_seal('pp2_body_idx') IS NOT NULL AS sealed_2;
+ANALYZE pp;
+
+SELECT bool_or(l ~ 'Merge Append') AS merge_append,
+       count(*) FILTER (WHERE l ~ 'Index Scan using pp[12]_body_idx') AS child_index_scans
+FROM wo_plan($q$ SELECT id FROM pp WHERE body @@@ 'cat' ORDER BY body &@@ 'dog' $q$) l;
+
+-- Baseline distances: each child ranked by 'dog' on its own (no sibling).
+CREATE TABLE pp_base AS
+  SELECT id, body &@@ 'dog' AS d FROM pp1 WHERE body @@@ 'dog' ORDER BY body &@@ 'dog';
+INSERT INTO pp_base
+  SELECT id, body &@@ 'dog' AS d FROM pp2 WHERE body @@@ 'dog' ORDER BY body &@@ 'dog';
+
+SELECT count(DISTINCT d) = count(*) AS base_no_ties FROM pp_base;
+
+CREATE TABLE pp_out AS
+  SELECT id, d, row_number() OVER () AS rn
+    FROM (SELECT id, body &@@ 'dog' AS d FROM pp WHERE body @@@ 'cat'
+          ORDER BY body &@@ 'dog') s;
+
+-- The row set is the 'cat' rows; every ranked row's distance is its own child's
+-- baseline; the rest are exactly the 'cat' rows without 'dog'.
+SELECT count(*) AS out_rows,
+       count(*) = (SELECT count(*) FROM pp WHERE id % 3 <> 0) AS set_size_right,
+       bool_and(id % 3 <> 0) AS all_cat,
+       count(*) FILTER (WHERE o.d = 'Infinity') AS unmatched,
+       count(*) FILTER (WHERE o.d = 'Infinity')
+         = (SELECT count(*) FROM pp WHERE id % 3 <> 0 AND id % 4 = 0) AS unmatched_right,
+       bool_and(o.d = b.d) FILTER (WHERE b.id IS NOT NULL) AS ranked_distance_is_own_childs
+  FROM pp_out o LEFT JOIN pp_base b USING (id);
+
+-- Output order is non-decreasing in distance, so no ranked row follows an
+-- Infinity one.
+SELECT count(*) FILTER (WHERE d < prev_d) AS order_violations
+  FROM (SELECT d, lag(d) OVER (ORDER BY rn) AS prev_d FROM pp_out) x;
+
+-- LIMIT through the Merge Append is the top of the merged ranking.
+SELECT (SELECT array_agg(id ORDER BY id)
+          FROM (SELECT id FROM pp WHERE body @@@ 'cat' ORDER BY body &@@ 'dog' LIMIT 5) s)
+     = (SELECT array_agg(id ORDER BY id)
+          FROM (SELECT b.id FROM pp_base b WHERE b.id % 3 <> 0 ORDER BY b.d LIMIT 5) s)
+       AS limit5_is_true_top5;
+
+DROP TABLE pp_out, pp_base;
+DROP TABLE pp;
+RESET enable_sort;
+
+DROP TABLE d;
+DROP FUNCTION wo_plan(text);
+RESET enable_seqscan;
+DROP EXTENSION bm25_native;

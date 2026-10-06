@@ -1,0 +1,22 @@
+{
+  "name": "bm25_native",
+  "abstract": "Native BM25 ranked full-text index access method",
+  "version": "1.0.0",
+  "maintainer": "Christophe Pettus <christophe.pettus@pgexperts.com>",
+  "license": "postgresql",
+  "release_status": "stable",
+  "prereqs": {
+    "runtime": {
+      "requires": { "PostgreSQL": "17.0.0" }
+    }
+  },
+  "provides": { "bm25_native": { "file": "bm25_native--1.0.sql", "version": "1.0.0" } },
+  "resources": {
+    "repository": {
+      "url": "https://github.com/pgexperts/pgx-bm25.git",
+      "web": "https://github.com/pgexperts/pgx-bm25",
+      "type": "git"
+    }
+  },
+  "meta-spec": { "version": "1.0.0" }
+}

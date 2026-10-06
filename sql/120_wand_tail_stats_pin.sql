@@ -1,0 +1,238 @@
+-- 120_wand_tail_stats_pin -- the WAND over-pull tail continues the emitted ranking
+-- instead of re-scoring it (issue #268).
+--
+-- A WAND-capped scan (bm25_native.wand_top_k rows) that the executor pulls past k
+-- rebuilds the full exhaustive ranking. The rebuild took a fresh snapshot and
+-- recomputed the corpus statistics (live N, avgdl, df -> idf), and those count every
+-- valid pending TID with no visibility check: any INSERT between the two builds --
+-- this transaction's own, an uncommitted or an aborted one -- moved them. The tail was
+-- then scored on a different scale from the rows already emitted, so the distances
+-- stopped being monotonic, and the relative order shifted, so the resume (by the last
+-- row's TID) replayed rows already emitted or skipped rows never emitted.
+--
+-- The rebuild now scores under the capped build's pinned statistics, and resumes at
+-- the first entry strictly after the last emitted (score, TID). Each case below opens
+-- a cursor, fetches up to the cap, changes the corpus statistics in the same
+-- transaction, then fetches the rest. The rows inserted mid-scan are invisible to the
+-- cursor's snapshot, so the result must be exactly the reference taken BEFORE the
+-- change: the same ids, each once, at the same distances, in non-decreasing distance.
+-- Before the fix every case fails at least one of those.
+--
+-- Not here: the last emitted entry disappearing between the builds. A row the executor
+-- returned cannot (the scan's snapshot holds VACUUM off it), but a dead entry the
+-- executor discarded within the same pull can be vacuumed by another session, so that
+-- case needs two sessions and is t/024_wand_tail_vanished_last.pl.
+CREATE EXTENSION bm25_native;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_sort = off;
+
+-- Cursor driver: fetch `nfirst` rows, run `between_sql` (rolled back again when
+-- `abort_between`, as ROLLBACK TO SAVEPOINT would), fetch the rest. Rows go to `got`
+-- in emission order. Everything runs in one transaction, and the cursor's snapshot
+-- predates between_sql, so the rows it inserts are never visible to the cursor.
+CREATE TABLE got (tag text, ord int, id int, d float8);
+CREATE TABLE ref (tag text, id int, d float8);
+CREATE FUNCTION tail_run(tag text, q text, nfirst int, between_sql text,
+                         abort_between bool) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+  c refcursor;
+  r record;
+  n int := 0;
+BEGIN
+  OPEN c FOR EXECUTE q;
+  WHILE n < nfirst LOOP
+    FETCH c INTO r;
+    EXIT WHEN NOT FOUND;
+    n := n + 1;
+    INSERT INTO got VALUES (tag, n, r.id, r.d);
+  END LOOP;
+  IF abort_between THEN
+    BEGIN
+      EXECUTE between_sql;
+      RAISE EXCEPTION 'undo';
+    EXCEPTION WHEN raise_exception THEN
+      NULL;
+    END;
+  ELSE
+    EXECUTE between_sql;
+  END IF;
+  LOOP
+    FETCH c INTO r;
+    EXIT WHEN NOT FOUND;
+    n := n + 1;
+    INSERT INTO got VALUES (tag, n, r.id, r.d);
+  END LOOP;
+  CLOSE c;
+END $$;
+
+-- The reference: the exhaustive scorer (wand_top_k = 0, no tail at all) over the
+-- corpus as it stands before the change.
+CREATE FUNCTION take_ref(tag text, q text) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL bm25_native.wand_top_k = 0;
+  EXECUTE format('INSERT INTO ref SELECT %L, s.id, s.d FROM (%s) s', tag, q);
+END $$;
+
+-- One verdict row per case. lag() over the emission order checks monotonicity;
+-- the reference comparison is exact float8 equality, because a document both builds
+-- saw must score bit-identically in both.
+CREATE VIEW verdict AS
+SELECT r.tag,
+       (SELECT count(*) FROM got g WHERE g.tag = r.tag) AS emitted,
+       (SELECT count(*) = count(DISTINCT id) FROM got g WHERE g.tag = r.tag) AS ids_distinct,
+       (SELECT array_agg(id ORDER BY id) FROM got g WHERE g.tag = r.tag)
+         IS NOT DISTINCT FROM
+       (SELECT array_agg(id ORDER BY id) FROM ref x WHERE x.tag = r.tag) AS same_ids,
+       (SELECT coalesce(bool_and(d >= prev), true) FROM
+          (SELECT d, lag(d) OVER (ORDER BY ord) AS prev FROM got g WHERE g.tag = r.tag) m
+        WHERE prev IS NOT NULL) AS non_decreasing,
+       (SELECT coalesce(bool_and(g.d = x.d), false) FROM got g JOIN ref x USING (tag, id)
+        WHERE g.tag = r.tag) AS same_distances
+FROM (SELECT DISTINCT tag FROM ref) r
+ORDER BY r.tag;
+
+-- ------------------------------------------------------------ repeat
+-- avgdl SHRINKS: 2000 one-word rows. Row 1 (high tf, long) gains on row 3, which used
+-- to lift row 1 past the last emitted row and emit it a second time.
+CREATE TABLE b (id int, body text);
+INSERT INTO b VALUES (1, 'alpha alpha alpha zzq zzq zzq zzq zzq zzq zzq'), (2, 'alpha'),
+                     (3, 'alpha ' || repeat('zzq ', 30));
+INSERT INTO b SELECT 100 + g, repeat('zzq ', 200) FROM generate_series(1, 20) g;
+CREATE INDEX b_i ON b USING bm25_native (body);
+-- The index scan, ordered by the index; the cursor below runs the same query.
+SET bm25_native.wand_top_k = 2;
+EXPLAIN (COSTS OFF)
+SELECT id, body &@@ 'alpha' AS d FROM b WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha';
+SELECT take_ref('repeat',
+  $q$SELECT id, body &@@ 'alpha' AS d FROM b WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha'$q$);
+SELECT tail_run('repeat',
+  $q$SELECT id, body &@@ 'alpha' AS d FROM b WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha'$q$,
+  2, $s$INSERT INTO b SELECT 1000 + g, 'zzq' FROM generate_series(1, 2000) g$s$, false);
+
+-- ------------------------------------------------------------ skip
+-- avgdl GROWS: 50 long rows. Row 3 (one alpha in a long row) falls behind row 2, the
+-- last emitted row, and was skipped.
+CREATE TABLE c (id int, body text);
+INSERT INTO c VALUES (1, 'alpha alpha'), (2, 'alpha'),
+                     (3, 'alpha alpha alpha zzq zzq zzq zzq zzq zzq zzq');
+INSERT INTO c SELECT 100 + g, 'zzq' FROM generate_series(1, 20) g;
+CREATE INDEX c_i ON c USING bm25_native (body);
+SELECT take_ref('skip',
+  $q$SELECT id, body &@@ 'alpha' AS d FROM c WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha'$q$);
+SELECT tail_run('skip',
+  $q$SELECT id, body &@@ 'alpha' AS d FROM c WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha'$q$,
+  2, $s$INSERT INTO c SELECT 1000 + g, repeat('zzq ', 200) FROM generate_series(1, 50) g$s$, false);
+
+-- ------------------------------------------------------------ aborted
+-- The same change, rolled back before the tail. The aborted rows' pending entries are
+-- still valid TIDs, so the fresh statistics counted them exactly as if they had
+-- committed: an aborted write moved the scores too.
+CREATE TABLE a (id int, body text);
+INSERT INTO a SELECT * FROM c WHERE id < 1000;
+CREATE INDEX a_i ON a USING bm25_native (body);
+SELECT take_ref('aborted',
+  $q$SELECT id, body &@@ 'alpha' AS d FROM a WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha'$q$);
+SELECT tail_run('aborted',
+  $q$SELECT id, body &@@ 'alpha' AS d FROM a WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha'$q$,
+  2, $s$INSERT INTO a SELECT 1000 + g, repeat('zzq ', 200) FROM generate_series(1, 50) g$s$, true);
+
+-- ------------------------------------------------------------ filter + LIMIT, default k
+-- The default wand_top_k (100) with LIMIT 5 reaches the tail too, when a filter qual
+-- rejects most of the top k: the five tenant-7 rows rank 50th, 150th, 200th, 250th and
+-- 300th, so only the first is in the capped top 100.
+RESET bm25_native.wand_top_k;
+CREATE TABLE t (id int, tenant int, body text);
+INSERT INTO t SELECT n, CASE WHEN n IN (50, 150, 200, 250, 300) THEN 7 ELSE 1 END,
+                     'alpha ' || repeat('zzq ', n)
+FROM generate_series(1, 300) n;
+CREATE INDEX t_i ON t USING bm25_native (body);
+EXPLAIN (COSTS OFF)
+SELECT id, body &@@ 'alpha' AS d FROM t WHERE tenant = 7 AND body @@@ 'alpha'
+ORDER BY body &@@ 'alpha' LIMIT 5;
+SELECT take_ref('filter_limit',
+  $q$SELECT id, body &@@ 'alpha' AS d FROM t WHERE tenant = 7 AND body @@@ 'alpha'
+     ORDER BY body &@@ 'alpha' LIMIT 5$q$);
+SELECT tail_run('filter_limit',
+  $q$SELECT id, body &@@ 'alpha' AS d FROM t WHERE tenant = 7 AND body @@@ 'alpha'
+     ORDER BY body &@@ 'alpha' LIMIT 5$q$,
+  1, $s$INSERT INTO t SELECT 1000 + g, 1, 'zzq' FROM generate_series(1, 3000) g$s$, false);
+
+-- ------------------------------------------------------------ multifield
+-- BM25F: two fields, so the pinned avgdl and idf are per field. The insert lengthens
+-- only the title field.
+SET bm25_native.wand_top_k = 2;
+CREATE TABLE m (id int, title text, body text);
+INSERT INTO m VALUES (1, 'alpha alpha', 'zzq'), (2, 'alpha', 'zzq zzq'),
+                     (3, 'zzq', 'alpha alpha alpha zzq zzq zzq zzq zzq zzq zzq'),
+                     (4, 'alpha zzq zzq zzq', 'alpha');
+INSERT INTO m SELECT 100 + g, 'zzq', 'zzq' FROM generate_series(1, 20) g;
+CREATE INDEX m_i ON m USING bm25_native (title, body);
+SELECT take_ref('multifield',
+  $q$SELECT id, title &@@ 'alpha' AS d FROM m WHERE title @@@ 'alpha' ORDER BY title &@@ 'alpha'$q$);
+SELECT tail_run('multifield',
+  $q$SELECT id, title &@@ 'alpha' AS d FROM m WHERE title @@@ 'alpha' ORDER BY title &@@ 'alpha'$q$,
+  2, $s$INSERT INTO m SELECT 1000 + g, repeat('zzq ', 200), 'zzq' FROM generate_series(1, 50) g$s$,
+  false);
+
+-- ------------------------------------------------------------ multiterm
+-- Four query terms over two fields, with a field boost, a sealed segment from the
+-- build, a second from bm25_seal and a pending tail. Every case above has one term,
+-- under which a wrong per-term offset into the pinned idf, or a different per-term
+-- summation order in the rebuild, would still pass. Three changes between the builds:
+-- an insert, an aborted insert, and an insert followed by a seal, which moves the
+-- scanned rows' postings from pending into a new segment mid-scan.
+CREATE TABLE mt (id int, title text, body text);
+-- Deterministic pseudo-text: 1 to 17 words drawn from four query terms and four
+-- fillers, varied by row and salt so the scores are spread out.
+CREATE FUNCTION mt_words(n int, salt int) RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT string_agg((ARRAY['alpha','beta','gamma','delta','zzq','yyq','xxq','wwq'])
+                    [1 + ((n * 7 + g * 13 + salt * 5) % 8)], ' ')
+  FROM generate_series(1, 1 + (n * 3 + salt) % 17) g $$;
+INSERT INTO mt SELECT n, mt_words(n, 1), mt_words(n, 2) FROM generate_series(1, 200) n;
+CREATE INDEX mt_i ON mt USING bm25_native (title, body) WITH (boost_title = '2.0');
+INSERT INTO mt SELECT n, mt_words(n, 1), mt_words(n, 2) FROM generate_series(201, 300) n;
+SELECT bm25_seal('mt_i');
+INSERT INTO mt SELECT n, mt_words(n, 3), mt_words(n, 4) FROM generate_series(301, 400) n;
+SET bm25_native.wand_top_k = 5;
+SELECT take_ref('multiterm_insert',
+  $q$SELECT id, title &@@ 'alpha beta gamma delta' AS d FROM mt
+     WHERE title @@@ 'alpha beta gamma delta' ORDER BY title &@@ 'alpha beta gamma delta'$q$);
+SELECT tail_run('multiterm_insert',
+  $q$SELECT id, title &@@ 'alpha beta gamma delta' AS d FROM mt
+     WHERE title @@@ 'alpha beta gamma delta' ORDER BY title &@@ 'alpha beta gamma delta'$q$,
+  5, $s$INSERT INTO mt SELECT n, mt_words(n, 5), 'alpha' FROM generate_series(1001, 1600) n$s$,
+  false);
+SELECT take_ref('multiterm_aborted',
+  $q$SELECT id, title &@@ 'alpha beta gamma delta' AS d FROM mt
+     WHERE title @@@ 'alpha beta gamma delta' ORDER BY title &@@ 'alpha beta gamma delta'$q$);
+SELECT tail_run('multiterm_aborted',
+  $q$SELECT id, title &@@ 'alpha beta gamma delta' AS d FROM mt
+     WHERE title @@@ 'alpha beta gamma delta' ORDER BY title &@@ 'alpha beta gamma delta'$q$,
+  5, $s$INSERT INTO mt SELECT n, 'delta', mt_words(n, 6) FROM generate_series(2001, 2600) n$s$,
+  true);
+SELECT take_ref('multiterm_seal',
+  $q$SELECT id, title &@@ 'alpha beta gamma delta' AS d FROM mt
+     WHERE title @@@ 'alpha beta gamma delta' ORDER BY title &@@ 'alpha beta gamma delta'$q$);
+SELECT tail_run('multiterm_seal',
+  $q$SELECT id, title &@@ 'alpha beta gamma delta' AS d FROM mt
+     WHERE title @@@ 'alpha beta gamma delta' ORDER BY title &@@ 'alpha beta gamma delta'$q$,
+  5, $s$INSERT INTO mt SELECT n, mt_words(n, 5), 'gamma gamma' FROM generate_series(3001, 3400) n;
+        SELECT bm25_seal('mt_i')$s$,
+  false);
+
+-- ------------------------------------------------------------ verdicts
+-- The emitted sequences of the small cases (the multiterm ones run to hundreds of
+-- rows), then one row per case; every boolean must be true.
+SELECT tag, ord, id, round(d::numeric, 4) AS d FROM got
+WHERE tag NOT LIKE 'multiterm%' ORDER BY tag, ord;
+SELECT * FROM verdict;
+
+DROP VIEW verdict;
+DROP FUNCTION tail_run(text, text, int, text, bool);
+DROP FUNCTION take_ref(text, text);
+DROP FUNCTION mt_words(int, int);
+DROP TABLE got, ref, a, b, c, t, m, mt;
+DROP EXTENSION bm25_native;

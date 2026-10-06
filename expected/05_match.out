@@ -1,0 +1,78 @@
+CREATE EXTENSION bm25_native;
+CREATE TABLE docs (id int primary key, body text);
+INSERT INTO docs VALUES
+  (1, 'the quick brown fox'),
+  (2, 'the lazy brown dog'),
+  (3, 'quick quick fox');
+CREATE INDEX docs_bm25 ON docs USING bm25_native (body);
+SET enable_seqscan = off;
+-- term present in docs 1 and 2
+SELECT id FROM docs WHERE body @@@ 'brown' ORDER BY id;
+ id 
+----
+  1
+  2
+(2 rows)
+
+-- term present in docs 1 and 3
+SELECT id FROM docs WHERE body @@@ 'fox' ORDER BY id;
+ id 
+----
+  1
+  3
+(2 rows)
+
+-- absent term
+SELECT id FROM docs WHERE body @@@ 'cat' ORDER BY id;
+ id 
+----
+(0 rows)
+
+-- confirm the index is actually used
+EXPLAIN (COSTS OFF) SELECT id FROM docs WHERE body @@@ 'fox';
+              QUERY PLAN              
+--------------------------------------
+ Index Scan using docs_bm25 on docs
+   Index Cond: (body @@@ 'fox'::text)
+(2 rows)
+
+-- multi-term OR: 'fox dog' should match docs 1 (fox), 2 (dog), and 3 (fox)
+-- Doc 2 has "dog" but not "fox"; doc 3 has "fox" but not "dog".
+-- Before the fix, only the first query token was used so doc 2 was dropped.
+SELECT id FROM docs WHERE body @@@ 'fox dog' ORDER BY id;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+RESET enable_seqscan;
+DROP TABLE docs;
+-- v4: stemmed matching must agree on BOTH the index path and the bm25_match seqscan
+-- path. The index match is authoritative (xs_recheck=false), so the index query
+-- below verifies stemmed matching directly (no recheck); the forced-seqscan query
+-- then independently exercises bm25_match. Both must return the same row.
+CREATE TABLE mdocs (id int primary key, body text);
+INSERT INTO mdocs VALUES (1, 'the defendant showed gross negligence'),
+                         (2, 'a routine contract review');
+CREATE INDEX mdocs_bm25 ON mdocs USING bm25_native (body);
+SET enable_seqscan = off;
+SELECT id FROM mdocs WHERE body @@@ 'negligent' ORDER BY id;        -- index path: 1
+ id 
+----
+  1
+(1 row)
+
+RESET enable_seqscan;
+-- seqscan path exercises bm25_match directly; must give the SAME answer.
+SET enable_seqscan = on; SET enable_indexscan = off; SET enable_bitmapscan = off;
+SELECT id FROM mdocs WHERE body @@@ 'negligent' ORDER BY id;        -- seqscan: 1
+ id 
+----
+  1
+(1 row)
+
+RESET enable_seqscan; RESET enable_indexscan; RESET enable_bitmapscan;
+DROP TABLE mdocs;
+DROP EXTENSION bm25_native;

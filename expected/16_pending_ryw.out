@@ -1,0 +1,156 @@
+-- Read-your-writes (RYW) over the unsealed pending list and dedupe-by-TID.
+--
+-- Two correctness properties from Task 12:
+--   (1) RYW: a doc inserted into the pending list (never sealed) is ranked
+--       alongside sealed-segment docs without requiring a seal first.
+--   (2) Dedupe: after an UPDATE the current (pending) version of a doc wins;
+--       the stale sealed-segment posting for the old ctid is discarded so the
+--       doc is scored exactly once.  BM25 is additive, so a missed dedupe
+--       doubles the score and would be directly observable via the score-pin.
+CREATE EXTENSION bm25_native;
+CREATE TABLE docs (id int primary key, body text) WITH (autovacuum_enabled=off);
+INSERT INTO docs VALUES (1, 'quick brown fox'), (2, 'lazy brown dog');
+CREATE INDEX docs_bm25 ON docs USING bm25_native (body);   -- seals seg0 (docs 1,2)
+-- Insert WITHOUT sealing: doc3 lives only in the pending list.
+INSERT INTO docs VALUES (3, 'quick quick fox');
+SET enable_seqscan = off;
+-- (1) Read-your-writes: doc3 (pending, tf=2) outranks doc1 (sealed, tf=1) for
+-- 'quick', though doc3 was never sealed.
+SELECT id FROM docs WHERE body @@@ 'quick' ORDER BY body &@@ 'quick';
+ id 
+----
+  3
+  1
+(2 rows)
+
+-- (2) Dedupe: UPDATE doc1's body. The update makes a new pending entry (current
+-- version) while the old sealed posting for doc1 still references the old ctid;
+-- the live row's ctid moves. Score the current 'fox' doc set: each live doc must
+-- appear ONCE. Count rows == count distinct ctids (no doubles), and doc1's score
+-- is the single pending contribution, not pending+segment.
+UPDATE docs SET body = 'fox fox fox' WHERE id = 1;   -- doc1 now heavy on 'fox'
+SELECT count(*) AS n_rows, count(DISTINCT ctid) AS n_ctids
+FROM (SELECT ctid FROM docs WHERE body @@@ 'fox' ORDER BY body &@@ 'fox') s;
+ n_rows | n_ctids 
+--------+---------
+      2 |       2
+(1 row)
+
+-- doc1 (updated, 'fox fox fox' tf=3, in pending) must rank above doc3
+-- ('quick quick fox' tf=1, in pending) for 'fox'; doc1 appears once.
+SELECT id FROM docs WHERE body @@@ 'fox' ORDER BY body &@@ 'fox';
+ id 
+----
+  1
+  3
+(2 rows)
+
+-- doc1's 'fox' score must equal a single tf=3 contribution, not doubled.
+-- Capture all scores from the full ordered scan; then extract doc1's score.
+-- (bm25_score reads the active scan slot, so the score query must not filter
+-- by id — a separate filter would bypass the scored index scan and return NULL.)
+CREATE TEMP TABLE fox_scores AS
+  SELECT id, round(bm25_score(ctid)::numeric, 6) AS s
+  FROM docs WHERE body @@@ 'fox' ORDER BY body &@@ 'fox';
+SELECT s AS doc1_fox_score FROM fox_scores WHERE id = 1;
+ doc1_fox_score 
+----------------
+       0.560489
+(1 row)
+
+-- (3) A SEAL MOVES NOTHING. Read-your-writes is only half a contract: the other
+-- half is that draining those writes into a segment leaves every score exactly
+-- where it was. The quantity that decides it is per-field doclen. A pending record
+-- stores it outright (format v8); the seal re-derives it from the same document's
+-- token positions and writes it into NORMS. Two different computations of one
+-- number -- so if they ever disagree, a bm25_seal() silently re-ranks the corpus.
+--
+-- Multi-field on purpose: with one field, per-field doclen and whole-document
+-- doclen are the same value, so a single-field corpus cannot tell a per-field
+-- mistake from a global one. Doc 4 has an empty title, which keeps N_title
+-- distinct from N_body and makes both avgdl denominators discriminating.
+--
+-- The pre-v8 reconstruction was "sum tf over the field's term entries", which is
+-- the TOKEN count. It agrees with the run count for every analyzer that emits one
+-- token per source word, i.e. for everything shipped today -- so this assertion
+-- passes on both sides of the v8 change and is not its A/B (case (J) of
+-- sql/55_format_compat is).
+--
+-- AND IT CANNOT BE THE A/B FOR THE ANALYZER FLIP EITHER, for the same reason,
+-- which is worth stating here so nobody mistakes it for one: this corpus is
+-- english, where a source word run and a token are always the same thing, so a
+-- pending side left on sum-of-tf would agree with a sealed side on run counts and
+-- this section would stay green. Verified against a build carrying per-run
+-- positions with the v8 array disabled: this suite passed. The discriminating
+-- version of the same assertion lives in sql/65_multilexeme_tokens, over the
+-- ispell compound dictionary, and it fails on that build. What this section is
+-- for is the structural property -- that the two paths agree at all, on ordinary
+-- content, through the multi-field per-field statistics.
+CREATE TABLE ryw2 (id int primary key, title text, body text)
+  WITH (autovacuum_enabled=off);
+INSERT INTO ryw2 VALUES (1, 'quick brown fox', 'alpha beta gamma delta');
+CREATE INDEX ryw2_bm25 ON ryw2 USING bm25_native (title, body);   -- seals seg0 (doc 1)
+-- Rows 2..4 go in AFTER the build, so they live only in the pending list and are
+-- scored from pending records until the seal below drains them.
+INSERT INTO ryw2 VALUES
+  (2, 'lazy brown dog',  'beta gamma'),
+  (3, 'quick quick fox', 'alpha alpha alpha beta'),
+  (4, '',                'gamma fox delta epsilon');
+-- Per-field corpus stats first: Σdoclen and N_field per field, read across the
+-- live segments AND the pending list.
+CREATE TEMP TABLE ryw2_stats_before AS
+  SELECT field_id, ndocs_field, total_len_field FROM bm25_debug_field_stats('ryw2_bm25');
+-- Then every scored row. bm25_score reads the active scan slot, so the capture has
+-- to BE the scored index scan (same reason as the doc1 pin above).
+CREATE TEMP TABLE ryw2_before AS
+  SELECT id, round(bm25_score(ctid)::numeric, 6) AS s
+  FROM ryw2 WHERE title @@@ 'fox' ORDER BY title &@@ 'fox';
+SELECT bm25_seal('ryw2_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+CREATE TEMP TABLE ryw2_stats_after AS
+  SELECT field_id, ndocs_field, total_len_field FROM bm25_debug_field_stats('ryw2_bm25');
+CREATE TEMP TABLE ryw2_after AS
+  SELECT id, round(bm25_score(ctid)::numeric, 6) AS s
+  FROM ryw2 WHERE title @@@ 'fox' ORDER BY title &@@ 'fox';
+-- Same documents matched, before and after (membership style: array_agg over an
+-- explicit id order, so a rank change cannot masquerade as a set change).
+SELECT array_agg(id ORDER BY id) AS matched_before FROM ryw2_before;
+ matched_before 
+----------------
+ {1,3,4}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS matched_after  FROM ryw2_after;
+ matched_after 
+---------------
+ {1,3,4}
+(1 row)
+
+-- ...and not one field's length statistics moved. FULL JOIN, not INNER: a field
+-- that appears on only one side has to show up as a difference rather than being
+-- silently dropped from the comparison.
+SELECT count(*) AS field_stats_that_moved
+FROM ryw2_stats_before b FULL JOIN ryw2_stats_after a USING (field_id)
+WHERE (b.ndocs_field, b.total_len_field) IS DISTINCT FROM (a.ndocs_field, a.total_len_field);
+ field_stats_that_moved 
+------------------------
+                      0
+(1 row)
+
+-- ...and not one score moved. Zero is the whole assertion.
+SELECT count(*) AS scores_that_moved
+FROM ryw2_before b FULL JOIN ryw2_after a USING (id)
+WHERE b.s IS DISTINCT FROM a.s;
+ scores_that_moved 
+-------------------
+                 0
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE ryw2;
+DROP TABLE docs;
+DROP EXTENSION bm25_native;

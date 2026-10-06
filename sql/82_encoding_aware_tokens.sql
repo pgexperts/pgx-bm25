@@ -1,0 +1,189 @@
+-- 82_encoding_aware_tokens: the tokenizer measures CHARACTERS, not bytes (ADR 0046).
+--
+-- What was wrong. bm25_analyze folded its working copy with a byte-wise tolower()
+-- and split runs with a byte-wise isalnum(). Both are single-byte, LC_CTYPE-sensitive
+-- libc calls, and neither is safe to point at a multibyte string:
+--
+--   * On a platform whose single-byte ctype table covers 0x80-0xFF (BSD/macOS) under
+--     a UTF-8 LC_CTYPE, isalnum(0xC3) is TRUE and tolower(0xC3) is 0xE3 -- the lead
+--     byte of every Latin-1-range character is "lowercased" as if it were Latin-1 'A
+--     with diaeresis'. The continuation byte is not alnum, so the run was also cut
+--     mid-character. The result was a one-byte term 0xE3, which is not valid UTF-8:
+--     CREATE INDEX over ordinary accented text failed outright with
+--     'invalid byte sequence for encoding "UTF8"', raised from inside ts_lexize.
+--   * On glibc the same source silently treated 0x80-0xFF as separators instead, so
+--     an accented word was shredded into its ASCII fragments and two different words
+--     could collapse onto one term.
+--
+-- Same code, two behaviours, neither correct -- and CI (Linux) could never see the
+-- first one. Runs are now measured with bm25_next_char and folded with bm25_fold_term
+-- at emit, which is also what makes the wildcard expander and the snippet edge snapper
+-- agree with the analyzer instead of each carrying its own ASCII approximation.
+--
+-- WHY EVERY ASSERTION BELOW IS A BOOLEAN OR A COUNT, AND WHY NONE OF THEM USES
+-- lower(). How FAR a fold reaches is a property of the database, not of this code:
+-- under a C collation it folds ASCII only, so 'A with diaeresis' stays uppercase in
+-- the dictionary, while under a UTF-8 collation it folds. Printing a folded term would
+-- pin output that differs between two correct servers.
+--
+-- The obvious defence -- compare lower(term) against lower(word) so fold depth cancels
+-- -- does NOT work here. The fold gates whether the STEMMER engages: 'A-diaeresis +
+-- rger' under a folding collation reaches german_stem already lowercased, gets stemmed
+-- AND transliterated (a-diaeresis -> a) to 'arg', while under a C collation the
+-- stemmer's rules miss the uppercase form and the whole word is stored. The stored term
+-- differs STRUCTURALLY, not just in case, so no amount of lower() reconciles it. This
+-- was found by running the suite against a UTF-8 database, not by reasoning about it.
+-- Every assertion here therefore uses english, whose stemmer leaves these words intact
+-- -- a property of the test, not a claim about german; see the transliteration note in
+-- ADR 0046.
+--
+-- A related trap, latent here rather than operative: convert_from(bytea, name) returns
+-- text carrying the C collation it inherits from its `name` argument, so lower() over a
+-- DIRECT convert_from call folds ASCII only whatever the database collation is. Calls
+-- through nab_u() below do NOT inherit that -- a SQL function's result collation comes
+-- from the call site, so it is the default collation and lower() folds normally. The
+-- byte-length comparisons used here sidestep the question entirely, which is the point:
+-- any future assertion that reaches for a direct convert_from would hit it.
+--
+-- So the invariant used instead is BYTE LENGTH. Every word below folds within its own
+-- byte length in both directions (the Latin-1-range characters are two bytes upper and
+-- lower), so octet_length is identical under both collations while still being wrong by
+-- construction if a character is dropped -- which is exactly the defect. Nothing here
+-- depends on how far the database folds.
+--
+-- The cross-case direction (querying lowercase for an uppercase accented term) is
+-- deliberately NOT asserted: it works only where the collation folds non-ASCII, exactly
+-- as it does for to_tsvector.
+--
+-- TEST DATA IS HEX. Every non-ASCII literal is built with convert_from(decode(...))
+-- so this file is pure ASCII on disk and cannot be corrupted by an editor or a
+-- client_encoding mismatch. The words used:
+--   c38472676572 = A-diaeresis + "rger"     (German "Aerger", 6 bytes)
+--   c39672676572 = O-diaeresis + "rger"     (6 bytes; differs from the above ONLY in
+--                                            its leading character)
+--   4fc399       = "O" + U-grave            (French "OU", the stoplist word)
+--   c38472672a   = A-diaeresis + "rg*"      (wildcard prefix, same case as indexed)
+--   c38472672a72 = A-diaeresis + "rg*r"     (the embedded-glob variant of the above)
+CREATE EXTENSION bm25_native;
+SET enable_seqscan = off;
+
+-- Shorthand so the assertions stay readable. Dropped at the end of the suite.
+CREATE FUNCTION nab_u(hex text) RETURNS text LANGUAGE sql IMMUTABLE AS
+  $$ SELECT convert_from(decode($1, 'hex'), 'UTF8') $$;
+
+-- ============================================================================
+-- Part 1 -- the analyzer keeps a multibyte word whole.
+-- ============================================================================
+
+-- The headline regression, and the one that needs no locale to demonstrate: two words
+-- that differ ONLY in their leading multibyte character must not produce the same
+-- token. Byte-wise splitting dropped that character from both and collapsed them onto
+-- the shared ASCII tail "rger", silently merging two distinct terms' postings.
+SELECT bm25_debug_tokenize(nab_u('c38472676572'))
+    <> bm25_debug_tokenize(nab_u('c39672676572')) AS distinct_words_stay_distinct;
+
+-- One word in, one token out -- byte-wise splitting produced a separate token per
+-- ASCII fragment, so a two-word phrase could arrive as three or more tokens and shift
+-- every position after it.
+SELECT array_length(bm25_debug_tokenize(nab_u('c38472676572')), 1) AS one_token;
+
+-- The token is the whole word: same byte length in, same byte length out. A case fold
+-- preserves the length of every character used in this file, so this holds identically
+-- under a C and a UTF-8 collation; dropping the leading character does not, which is
+-- what pre-fix did (4 bytes of 'rger' against the word's 6).
+SELECT octet_length((bm25_debug_tokenize(nab_u('c38472676572')))[1])
+     = octet_length(nab_u('c38472676572')) AS token_is_the_whole_word;
+
+-- stopwords='none' keeps a dropped word's SURFACE form, and that surface is the one
+-- term the analyzer writes WITHOUT passing it through ts_lexize -- so it is the one
+-- that had to be taught to fold the same way the dictionary folds. French "OU" is a
+-- stoplist entry; whichever branch produces it, it must come back whole (3 bytes).
+-- Pre-fix the multibyte character was a separator and the token was the bare 'O'.
+SELECT octet_length((bm25_debug_tokenize(nab_u('4fc399'), 'standard', 'none', 'french'))[1])
+     = octet_length(nab_u('4fc399')) AS stopword_surface_kept_whole;
+
+-- ============================================================================
+-- Part 2 -- the index path: build, dictionary contents, exact match.
+-- ============================================================================
+CREATE TABLE nab (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO nab VALUES
+  (1, nab_u('c384726765722069737420656e646c696368206c6573626172')),  -- "<A>rger ist endlich lesbar"
+  (2, nab_u('c396726765722069737420657477617320616e6465726573')),    -- "<O>rger ist etwas anderes"
+  (3, 'plain ascii control row');
+
+-- Reaching this line at all is the BSD/macOS regression: on a UTF-8 LC_CTYPE this
+-- CREATE INDEX used to fail with 'invalid byte sequence for encoding "UTF8"', because
+-- the corrupted lead byte was handed to ts_lexize.
+--
+-- english, not german, for the reason given in the header: the german stemmer
+-- transliterates the accent away under a folding collation and not under a C one, so
+-- the stored term would differ by collation and this suite would pin one of them.
+CREATE INDEX nab_idx ON nab USING bm25_native (body) WITH (language = 'english');
+
+-- The dictionary holds both words WHOLE -- each is 6 bytes and ends in the ASCII tail
+-- 'rger'. Pre-fix the dictionary held a single 4-byte 'rger' shared by both documents,
+-- so this counted zero. The LIKE pattern is pure ASCII and the length is fold-stable,
+-- so the count is the same under either collation.
+SELECT count(*) = 2 AS dict_holds_both_words_whole
+  FROM bm25_debug_terms('nab_idx'::regclass)
+ WHERE term LIKE '%rger' AND octet_length(term) = 6;
+
+-- A query for one of them returns ONLY its document. Pre-fix both rows shared the
+-- term 'rger', so this returned both -- a false positive invisible to any ASCII test.
+SELECT id FROM nab WHERE body @@@ nab_u('c38472676572') ORDER BY id;
+
+-- ============================================================================
+-- Part 3 -- wildcard/index parity across a multibyte prefix.
+-- ============================================================================
+-- The expander folds the caller's pattern and compares it against dictionary bytes, so
+-- it has to fold the way the analyzer folded on the way in. It used to run its own
+-- byte-wise tolower(), which agreed with the analyzer for ASCII and nowhere else.
+--
+-- Asserted in the SAME case as the indexed text: that is the direction that holds
+-- regardless of how far the database's collation folds, because both sides go through
+-- bm25_fold_term -- under a C collation the pattern and the stored term both keep the
+-- uppercase accent, under a UTF-8 collation both lose it. Pre-fix this returned zero
+-- rows, because the expander's byte-wise fold agreed with the analyzer only for ASCII.
+--
+-- This works because english leaves the word intact. It would NOT work against a
+-- stemmer that transliterates: wildcards deliberately bypass the stemmer, so on a
+-- folding database a german index stores 'arg' and no accented prefix can reach it.
+-- That is the documented wildcard/stemmer trade-off, not a folding defect.
+SELECT count(*) AS pure_prefix_hits
+  FROM nab WHERE body @@@ bm25_wildcard('body', nab_u('c38472672a'));
+
+-- The embedded-glob branch takes a different path (bm25_glob_match instead of a plain
+-- prefix accept), and it is the one that must measure the FOLDED pattern's length: the
+-- fold is not byte-length preserving, so pairing the folded buffer with the caller's
+-- original length reads the wrong number of bytes. Pattern is A-diaeresis + "rg*r",
+-- matching the indexed word, which ends in 'r'.
+SELECT count(*) AS embedded_glob_hits
+  FROM nab WHERE body @@@ bm25_wildcard('body', nab_u('c38472672a72'));
+
+-- ============================================================================
+-- Part 4 -- the snippet highlighter cuts on the same boundaries.
+-- ============================================================================
+-- bm25_snippet snaps excerpt edges with its own word-byte test. While that test was
+-- ASCII-only it called every byte of an accented word a separator, so an excerpt could
+-- begin partway into one and the highlight tags could land inside the word. The
+-- snippet preserves ORIGINAL casing, so the whole word is expected verbatim here in
+-- every locale -- pre-fix the tags split it as '<A-diaeresis><b>rger</b>'.
+SELECT id,
+       bm25_snippet(body, '<b>', '</b>', 60) LIKE ('%' || nab_u('c38472676572') || '%')
+         AS snippet_keeps_word_whole
+  FROM nab WHERE body @@@ nab_u('c38472676572')
+  ORDER BY body &@@ nab_u('c38472676572');
+
+-- ============================================================================
+-- Part 5 -- ASCII behaviour is unchanged (positive control).
+-- ============================================================================
+-- The other 87 suites are this control at scale; this is the local statement of it.
+-- Character-wise splitting must not perturb pure-ASCII text, whose every character is
+-- one byte and whose fold is the identity change it always was.
+SELECT bm25_debug_tokenize('plain ascii control row') AS ascii_tokens;
+SELECT id FROM nab WHERE body @@@ 'control' ORDER BY id;
+
+RESET enable_seqscan;
+DROP TABLE nab;
+DROP FUNCTION nab_u(text);
+DROP EXTENSION bm25_native;

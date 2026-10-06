@@ -1,0 +1,400 @@
+-- 49_m6_acceptance: M6 Task 9 -- the comprehensive acceptance gate. A realistic
+-- multi-field BM25F corpus (title/body legal-brief-shaped text, 20 docs spanning
+-- TWO sealed segments + one pending batch) exercising boolean must/should/must_not
+-- + nested + wildcard + boost + phrase + field scope end-to-end, PLUS the three
+-- deferred coverage gaps routed here from the Task 4/7 reviews: cross-field
+-- must_not, should-partition, and bare-leaf multi-field membership.
+--
+-- Every expected id set below was derived from the REAL analyzer via
+-- bm25_debug_tokenize on the corpus text (not hand-computed stems) -- see the
+-- per-block comments for the stem facts each assertion relies on.
+--
+-- ANCHOR NOTE: every existing M5/M6 multi-field suite (31/32/35/45/46/47/48)
+-- drives @@@/&@@ off the FIRST indexed column (here: title) even when the query
+-- semantically scopes to a different field -- a jsonb/text query anchored on a
+-- LATER column (e.g. `body @@@ ...` on a (title,body) index) falls back to a
+-- Seq Scan (confirmed live: `Index Cond` only forms on the first column), which
+-- for a jsonb RHS applies `col @@@ jsonb` as a seqscan/filter qual and so calls
+-- bm25_match_jsonb. That used to PG_RETURN_BOOL(false) and silently return zero
+-- rows; it now ereport(ERROR)s instead (fail-loud -- a jsonb query tree cannot
+-- be evaluated from one heap column value with no index handle), so the misuse
+-- is surfaced rather than answered wrongly. The planner/AM characteristic is
+-- pre-existing, not new here, so every query below anchors on `title`; the field
+-- SCOPE itself comes from the jsonb tree (field:'body' etc.), independent of the
+-- anchor column.
+--
+-- RANK-COLLAPSE GUARDRAIL: `ORDER BY x &@@ q, <secondary key>` no longer
+-- collapses BM25 rank onto the secondary key. That was a real whole-index bug
+-- (every ranked query, since M1) and it is FIXED on the supported floor --
+-- bm25_gettuple stashes each tuple's -score and the distance operators return
+-- that stash instead of a constant +inf, so the tiebreak now sorts correctly
+-- (docs/adr/0005-tradeoffs.md; gating suite 50_orderby_dist; PG16 was dropped
+-- because its planner does not build the path the fix relies on).
+-- It still collapses where no scored scan is active -- notably when `&@@` is
+-- NOT the leading order-by key.
+-- The single-key idiom below is therefore house style rather than a
+-- workaround: it is portable across that residual case and unambiguous about
+-- what it asserts. Every MEMBERSHIP/SET assertion uses
+-- array_agg(id ORDER BY id) (the outer id-resort defines the set, so ordering
+-- of the inner scan cannot matter). The ONE ranked-order (score-desc SEQUENCE)
+-- assertion (the boost block) uses a bare single-key `ORDER BY x &@@ q LIMIT n`
+-- with no secondary key, and its EXPLAIN is pinned to confirm a plain
+-- Limit -> Index Scan (no Incremental Sort).
+CREATE EXTENSION bm25_native;
+-- ===========================================================================
+-- The corpus: `acc` (id, title, body). Built across THREE sources so every
+-- membership/wildcard check below runs against a real multi-segment index:
+--   segment A = ids 1-8  (sealed)
+--   segment B = ids 9-15 (sealed)
+--   pending   = ids 16-20 (never sealed)
+-- ===========================================================================
+CREATE TABLE acc (id int, title text, body text);
+INSERT INTO acc VALUES
+(1,  'tort claim summary',            'plaintiff alleges negligence and seeks damages'),
+(2,  'contract dispute notice',       'defendant breached the contract terms'),
+(3,  'tort and contract combined',    'court reviews tort and battery liability claims'),
+(4,  'battery assault case',          'defendant committed battery causing injury'),
+(5,  'tort battery hybrid claim',     'witness statement supports the claim'),
+(6,  'theft and burglary report',     'defendant committed theft of property'),
+(7,  'appeal of judgment filed',      'plaintiff files appeal seeking reversal'),
+(8,  'tort breach dispute notice',    'defendant cured the issue promptly');
+CREATE INDEX acc_bm25 ON acc USING bm25_native (title, body);
+SELECT bm25_seal('acc_bm25');   -- segment A: ids 1-8
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+INSERT INTO acc VALUES
+(9,  'nuisance and trespass claim',   'neighbors allege nuisance from noise'),
+(10, 'vandalism charges filed',       'defendant faces vandalism charges'),
+(11, 'arson investigation update',    'investigators probe the arson scene'),
+(12, 'duty of care review',           'court examines duty causation and foreseeable harm'),
+(13, 'proximate cause dispute',       'defendant argues the harm was too remote'),
+(14, 'mitigation of damages notice',  'plaintiff failed the mitigation duty'),
+(15, 'tort claim second segment',     'defendant liable for the tort here');
+SELECT bm25_seal('acc_bm25');   -- segment B: ids 9-15
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+INSERT INTO acc VALUES
+(16, 'evidence review hearing',       'court reviews evidence including witness statements'),
+(17, 'statute of limitations bar',    'the statute of limitations bars this claim'),
+(18, 'tort claim pending review',     'plaintiff alleges tort and theft against defendant'),
+(19, 'general filing notice only',    'no specific claim mentioned here at all'),
+(20, 'battery pending claim filed',   'defendant committed battery in this filing');
+-- ids 16-20 stay PENDING (no seal) -- the third source.
+SET enable_seqscan = off;
+-- ===========================================================================
+-- (1) Boolean matrix (membership idiom). Stem facts (bm25_debug_tokenize):
+--   body has 'tort'    -> {3,15,18}
+--   body has 'batteri' -> {3,4,20}     (doc 3's body has BOTH tort and battery)
+--   body has 'theft'   -> {6,18}
+-- ===========================================================================
+-- AND-NOT: tort AND NOT battery (body) -> {3,15,18} minus {3,4,20} = {15,18}.
+-- DISCRIMINATING: doc 3 has BOTH terms in body, so a must_not that failed to
+-- exclude it would leave {3,15,18} (3 rows) instead of {15,18} (2 rows).
+SELECT array_agg(id ORDER BY id) = ARRAY[15,18] AS and_not_ok
+FROM ( SELECT id FROM acc
+        WHERE title @@@ bm25_boolean(must=>ARRAY[bm25_term('body','tort')], must_not=>ARRAY[bm25_term('body','battery')])
+        ORDER BY title &@@ bm25_boolean(must=>ARRAY[bm25_term('body','tort')], must_not=>ARRAY[bm25_term('body','battery')]), id ) s;
+ and_not_ok 
+------------
+ t
+(1 row)
+
+-- should-OR: tort OR battery (body) -> {3,15,18} union {3,4,20} = {3,4,15,18,20}.
+SELECT array_agg(id ORDER BY id) = ARRAY[3,4,15,18,20] AS should_or_ok
+FROM ( SELECT id FROM acc
+        WHERE title @@@ bm25_boolean(should=>ARRAY[bm25_term('body','tort'),bm25_term('body','battery')])
+        ORDER BY title &@@ bm25_boolean(should=>ARRAY[bm25_term('body','tort'),bm25_term('body','battery')]), id ) s;
+ should_or_ok 
+--------------
+ t
+(1 row)
+
+-- nested: (tort OR battery) AND theft (body) -> ({3,15,18} union {3,4,20}) intersect
+-- {6,18} = {18}. DISCRIMINATING: a should-as-must reading (require BOTH tort AND
+-- battery in the inner clause: only doc 3) intersected with theft{6,18} gives {},
+-- not {18}.
+SELECT array_agg(id ORDER BY id) = ARRAY[18] AS nested_ok
+FROM ( SELECT id FROM acc
+        WHERE title @@@ bm25_boolean(must=>ARRAY[bm25_boolean(should=>ARRAY[bm25_term('body','tort'),bm25_term('body','battery')]), bm25_term('body','theft')])
+        ORDER BY title &@@ bm25_boolean(must=>ARRAY[bm25_boolean(should=>ARRAY[bm25_term('body','tort'),bm25_term('body','battery')]), bm25_term('body','theft')]), id ) s;
+ nested_ok 
+-----------
+ t
+(1 row)
+
+-- ===========================================================================
+-- (2) Cross-field must_not (deferred gap, Task 4/7 review). Stem facts:
+--   title has 'tort'   -> {1,3,5,8,15,18}
+--   title has 'breach' -> {8}            (doc 8's TITLE has 'breach')
+--   body  has 'breach' -> {2}            (doc 8's BODY does NOT have 'breach')
+-- must=[title:tort], must_not=[body:breach] must NOT exclude doc 8: 'breach' is
+-- scoped to BODY, and doc 8's body lacks it (only its title has 'breach'). A
+-- field-BLIND must_not (checking 'breach' in ANY field) would wrongly also match
+-- doc 8's title and exclude it, shrinking {1,3,5,8,15,18} (6) to {1,3,5,15,18} (5).
+-- ===========================================================================
+SELECT array_agg(id ORDER BY id) = ARRAY[1,3,5,8,15,18] AS cross_field_must_not_ok
+FROM ( SELECT id FROM acc
+        WHERE title @@@ bm25_boolean(must=>ARRAY[bm25_term('title','tort')], must_not=>ARRAY[bm25_term('body','breach')])
+        ORDER BY title &@@ bm25_boolean(must=>ARRAY[bm25_term('title','tort')], must_not=>ARRAY[bm25_term('body','breach')]), id ) s;
+ cross_field_must_not_ok 
+-------------------------
+ t
+(1 row)
+
+-- ===========================================================================
+-- (3) should-partition (deferred gap). Stem facts: body has 'arson' -> {11}
+-- (only), body has 'vandal' -> {10} (only) -- disjoint, no doc has both. Pin the
+-- EXACT union AND that dropping either should-leaf shrinks it (proves both
+-- leaves contribute, neither is redundant).
+-- ===========================================================================
+SELECT array_agg(id ORDER BY id) = ARRAY[10,11] AS partition_union_ok
+FROM ( SELECT id FROM acc
+        WHERE title @@@ bm25_boolean(should=>ARRAY[bm25_term('body','arson'),bm25_term('body','vandal')])
+        ORDER BY title &@@ bm25_boolean(should=>ARRAY[bm25_term('body','arson'),bm25_term('body','vandal')]), id ) s;
+ partition_union_ok 
+--------------------
+ t
+(1 row)
+
+SELECT array_agg(id ORDER BY id) = ARRAY[11] AS partition_drop_vandal_ok
+FROM ( SELECT id FROM acc
+        WHERE title @@@ bm25_boolean(should=>ARRAY[bm25_term('body','arson')])
+        ORDER BY title &@@ bm25_boolean(should=>ARRAY[bm25_term('body','arson')]), id ) s;
+ partition_drop_vandal_ok 
+--------------------------
+ t
+(1 row)
+
+SELECT array_agg(id ORDER BY id) = ARRAY[10] AS partition_drop_arson_ok
+FROM ( SELECT id FROM acc
+        WHERE title @@@ bm25_boolean(should=>ARRAY[bm25_term('body','vandal')])
+        ORDER BY title &@@ bm25_boolean(should=>ARRAY[bm25_term('body','vandal')]), id ) s;
+ partition_drop_arson_ok 
+-------------------------
+ t
+(1 row)
+
+-- ===========================================================================
+-- (4) Wildcard across fields + multi-segment dedup. Stem fact: no title/body
+-- stem in this corpus besides 'tort' starts with 'tor' (checked against every
+-- token via bm25_debug_tokenize), so wildcard('tor*') expands to exactly {tort}
+-- on both fields -- the wildcard set must equal the plain term set, field-scoped.
+-- 'tort' itself is spread across ALL THREE sources (segment A titles 1/3/5/8,
+-- segment B title+body 15, pending title+body 18) -- a cross-segment dict dedup
+-- failure would list 'tort' 2-3x in the OR work list and INFLATE scores for docs
+-- that already have it, so per-doc score must equal the plain-match score too.
+-- ===========================================================================
+SELECT array_agg(id ORDER BY id) = ARRAY[1,3,5,8,15,18] AS wild_title_eq_term_set
+FROM ( SELECT id FROM acc WHERE title @@@ bm25_wildcard('title','tor*')
+        ORDER BY title &@@ bm25_wildcard('title','tor*'), id ) s;
+ wild_title_eq_term_set 
+------------------------
+ t
+(1 row)
+
+SELECT array_agg(id ORDER BY id) = ARRAY[3,15,18] AS wild_body_eq_term_set
+FROM ( SELECT id FROM acc WHERE title @@@ bm25_wildcard('body','tor*')
+        ORDER BY title &@@ bm25_wildcard('body','tor*'), id ) s;
+ wild_body_eq_term_set 
+-----------------------
+ t
+(1 row)
+
+CREATE TEMP TABLE acc_wild_scores AS
+  SELECT id, round(bm25_score(ctid)::numeric,6) AS s
+  FROM acc WHERE title @@@ bm25_wildcard('title','tor*') ORDER BY title &@@ bm25_wildcard('title','tor*');
+CREATE TEMP TABLE acc_term_scores AS
+  SELECT id, round(bm25_score(ctid)::numeric,6) AS s
+  FROM acc WHERE title @@@ bm25_term('title','tort') ORDER BY title &@@ bm25_term('title','tort');
+SELECT bool_and(w.s = t.s) AS wildcard_scores_once, count(*) AS n
+FROM acc_wild_scores w JOIN acc_term_scores t USING (id);   -- expect (t, 6): no cross-segment double-count
+ wildcard_scores_once | n 
+----------------------+---
+ t                    | 6
+(1 row)
+
+DROP TABLE acc_wild_scores;
+DROP TABLE acc_term_scores;
+-- ===========================================================================
+-- (5) Phrase leaf inside a boolean (membership) + a slop variant. Stem facts:
+--   title 'tort claim' ADJACENT in {1,15,18}; doc 5's title has BOTH 'tort' and
+--   'claim' but NOT adjacent ('tort batteri hybrid claim') -- the bag-of-words
+--   trap. must=[phrase('title','tort claim'), term('title','tort')] must
+--   exclude doc 5: {1,15,18}, NOT {1,5,15,18}.
+-- ===========================================================================
+SELECT array_agg(id ORDER BY id) = ARRAY[1,15,18] AS phrase_in_boolean_ok
+FROM ( SELECT id FROM acc
+        WHERE title @@@ bm25_boolean(must=>ARRAY[bm25_phrase('title','tort claim'), bm25_term('title','tort')])
+        ORDER BY title &@@ bm25_boolean(must=>ARRAY[bm25_phrase('title','tort claim'), bm25_term('title','tort')]), id ) s;
+ phrase_in_boolean_ok 
+----------------------
+ t
+(1 row)
+
+-- slop variant: doc 16's body is 'court reviews evidence including witness
+-- statements' -- tokens {court,review,evid,includ,wit,statement}; 'evid' and
+-- 'wit' are 2 apart (one word, 'includ', between them). slop=0 (exact adjacency)
+-- must NOT match; slop=1 (tolerates the one-word gap) must match. No other doc
+-- has both 'evid' and 'wit', so this isolates the slop parameter cleanly.
+SELECT count(*) = 0 AS phrase_slop0_excludes
+FROM ( SELECT id FROM acc
+        WHERE title @@@ bm25_boolean(must=>ARRAY[bm25_phrase('body','evidence witness',0,true)])
+        ORDER BY title &@@ bm25_boolean(must=>ARRAY[bm25_phrase('body','evidence witness',0,true)]) ) s;
+ phrase_slop0_excludes 
+-----------------------
+ t
+(1 row)
+
+SELECT array_agg(id ORDER BY id) = ARRAY[16] AS phrase_slop1_includes
+FROM ( SELECT id FROM acc
+        WHERE title @@@ bm25_boolean(must=>ARRAY[bm25_phrase('body','evidence witness',1,true)])
+        ORDER BY title &@@ bm25_boolean(must=>ARRAY[bm25_phrase('body','evidence witness',1,true)]), id ) s;
+ phrase_slop1_includes 
+-----------------------
+ t
+(1 row)
+
+-- ===========================================================================
+-- (6) Boost RANKING -- the ONE score-desc SEQUENCE assertion in this suite, so
+-- it uses a dedicated small fixture + a bare SINGLE-KEY `ORDER BY ... LIMIT n`
+-- (no secondary sort key -- see the rank-collapse guardrail at the top of this
+-- file). Mirrors the proven Task 5 `bo` shape (should=[title-clause,
+-- body-clause], a 10x boost moved between clauses flips the winner) with
+-- distinct doclens on the non-scoring filler field as extra tie insurance.
+-- ===========================================================================
+CREATE TABLE accb (id int, title text, body text);
+INSERT INTO accb VALUES
+  (1, 'tort', 'alpha bravo charlie'),   -- doc1: title hit only, 3-word filler body
+  (2, 'alpha bravo', 'tort');           -- doc2: body hit only, 2-word filler title
+CREATE INDEX accb_bm25 ON accb USING bm25_native (title, body);
+SELECT bm25_seal('accb_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+-- Boost the TITLE clause 10x -> doc 1's title hit must outrank doc 2's body hit.
+-- EXPLAIN pins the plain Limit -> Index Scan shape (no Incremental Sort): this
+-- is the ONE ranked-order sequence assertion in the suite, single-key by design.
+EXPLAIN (COSTS OFF)
+SELECT id FROM accb
+ WHERE title @@@ bm25_boolean(should=>ARRAY[bm25_boost(10.0,bm25_term('title','tort')), bm25_term('body','tort')])
+ ORDER BY title &@@ bm25_boolean(should=>ARRAY[bm25_boost(10.0,bm25_term('title','tort')), bm25_term('body','tort')]) LIMIT 2;
+                                                                                                           QUERY PLAN                                                                                                            
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using accb_bm25 on accb
+         Index Cond: (title @@@ '{"boolean": {"must": [], "should": [{"boost": {"query": {"term": {"field": "title", "value": "tort"}}, "weight": 10}}, {"term": {"field": "body", "value": "tort"}}], "must_not": []}}'::jsonb)
+         Order By: (title &@@ '{"boolean": {"must": [], "should": [{"boost": {"query": {"term": {"field": "title", "value": "tort"}}, "weight": 10}}, {"term": {"field": "body", "value": "tort"}}], "must_not": []}}'::jsonb)
+(4 rows)
+
+SELECT array_agg(id) FROM (
+  SELECT id FROM accb
+   WHERE title @@@ bm25_boolean(should=>ARRAY[bm25_boost(10.0,bm25_term('title','tort')), bm25_term('body','tort')])
+   ORDER BY title &@@ bm25_boolean(should=>ARRAY[bm25_boost(10.0,bm25_term('title','tort')), bm25_term('body','tort')]) LIMIT 2) s;
+ array_agg 
+-----------
+ {1,2}
+(1 row)
+
+-- expect {1,2}
+-- Move the SAME 10x boost onto the BODY clause instead -> the order must flip.
+SELECT array_agg(id) FROM (
+  SELECT id FROM accb
+   WHERE title @@@ bm25_boolean(should=>ARRAY[bm25_term('title','tort'), bm25_boost(10.0,bm25_term('body','tort'))])
+   ORDER BY title &@@ bm25_boolean(should=>ARRAY[bm25_term('title','tort'), bm25_boost(10.0,bm25_term('body','tort'))]) LIMIT 2) s;
+ array_agg 
+-----------
+ {2,1}
+(1 row)
+
+-- expect {2,1}
+DROP TABLE accb;
+-- ===========================================================================
+-- (7) D12 end-to-end: bare `@@@` filter set == ranked `&@@` set, on 3
+-- representative trees already proven above (AND-NOT, should-partition, phrase).
+-- ===========================================================================
+SELECT (SELECT array_agg(id ORDER BY id) FROM acc WHERE title @@@ bm25_boolean(must=>ARRAY[bm25_term('body','tort')], must_not=>ARRAY[bm25_term('body','battery')]))
+     = (SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM acc WHERE title @@@ bm25_boolean(must=>ARRAY[bm25_term('body','tort')], must_not=>ARRAY[bm25_term('body','battery')])
+          ORDER BY title &@@ bm25_boolean(must=>ARRAY[bm25_term('body','tort')], must_not=>ARRAY[bm25_term('body','battery')]), id) s)
+  AS d12_and_not_ok;
+ d12_and_not_ok 
+----------------
+ t
+(1 row)
+
+SELECT (SELECT array_agg(id ORDER BY id) FROM acc WHERE title @@@ bm25_boolean(should=>ARRAY[bm25_term('body','arson'),bm25_term('body','vandal')]))
+     = (SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM acc WHERE title @@@ bm25_boolean(should=>ARRAY[bm25_term('body','arson'),bm25_term('body','vandal')])
+          ORDER BY title &@@ bm25_boolean(should=>ARRAY[bm25_term('body','arson'),bm25_term('body','vandal')]), id) s)
+  AS d12_should_partition_ok;
+ d12_should_partition_ok 
+-------------------------
+ t
+(1 row)
+
+SELECT (SELECT array_agg(id ORDER BY id) FROM acc WHERE title @@@ bm25_boolean(must=>ARRAY[bm25_phrase('title','tort claim'), bm25_term('title','tort')]))
+     = (SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM acc WHERE title @@@ bm25_boolean(must=>ARRAY[bm25_phrase('title','tort claim'), bm25_term('title','tort')])
+          ORDER BY title &@@ bm25_boolean(must=>ARRAY[bm25_phrase('title','tort claim'), bm25_term('title','tort')]), id) s)
+  AS d12_phrase_ok;
+ d12_phrase_ok 
+---------------
+ t
+(1 row)
+
+-- ===========================================================================
+-- (8) Bare-leaf multi-field membership (closes the Task 7 review non-issue):
+-- term/wildcard scoped to ONE field, bare (no boolean wrapper), BOTH the @@@
+-- filter and the single-key &@@ scored form -- assert field scope is correct
+-- AND filter == scored.
+-- ===========================================================================
+SELECT array_agg(id ORDER BY id) AS filter_set FROM acc WHERE title @@@ bm25_term('title','tort');   -- expect {1,3,5,8,15,18}
+   filter_set    
+-----------------
+ {1,3,5,8,15,18}
+(1 row)
+
+SELECT (SELECT array_agg(id ORDER BY id) FROM acc WHERE title @@@ bm25_term('title','tort'))
+     = (SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM acc WHERE title @@@ bm25_term('title','tort') ORDER BY title &@@ bm25_term('title','tort'), id) s)
+  AS bare_term_title_filter_eq_scored;
+ bare_term_title_filter_eq_scored 
+----------------------------------
+ t
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS filter_set FROM acc WHERE title @@@ bm25_term('body','tort');      -- expect {3,15,18}
+ filter_set 
+------------
+ {3,15,18}
+(1 row)
+
+SELECT (SELECT array_agg(id ORDER BY id) FROM acc WHERE title @@@ bm25_term('body','tort'))
+     = (SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM acc WHERE title @@@ bm25_term('body','tort') ORDER BY title &@@ bm25_term('body','tort'), id) s)
+  AS bare_term_body_filter_eq_scored;
+ bare_term_body_filter_eq_scored 
+---------------------------------
+ t
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS filter_set FROM acc WHERE title @@@ bm25_wildcard('title','tor*');   -- expect {1,3,5,8,15,18}
+   filter_set    
+-----------------
+ {1,3,5,8,15,18}
+(1 row)
+
+SELECT (SELECT array_agg(id ORDER BY id) FROM acc WHERE title @@@ bm25_wildcard('title','tor*'))
+     = (SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM acc WHERE title @@@ bm25_wildcard('title','tor*') ORDER BY title &@@ bm25_wildcard('title','tor*'), id) s)
+  AS bare_wildcard_title_filter_eq_scored;
+ bare_wildcard_title_filter_eq_scored 
+--------------------------------------
+ t
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE acc;
+DROP EXTENSION bm25_native;

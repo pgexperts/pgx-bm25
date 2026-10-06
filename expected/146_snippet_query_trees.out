@@ -1,0 +1,308 @@
+-- 146_snippet_query_trees.sql -- bm25_snippet over every jsonb query shape, the excerpt
+-- budget at a field edge, the cost of the hit test, and the bounded character walk
+-- (#308 TEXT-04/TEXT-06/TEXT-08, #305 XCUT-06).
+--
+-- TEXT-04: bm25_snippet used to read its query terms only from so->qterm, which the scan
+-- fills only for a text query or a single MATCH/TERM jsonb root. Every other jsonb root --
+-- PHRASE, WILDCARD, BOOLEAN, BOOST -- returned NULL on every row, which is also the
+-- answer for "no hit", so the README's own recommended builders silently lost
+-- highlighting. Now the hit set is every NON-NEGATED leaf's analyzed terms, plus each
+-- wildcard pattern globbed against the field's tokens (decision D17). Every assertion
+-- below that expects a <mark> returned NULL before the fix.
+--
+-- TEXT-06: the budget left over after the hit was split evenly with no carry-over, so a
+-- hit in a field's first or last words got about half the requested excerpt and a short
+-- field that fit whole was cut with a spurious ellipsis.
+--
+-- XCUT-06: the hit test was a linear probe of every query token per field token, with no
+-- interrupt check: O(field tokens x query tokens) per row and uncancellable. Now a sorted
+-- bsearch with CHECK_FOR_INTERRUPTS per field token. Like 74_match_intersect, pg_regress
+-- cannot see a missing interrupt check (a pre-fix statement_timeout also fires, late); the
+-- CI interrupt-check floor guards that. What this suite CAN see is the complexity: the
+-- elapsed-time assertion below takes about 23 s against the linear probe on the machine
+-- the fix was written on, and well under a second after it.
+--
+-- TEXT-08: pg_mblen is gone; the character walk ERRORs on a truncated trailing sequence
+-- instead of clamping it into a term. Only corrupt text can carry one, so the probe below
+-- manufactures it with bm25_debug_bounded_name_bytes, which returns raw bytes as text.
+--
+-- Every ranked query pairs WHERE @@@ with ORDER BY &@@ on the same literal and nothing
+-- else (the 39_snippet idiom): a scored index scan is what bm25_snippet reads, and a
+-- secondary sort key would let the planner answer off-index.
+CREATE EXTENSION bm25_native;
+SET enable_seqscan = off;
+CREATE TABLE st (id int PRIMARY KEY, title text, body text) WITH (autovacuum_enabled = off);
+INSERT INTO st VALUES
+    (1, 'court news',  'The judge ruled on the case today'),
+    (2, 'sports desk', 'The judges ruled the match a draw after extra time'),
+    (3, 'misc',        'A judgment was handed down by the appeals court on Friday');
+CREATE INDEX st_bm25 ON st USING bm25_native (title, body) WITH (language = 'english');
+-- ============================================================================
+-- Part 1 -- TEXT-04: every jsonb root shape highlights.
+-- ============================================================================
+-- Control: the text-syntax phrase always highlighted (it reaches so->qterm).
+SELECT id, bm25_snippet(body) AS snip
+  FROM st WHERE title @@@ '"judge ruled"' ORDER BY title &@@ '"judge ruled"';
+ id |                                     snip                                     
+----+------------------------------------------------------------------------------
+  1 | The <mark>judge</mark> <mark>ruled</mark> on the case today
+  2 | The <mark>judges</mark> <mark>ruled</mark> the match a draw after extra time
+(2 rows)
+
+-- Control: a single TERM leaf always highlighted (copied into so->qterm).
+SELECT id, bm25_snippet(body) AS snip
+  FROM st WHERE title @@@ bm25_term('body', 'judge') ORDER BY title &@@ bm25_term('body', 'judge');
+ id |                              snip                               
+----+-----------------------------------------------------------------
+  1 | The <mark>judge</mark> ruled on the case today
+  2 | The <mark>judges</mark> ruled the match a draw after extra time
+(2 rows)
+
+-- PHRASE root: NULL on every row before the fix. A phrase highlights its terms wherever
+-- they occur in the field, the rule the text-syntax phrase above has always had.
+SELECT id, bm25_snippet(body) AS snip
+  FROM st WHERE title @@@ bm25_phrase('body', 'judge ruled')
+ ORDER BY title &@@ bm25_phrase('body', 'judge ruled');
+ id |                                     snip                                     
+----+------------------------------------------------------------------------------
+  1 | The <mark>judge</mark> <mark>ruled</mark> on the case today
+  2 | The <mark>judges</mark> <mark>ruled</mark> the match a draw after extra time
+(2 rows)
+
+-- WILDCARD root: NULL for all three rows before the fix. 'judg*' globs the field's
+-- STEMMED tokens (judg, judgment), the same bytes the dictionary expansion matched.
+SELECT id, bm25_snippet(body) AS snip
+  FROM st WHERE title @@@ bm25_wildcard('body', 'judg*')
+ ORDER BY title &@@ bm25_wildcard('body', 'judg*');
+ id |                                  snip                                  
+----+------------------------------------------------------------------------
+  3 | A <mark>judgment</mark> was handed down by the appeals court on Friday
+  1 | The <mark>judge</mark> ruled on the case today
+  2 | The <mark>judges</mark> ruled the match a draw after extra time
+(3 rows)
+
+-- The pattern is case-folded the way the expander folds it, so an upper-case pattern
+-- highlights the same spans.
+SELECT id, bm25_snippet(body) AS snip
+  FROM st WHERE title @@@ bm25_wildcard('body', 'JUDG*')
+ ORDER BY title &@@ bm25_wildcard('body', 'JUDG*');
+ id |                                  snip                                  
+----+------------------------------------------------------------------------
+  3 | A <mark>judgment</mark> was handed down by the appeals court on Friday
+  1 | The <mark>judge</mark> ruled on the case today
+  2 | The <mark>judges</mark> ruled the match a draw after extra time
+(3 rows)
+
+-- BOOLEAN with must + should: every positive leaf highlights, across leaf kinds.
+SELECT id, bm25_snippet(body) AS snip
+  FROM st WHERE title @@@ bm25_boolean(must => ARRAY[bm25_wildcard('body', 'judg*')],
+                                       should => ARRAY[bm25_term('body', 'court')])
+ ORDER BY title &@@ bm25_boolean(must => ARRAY[bm25_wildcard('body', 'judg*')],
+                                 should => ARRAY[bm25_term('body', 'court')]);
+ id |                                        snip                                         
+----+-------------------------------------------------------------------------------------
+  3 | A <mark>judgment</mark> was handed down by the appeals <mark>court</mark> on Friday
+  1 | The <mark>judge</mark> ruled on the case today
+  2 | The <mark>judges</mark> ruled the match a draw after extra time
+(3 rows)
+
+-- must_not contributes NOTHING. The negated leaf is a TERM on the OTHER field (a
+-- same-field must_not would exclude every row containing the term, leaving nothing to
+-- look at): title:judge excludes no row here, and 'judge'/'judges' in the BODY must stay
+-- unmarked while the positive 'ruled' is marked.
+SELECT id, bm25_snippet(body) AS snip
+  FROM st WHERE title @@@ bm25_boolean(must => ARRAY[bm25_term('body', 'ruled')],
+                                       must_not => ARRAY[bm25_term('title', 'judge')])
+ ORDER BY title &@@ bm25_boolean(must => ARRAY[bm25_term('body', 'ruled')],
+                                 must_not => ARRAY[bm25_term('title', 'judge')]);
+ id |                              snip                               
+----+-----------------------------------------------------------------
+  1 | The judge <mark>ruled</mark> on the case today
+  2 | The judges <mark>ruled</mark> the match a draw after extra time
+(2 rows)
+
+-- A negated WILDCARD is skipped too: title-scoped 'cour*' must not mark 'court' in the body.
+SELECT id, bm25_snippet(body) AS snip
+  FROM st WHERE title @@@ bm25_boolean(must => ARRAY[bm25_term('body', 'judgment')],
+                                       must_not => ARRAY[bm25_wildcard('title', 'cour*')])
+ ORDER BY title &@@ bm25_boolean(must => ARRAY[bm25_term('body', 'judgment')],
+                                 must_not => ARRAY[bm25_wildcard('title', 'cour*')]);
+ id |                                  snip                                  
+----+------------------------------------------------------------------------
+  3 | A <mark>judgment</mark> was handed down by the appeals court on Friday
+(1 row)
+
+-- BOOST wraps a boolean: the walk descends through it.
+SELECT id, bm25_snippet(body) AS snip
+  FROM st WHERE title @@@ bm25_boost(2.0, bm25_boolean(should => ARRAY[bm25_phrase('body', 'extra time'),
+                                                                      bm25_term('body', 'friday')]))
+ ORDER BY title &@@ bm25_boost(2.0, bm25_boolean(should => ARRAY[bm25_phrase('body', 'extra time'),
+                                                                bm25_term('body', 'friday')]));
+ id |                                     snip                                     
+----+------------------------------------------------------------------------------
+  2 | The judges ruled the match a draw after <mark>extra</mark> <mark>time</mark>
+  3 | A judgment was handed down by the appeals court on <mark>Friday</mark>
+(2 rows)
+
+-- Field scope is ignored, as for a text field:term query: bm25_snippet is handed a VALUE,
+-- not a column, so a title-scoped leaf marks the word in whatever text it is given.
+SELECT id, bm25_snippet('the appeals court sat late') AS snip
+  FROM st WHERE title @@@ bm25_term('title', 'court') ORDER BY title &@@ bm25_term('title', 'court');
+ id |                  snip                   
+----+-----------------------------------------
+  1 | the appeals <mark>court</mark> sat late
+(1 row)
+
+-- A row the scan returns whose snippet field has no hit is still NULL (D11).
+SELECT id, bm25_snippet(title) IS NULL AS no_hit_is_null
+  FROM st WHERE title @@@ bm25_wildcard('body', 'judg*')
+ ORDER BY title &@@ bm25_wildcard('body', 'judg*');
+ id | no_hit_is_null 
+----+----------------
+  3 | t
+  1 | t
+  2 | t
+(3 rows)
+
+-- ============================================================================
+-- Part 2 -- TEXT-06: a hit near a field edge gets the whole budget.
+-- Measured as ORIGINAL characters: tags ('[' ']') and the ellipsis stripped.
+-- ============================================================================
+-- Hit at the LEFT edge, budget 100: before the fix the excerpt carried ~51 characters.
+SELECT char_length(replace(replace(replace(s, '[', ''), ']', ''), U&'\2026', '')) BETWEEN 90 AND 100
+         AS left_edge_fills_budget,
+       s
+  FROM (SELECT bm25_snippet('judge ' || repeat('word ', 50), '[', ']', 100) AS s
+          FROM st WHERE title @@@ 'judge' ORDER BY title &@@ 'judge' LIMIT 1) x;
+ left_edge_fills_budget |                                                    s                                                    
+------------------------+---------------------------------------------------------------------------------------------------------
+ t                      | [judge] word word word word word word word word word word word word word word word word word word word…
+(1 row)
+
+-- The mirror: hit at the RIGHT edge.
+SELECT char_length(replace(replace(replace(s, '[', ''), ']', ''), U&'\2026', '')) BETWEEN 90 AND 100
+         AS right_edge_fills_budget,
+       s
+  FROM (SELECT bm25_snippet(repeat('word ', 50) || 'judge', '[', ']', 100) AS s
+          FROM st WHERE title @@@ 'judge' ORDER BY title &@@ 'judge' LIMIT 1) x;
+ right_edge_fills_budget |                                                    s                                                    
+-------------------------+---------------------------------------------------------------------------------------------------------
+ t                       | …word word word word word word word word word word word word word word word word word word word [judge]
+(1 row)
+
+-- A field exactly the budget long is returned whole, with no ellipsis ('x' used to be
+-- dropped and a leading ellipsis added).
+SELECT bm25_snippet('x judge', '[', ']', 7) AS whole_field
+  FROM st WHERE title @@@ 'judge' ORDER BY title &@@ 'judge' LIMIT 1;
+ whole_field 
+-------------
+ x [judge]
+(1 row)
+
+-- Characters, not bytes: a multibyte field with the hit at the left edge also fills the
+-- budget, counted in characters.
+SELECT char_length(replace(replace(replace(s, '[', ''), ']', ''), U&'\2026', '')) BETWEEN 18 AND 20
+         AS multibyte_left_edge_fills_budget,
+       s
+  FROM (SELECT bm25_snippet('judge ' || repeat('日本語 ', 20), '[', ']', 20) AS s
+          FROM st WHERE title @@@ 'judge' ORDER BY title &@@ 'judge' LIMIT 1) x;
+ multibyte_left_edge_fills_budget |               s                
+----------------------------------+--------------------------------
+ t                                | [judge] 日本語 日本語 日本語 …
+(1 row)
+
+-- A hit with room on BOTH sides still splits evenly (unchanged).
+SELECT bm25_snippet(repeat('aa ', 20) || 'judge' || repeat(' bb', 20), '[', ']', 21) AS centered
+  FROM st WHERE title @@@ 'judge' ORDER BY title &@@ 'judge' LIMIT 1;
+        centered         
+-------------------------
+ … aa aa [judge] bb bb …
+(1 row)
+
+-- ============================================================================
+-- Part 3 -- XCUT-06: the hit test is a bsearch, and cancellable.
+-- Eight rows of a 50,001-token body against a 40,001-term query: the linear probe did
+-- ~2e9 comparisons per row.
+-- ============================================================================
+CREATE TABLE big (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO big
+SELECT g, 'needle ' || (SELECT string_agg('w' || i, ' ') FROM generate_series(1, 50000) i)
+  FROM generate_series(1, 8) g;
+CREATE INDEX big_bm25 ON big USING bm25_native (body) WITH (language = 'english');
+CREATE TABLE bigq AS
+SELECT 'needle ' || string_agg('q' || i, ' ') AS q FROM generate_series(1, 40000) i;
+-- The answer: every row is highlighted at its needle. The 10 s bound is more than ten times
+-- what the bsearch needs where the fix was written (well under a second) and under half
+-- what the linear probe needs there (about 23 s): a tripwire for the complexity, not a
+-- benchmark.
+DO $$
+DECLARE
+    q  text;
+    t0 timestamptz;
+    n  int;
+BEGIN
+    SELECT bigq.q INTO q FROM bigq;
+    t0 := clock_timestamp();
+    EXECUTE format('SELECT count(*) FROM (SELECT bm25_snippet(body, ''['', '']'', 20) AS s '
+                   'FROM big WHERE body @@@ %L ORDER BY body &@@ %L) x '
+                   'WHERE s LIKE ''[needle]%%''', q, q) INTO n;
+    RAISE NOTICE 'rows highlighted: %, within time bound: %',
+        n, clock_timestamp() - t0 < interval '10 seconds';
+END
+$$;
+NOTICE:  rows highlighted: 8, within time bound: t
+-- Cancellable: statement_timeout unwinds it and the session is healthy afterwards. The
+-- timer is armed per top-level statement, so it is SET outside the DO block (a SET LOCAL
+-- inside one would not apply to the statement already running).
+SET statement_timeout = '1ms';
+DO $$
+DECLARE
+    q text;
+BEGIN
+    SELECT bigq.q INTO q FROM bigq;
+    EXECUTE format('SELECT count(s) FROM (SELECT bm25_snippet(body) AS s FROM big '
+                   'WHERE body @@@ %L ORDER BY body &@@ %L) x', q, q);
+    RAISE NOTICE 'completed inside 1 ms (raise the input size)';
+EXCEPTION WHEN query_canceled THEN
+    RAISE NOTICE 'cancelled';
+END
+$$;
+NOTICE:  cancelled
+RESET statement_timeout;
+SELECT id, bm25_snippet(body) AS snip
+  FROM st WHERE title @@@ 'judge' ORDER BY title &@@ 'judge';
+ id |                              snip                               
+----+-----------------------------------------------------------------
+  1 | The <mark>judge</mark> ruled on the case today
+  2 | The <mark>judges</mark> ruled the match a draw after extra time
+(2 rows)
+
+-- ============================================================================
+-- Part 4 -- TEXT-08: a truncated trailing multibyte sequence ERRORs.
+-- 'judge' followed by 0xE6, the lead byte of a three-byte UTF-8 character with its two
+-- continuation bytes missing. The clamp this replaced folded the stray byte into the
+-- token and returned it.
+-- ============================================================================
+SELECT getdatabaseencoding() = 'UTF8' AS utf8_database;
+ utf8_database 
+---------------
+ t
+(1 row)
+
+SELECT bm25_debug_tokenize(bm25_debug_bounded_name_bytes('\x6a75646765e6'::bytea, 6));
+ERROR:  invalid byte sequence for encoding "UTF8": 0xe6
+-- The snippet path analyzes the field with the same walk, so it errors the same way.
+SELECT bm25_snippet(bm25_debug_bounded_name_bytes('\x6a75646765e6'::bytea, 6))
+  FROM st WHERE title @@@ 'judge' ORDER BY title &@@ 'judge' LIMIT 1;
+ERROR:  invalid byte sequence for encoding "UTF8": 0xe6
+-- A complete sequence is fine: 'judge' + U+65E5 (e6 97 a5).
+SELECT bm25_debug_tokenize(bm25_debug_bounded_name_bytes('\x6a75646765e697a5'::bytea, 8));
+ bm25_debug_tokenize 
+---------------------
+ {judge日}
+(1 row)
+
+DROP TABLE big;
+DROP TABLE bigq;
+DROP TABLE st;
+DROP EXTENSION bm25_native;

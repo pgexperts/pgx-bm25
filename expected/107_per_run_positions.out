@@ -1,0 +1,303 @@
+-- Per-run positions, within-run dedup, and run-count doclen, end to end
+-- (issue #184 stage 3, analyzer revision 5, ADR 0087).
+--
+-- sql/99 pins the ANALYZER's output -- positions and token multiset straight out of
+-- bm25_debug_analyze_positions / bm25_debug_tokenize -- and the three phrase verdicts.
+-- This suite pins everything downstream of that: what reaches DISK, what the phrase
+-- matcher does with co-positioned slots, what doclen does to a score, and whether the
+-- pending path agrees with the sealed one.  Every PART below fails against a pre-flip
+-- build; that A/B is the reason each is here rather than left to the analyzer probes.
+-- Not every individual assertion does, and where one does not it says so and says why --
+-- see the ordered-slop note in PART TWO.  A test whose A/B power is assumed rather than
+-- measured is how the reverted attempt (ADR 0077) survived 105 green suites.
+--
+-- WHY EVERY CASE USES ispell_sample AND NONE USES ENGLISH.  Snowball English emits one
+-- lexeme per source run, so per-run and per-lexeme positions COINCIDE and every English
+-- corpus in this tree passes against a completely broken build -- that is not a
+-- hypothetical, it was proved during stage 2 by building the flip without its other half
+-- and watching 16_pending_ryw stay green.  ispell_sample ships with core PostgreSQL (its
+-- own tsdicts suite uses it), needs no fixture, and is pure ASCII, so it is safe under
+-- the C-locale CI legs.  'footballklubber' is the discriminating word: ispell splits it
+-- into six lexemes of which one is a REPEAT, so it exercises co-positioning and dedup at
+-- once.
+--
+-- The parity being pinned is exact against core for the same dictionary:
+--     to_tsvector('footballklubber') -> 'ball':1 'foot':1 'football':1
+--                                       'footballklubber':1 'klubber':1
+CREATE EXTENSION bm25_native;
+-- pg_catalog so CREATE INDEX's language reloption can resolve it (the debug probes take
+-- a session-schema dictionary; an index needs one the analyzer can find by name).
+CREATE TEXT SEARCH DICTIONARY pg_catalog.isp107_stem (
+    TEMPLATE = ispell, DictFile = ispell_sample, AffFile = ispell_sample);
+CREATE TABLE pr (id int primary key, body text);
+INSERT INTO pr VALUES (1, 'they saw the footballklubber yesterday'),
+                      (2, 'football klubber as separate words'),
+                      (3, 'footballklubber x football');
+CREATE INDEX pr_bm ON pr USING bm25_native (body)
+  WITH (language = 'isp107', stopwords = 'none');
+SET enable_seqscan = off;
+-- ------------------------------------------------------------------ PART ONE
+-- What actually reached disk.
+--
+-- The STRONGEST A/B available for this change, and deliberately first.  Every other
+-- assertion in this file runs through a scan plan, and this repo has been bitten
+-- repeatedly by assertions that pass against a broken build for planner reasons -- a
+-- bare @@@ answered off the index, an InitPlan hoist, a deleted SubPlan.
+-- bm25_debug_seg_positions is a set-returning function OVER THE INDEX: it decodes the
+-- sealed POS chain directly and no scan plan is involved, so it cannot pass vacuously.
+--
+-- 'klubber' is the term to probe because it is the one ispell emits TWICE for the
+-- compound.  Document 1 is 'they saw the footballklubber yesterday' -- they=0, saw=1,
+-- the=2, and the whole compound at 3 -- so a single position 3 pins co-positioning and
+-- dedup together.  Measured pre-flip, this returned FIVE rows rather than three, with
+-- TWO for that document: 'klubber' was the fourth and sixth lexeme of a run occupying
+-- positions 3..8, so it landed at 6 and at 8.
+SELECT seg, local_docid, field_id, pos
+  FROM bm25_debug_seg_positions('pr_bm', 'klubber')
+ ORDER BY seg, local_docid, pos;
+ seg | local_docid | field_id | pos 
+-----+-------------+----------+-----
+   0 |           0 |        0 |   3
+   0 |           1 |        0 |   1
+   0 |           2 |        0 |   0
+(3 rows)
+
+-- The same fact from the postings side: tf is 1, not 2, for the compound document.
+-- This is the tf third of "one source word counted N times", and it is what dedup buys
+-- beyond the position sharing -- without dedup the compound document would carry tf 2
+-- for a term its text contains once, and store that term twice at the same position.
+--
+-- THIS ASSERTION IS THE ONLY THING THAT WOULD CATCH A MISSING DEDUP.  It is tempting to
+-- assume bm25_seg_build.c's Assert(npos == tfs[j]) is a tripwire for that case, and it
+-- is not: bm25_accum_add_field_tokens increments tf and appends a position in the same
+-- iteration, so npos == tf holds by construction, and both position codecs use unbiased
+-- deltas, so the zero delta encodes and decodes silently.  An un-deduped build is
+-- quietly wrong with every Assert satisfied.
+SELECT seg, local_docid, tf
+  FROM bm25_debug_seg_postings('pr_bm', 'klubber')
+ ORDER BY seg, local_docid;
+ seg | local_docid | tf 
+-----+-------------+----
+   0 |           0 |  1
+   0 |           1 |  1
+   0 |           2 |  1
+(3 rows)
+
+-- ------------------------------------------------------------------ PART TWO
+-- The slot-disjointness discriminator, SQL-reachable for the first time.
+--
+-- Stage 1 (ADR 0085) gave unordered_match an exact bipartite-matching path behind a
+-- runtime disjointness check, because co-positioning breaks the disjointness its cheap
+-- counting sweep rested on.  Until this flip landed NO query could construct overlapping
+-- slot sets, so that path had only its C selftest.  This is the query that reaches it.
+--
+-- Document 3 is 'footballklubber x football':
+--     position 0: {footballklubber, foot, ball, klubber, football}   (the compound)
+--     position 1: {x}
+--     position 2: {football, foot, ball}
+-- The query '"klubber football"' is two slots: slot 0 = {klubber}, slot 1 =
+-- {football, foot, ball}.  Their position sets are {0} and {0,2} -- OVERLAPPING, and
+-- unequally so.  A counting sweep asks only "is each slot present in this window" and
+-- answers yes for the window [0,0], a false match at slop 0.  The correct verdict needs
+-- DISTINCT positions for distinct slots: the only perfect matching is slot 0 -> 0 and
+-- slot 1 -> 2, whose span is 2, past the slop-0 bound of 1.  So: no match.
+SELECT array_agg(id ORDER BY id) AS sdr_slop0
+  FROM pr WHERE body @@@ '"klubber football"~0';
+ sdr_slop0 
+-----------
+ {2}
+(1 row)
+
+-- Control, and it is load-bearing: at slop 1 the span-2 matching fits, so document 3
+-- DOES match.  Without this line the assertion above is indistinguishable from the
+-- matcher simply failing to see document 3 at all.
+SELECT array_agg(id ORDER BY id) AS sdr_slop1
+  FROM pr WHERE body @@@ '"klubber football"~1';
+ sdr_slop1 
+-----------
+ {2,3}
+(1 row)
+
+-- Ordered slop over runs.  A REGRESSION PIN, NOT AN A/B DISCRIMINATOR, and the
+-- distinction is recorded here because assuming otherwise is this repo's classic error.
+--
+-- Measured: this query returns {1} against a pre-flip build too.  The ordered bound is
+-- span <= (nterms - 1) + slop, and BOTH sides of it move with the lexeme count -- pre-flip
+-- the query had 7 slots to chain across document positions 3..9 (bound 6, span 6), and
+-- post-flip it has 2 slots across positions 3..4 (bound 1, span 1).  Each extra lexeme
+-- adds one to the required chain and one to the permitted span, so an ordered phrase over
+-- adjacent runs cannot see this change at any slop.  Adding intervening words does not
+-- rescue it; the compensation is exact.
+--
+-- It is kept because it pins the verdict against future regression, and because a reader
+-- who assumed it discriminates would build the next slop test on that false footing.  The
+-- assertion in this suite that DOES discriminate slop behaviour is the unordered one
+-- above: {2} here against {1,2,3} pre-flip.
+SELECT array_agg(id ORDER BY id) AS ordered_slop_over_runs
+  FROM pr WHERE body @@@ '"footballklubber yesterday"~>1';
+ ordered_slop_over_runs 
+------------------------
+ {1}
+(1 row)
+
+-- ---------------------------------------------------------------- PART THREE
+-- doclen: a source word counts once toward the length denominator.
+--
+-- Both documents are two source words and one of them is 'rare', so a query for 'rare'
+-- must score them IDENTICALLY.  Pre-flip document 1's doclen was 7 (six compound lexemes
+-- plus 'rare') against document 2's 4, so the length normalisation penalised a document
+-- for containing an ambiguous word -- the defect's ranking half.
+--
+-- Asserted as a DISTINCT-count rather than a ranked sequence deliberately: it is a
+-- membership-style assertion, so it carries no ORDER BY and cannot be confounded by the
+-- secondary-key rank collapse this repo has hit before.  Pre-flip this returns 2.
+CREATE TABLE dl (id int primary key, body text);
+INSERT INTO dl VALUES (1, 'footballklubber rare'), (2, 'football rare');
+CREATE INDEX dl_bm ON dl USING bm25_native (body)
+  WITH (language = 'isp107', stopwords = 'none');
+SELECT count(DISTINCT round(score::numeric, 6)) AS distinct_scores_must_be_1
+  FROM bm25_debug_rank('dl_bm', 'rare');
+ distinct_scores_must_be_1 
+---------------------------
+                         1
+(1 row)
+
+-- ----------------------------------------------------------------- PART FOUR
+-- The pending path, unsealed.
+--
+-- Positions on the pending path come from pending_phrase_stash rather than from a
+-- decoded POS chain, and doclen from the v8 per-field record rather than from NORMS --
+-- separate code reaching the same answer.  Stage 2 exists precisely because those two
+-- can disagree: with a run-count doclen on one side and a token-count doclen on the
+-- other, a document's score CHANGED when a seal ran, measured at 0.311209 unsealed
+-- against 0.802591 sealed for the same bytes.  Now that the flip makes the two
+-- definitions actually differ for this dictionary, that agreement is live rather than
+-- vacuous, so it is pinned on both sides of a seal.
+CREATE TABLE pnd (id int primary key, body text);
+CREATE INDEX pnd_bm ON pnd USING bm25_native (body)
+  WITH (language = 'isp107', stopwords = 'none');
+SET bm25_native.seal_threshold = '1GB';   -- nothing may seal under us
+INSERT INTO pnd VALUES (1, 'they saw the footballklubber yesterday'),
+                       (2, 'football klubber as separate words'),
+                       (3, 'footballklubber rare'),
+                       (4, 'football rare');
+SELECT pending_ndocs FROM bm25_stats('pnd_bm');
+ pending_ndocs 
+---------------
+             4
+(1 row)
+
+-- The headline regression guard, on the pending path.  This is the query that returned
+-- ZERO ROWS under the reverted doc-side-only fix (ADR 0077).
+SELECT array_agg(id ORDER BY id) AS pending_phrase_compound
+  FROM pnd WHERE body @@@ '"footballklubber yesterday"';
+ pending_phrase_compound 
+-------------------------
+ {1}
+(1 row)
+
+-- The recall gain, on the pending path: document 2's separate words satisfy the slot.
+SELECT array_agg(id ORDER BY id) AS pending_phrase_slot_or
+  FROM pnd WHERE body @@@ '"footballklubber"';
+ pending_phrase_slot_or 
+------------------------
+ {1,2,3,4}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS pending_phrase_separate
+  FROM pnd WHERE body @@@ '"football klubber"';
+ pending_phrase_separate 
+-------------------------
+ {2}
+(1 row)
+
+-- Pending doclen agrees with what a seal would store, so the same two documents score
+-- equally here too.
+SELECT count(DISTINCT round(score::numeric, 6)) AS pending_distinct_scores_must_be_1
+  FROM bm25_debug_rank('pnd_bm', 'rare');
+ pending_distinct_scores_must_be_1 
+-----------------------------------
+                                 1
+(1 row)
+
+-- Now seal and re-assert: the verdicts and the score equality must be unchanged, which
+-- is the pending/sealed agreement stage 2 bought and this flip finally exercises.
+SELECT bm25_seal('pnd_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS sealed_phrase_compound
+  FROM pnd WHERE body @@@ '"footballklubber yesterday"';
+ sealed_phrase_compound 
+------------------------
+ {1}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS sealed_phrase_slot_or
+  FROM pnd WHERE body @@@ '"footballklubber"';
+ sealed_phrase_slot_or 
+-----------------------
+ {1,2,3,4}
+(1 row)
+
+SELECT count(DISTINCT round(score::numeric, 6)) AS sealed_distinct_scores_must_be_1
+  FROM bm25_debug_rank('pnd_bm', 'rare');
+ sealed_distinct_scores_must_be_1 
+----------------------------------
+                                1
+(1 row)
+
+-- ----------------------------------------------------------------- PART FIVE
+-- The boolean/jsonb leaf, whose slot map is SEPARATE code.
+--
+-- bm25_scan_rank.c builds a slot map twice: once for the text-grammar phrase path and once
+-- per BoolPhraseGrp for the jsonb builders.  sql/99's guards and PART FOUR above drive
+-- only the first.  Without this part a wiring bug confined to the boolean path -- a slot
+-- map built from the wrong token array, or not built at all -- ships green.
+--
+-- Same three verdicts as the text path on the same corpus, plus the disjointness
+-- discriminator, so a divergence between the two paths shows up as a diff rather than
+-- as silence.
+SELECT array_agg(id ORDER BY id) AS bool_phrase_compound
+  FROM pr WHERE body @@@ bm25_phrase('body', 'footballklubber yesterday', 0, true);
+ bool_phrase_compound 
+----------------------
+ {1}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS bool_phrase_slot_or
+  FROM pr WHERE body @@@ bm25_phrase('body', 'footballklubber', 0, true);
+ bool_phrase_slot_or 
+---------------------
+ {1,2,3}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS bool_phrase_separate
+  FROM pr WHERE body @@@ bm25_phrase('body', 'football klubber', 0, true);
+ bool_phrase_separate 
+----------------------
+ {2}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS bool_sdr_slop0
+  FROM pr WHERE body @@@ bm25_phrase('body', 'klubber football', 0, false);
+ bool_sdr_slop0 
+----------------
+ {2}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS bool_sdr_slop1
+  FROM pr WHERE body @@@ bm25_phrase('body', 'klubber football', 1, false);
+ bool_sdr_slop1 
+----------------
+ {2,3}
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE pr;
+DROP TABLE dl;
+DROP TABLE pnd;
+DROP TEXT SEARCH DICTIONARY pg_catalog.isp107_stem;
+DROP EXTENSION bm25_native;

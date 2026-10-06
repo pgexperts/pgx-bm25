@@ -1,0 +1,450 @@
+-- 80_maintenance_interrupts: PR #83/ADR 0024 made SCAN paths (@@@, ranked ORDER BY)
+-- cancellable (sql/66_scan_interrupts) but left every MAINTENANCE path -- seal,
+-- merge, VACUUM's pending-drain/mark-dead/orphan-reclaim, query-parse/glob -- with
+-- zero CHECK_FOR_INTERRUPTS. This suite covers bm25_seal(), the maintenance
+-- operation most likely to run long unattended (a large pending list).
+--
+-- THE SAME TRAP AS 66, RAISED A LEVEL: 66's header warned that a plain
+-- `SET statement_timeout; SELECT ...` proves nothing because pg_regress compares
+-- OUTPUT, not wall clock, so a scan that finishes the ENTIRE build before honoring
+-- the timeout prints the identical "canceling statement due to statement timeout"
+-- either way. Here that trap is worse: bm25_seal() returns VOID, and an
+-- uncancelled call and a cancelled-then-retried call both leave the index in a
+-- CONSISTENT state (that's the whole point of the singleton + one-record-publish
+-- design), so there is no output difference to compare AT ALL, timed out or not.
+-- So this suite pins LATENCY directly: a PL/pgSQL wrapper runs the call, and a
+-- `WHEN query_canceled` handler reports how much WORK the cancelled statement got
+-- through before it stopped. That count is output-comparable once it is divided by
+-- the same operation's uncancelled count, and it is a fact about HOW EARLY the
+-- cancel landed. The function RAISEs if the seal ever completes without being
+-- cancelled, so a pending list too small to reach the assertion fails LOUDLY
+-- instead of silently passing vacuous.
+--
+-- WORK, NOT WALL CLOCK (issue #156) -- AND NOT A TIMER EITHER (ADR 0070's 2026-10-06
+-- addendum). Both assertions in this file used to be `elapsed < interval '300 ms'`.
+-- A wall-clock boundary is a property of the RUNNER: on macos-latest these suites
+-- intermittently blew it on an unchanged tree, which is why ADR 0070 excluded this
+-- whole file and sql/66_scan_interrupts from that leg. #156 replaced it with the
+-- WORK the cancelled statement got through. bm25_debug_work_units() counts steps on
+-- the interrupt-checked loops -- pending pages drained, build page rotations, POST
+-- pages decoded, dictionary entries replayed -- and it is a C GLOBAL, which is the
+-- only reason a `WHEN query_canceled` handler can read it at all: that handler runs
+-- after the subtransaction aborted, so anything the cancelled block wrote to a table
+-- is already gone. See BM25_WORK_UNIT() in src/bm25.h.
+--
+-- #156 still DELIVERED the cancel with a 10 ms statement_timeout, and that put the
+-- runner back in. A timed cancel's count is (units per ms) x (the time the cancel
+-- actually arrives). #156 argued that a slower runner only does fewer units in
+-- 10 ms, which assumes the timer arrives at 10 ms. On macos-latest it does not.
+-- Measured there, 25 runs each: the seal's 10 ms timeout was serviced at 17-56 ms
+-- (median 47) and reported 963-1,605 units against the 1,584 ceiling. Two of the 25
+-- were over, and PR #352's run was one more. The SEGREAD-10 case below went the
+-- same way on 2026-09-27, and growing its fixture only moved the line. The code
+-- getting faster pushes the same direction: the development machine's cancelled
+-- seal drifted from 241-245 units (2026-09-22) to 586-652 (2026-10-06) with no
+-- change to this file.
+--
+-- So both cancels are now INJECTED at a fixed step: bm25_native.debug_cancel_at
+-- names a pause point (drain_pending_page for the seal, debug_dict_entry for the
+-- SRF) at which the backend sets its own query-cancel flags, the assignments
+-- StatementCancelHandler makes on SIGINT. Each point sits immediately ahead of its
+-- loop's interrupt check, and bm25_native.debug_cancel_after holds the cancel back
+-- until a set number of work units is done, so it arrives MID-loop. A cancel on the
+-- first iteration would show only that the first check is live; a lock taken during
+-- that iteration and held across the rest would pass it. What the count then
+-- measures is the property under test -- how far the operation runs after the cancel
+-- arrives, before a check that CAN act on it does -- with the arrival step fixed by
+-- the code rather than by a timer. sql/148 established the lever.
+-- statement_timeout's own delivery is not this file's subject; sql/66's 1 ms checks
+-- cover it.
+--
+-- WHY A RATIO AND NOT A CONSTANT. Each assertion divides by the SAME operation run
+-- to completion moments later, so the bound scales with the fixture instead of
+-- being a magic number that rots when the corpus, maintenance_work_mem or the page
+-- packing changes. Both sides count from the arrival: (cancelled - arrival) * 10 <
+-- (full - arrival), i.e. once the cancel was pending the operation did under a tenth
+-- of the work it had left. It cannot pass on a counter that counts nothing: the
+-- counter would never reach the arrival, the cancel would never fire, and the
+-- wrapper RAISEs. Both full runs are ones this file already performed for other
+-- reasons, so the ratio costs no extra fixture time.
+--
+-- COST, AND WHY THIS ISN'T A SEAL OF MILLIONS OF ROWS: the first version of this
+-- suite built its pending list via 3,000,000 ordinary INSERTs -- ~8 minutes end
+-- to end (dominated by aminsert's per-row tokenize-and-WAL-log-to-pending-list
+-- cost, not the seal itself), unacceptable to run on every push across two PG
+-- versions plus the hardening job. Cut to 500,000 rows, which keeps a healthy
+-- multi-second uncancelled seal while shrinking the dominant INSERT cost
+-- proportionally. The other cost that mattered: health checks after cancel/seal
+-- originally counted matches for 'alpha', a term every row contains. @@@ has no
+-- LIMIT short-circuit for a common term -- it decodes the WHOLE posting list
+-- regardless of LIMIT, since only ranked WAND has an early-exit -- so counting
+-- matches for a whole-corpus term was itself taking several seconds per check.
+-- Replaced with a lookup on each row's own unique term (its md5 hash, df=1),
+-- which touches one posting and is effectively free.
+--
+-- SIZING (development machine, Apple silicon, PG 18.6, 2026-10-06):
+--   500,000 pending docs, one explicit bm25_seal() call.
+--     uncancelled work:       15,822-15,844 units (pending pages drained, then
+--                                           build page rotations)
+--     arrival:                the first pending page after 500 units
+--     cancelled work:         501 units, every run
+--     bound asserted:         (cancelled - 500) * 10 < full - 500, i.e. cancelled
+--                             < ~2,033
+--   A seal made uncancellable across its drain reaches 14,899 units, 7.3x over the
+--   bound (see the A/B note below). The row count no longer buys headroom, since the
+--   numerator no longer grows with the machine; it stays for the cost note above and
+--   for the health checks after the seal.
+--
+-- WHAT THIS SUITE CAN AND CANNOT PROVE -- two negative results found while
+-- building it, both worth recording (ADR 0041).
+--
+-- (1) A CREATE-INDEX-based version of this test -- cancelling `CREATE INDEX ...
+-- USING bm25_native` on a pre-populated table, so the same chain_ensure
+-- rotation-gap fix builds the segment, and setup is a cheap untokenized heap
+-- load -- was tried first and abandoned. PostgreSQL's own generic
+-- table_index_build_scan (heapam_handler.c's heapam_index_build_range_scan,
+-- confirmed against the PG 18.3 source tree) calls CHECK_FOR_INTERRUPTS() on
+-- EVERY tuple of the heap-scan phase, before the bm25-specific callback ever
+-- runs -- true for every index AM's CREATE INDEX, not something this PR added
+-- or could remove. A 10 ms timeout is always caught there, every time, so a
+-- CREATE-INDEX cancellation test would pass identically whether or not
+-- chain_ensure's fix -- or ANY interrupt handling anywhere in bm25_native's
+-- build path -- exists at all. Verified directly: with chain_ensure's fix
+-- reverted, CREATE INDEX still cancelled in ~10-13 ms across three separate
+-- runs, no different from the fixed tree. That is not evidence of
+-- correctness, it is evidence the test cannot see the code under test, so it
+-- was not used, despite being the cheaper design.
+--
+-- (2) bm25_seal()'s own composite structure has the same shape one level
+-- down, and this suite is honest about what it does and does not isolate.
+-- Reverting ONLY chain_ensure's rotation-gap fix (bm25_seg_build.c) does NOT
+-- make this suite fail: bm25_pending_drain (bm25_pending.c) gained its own
+-- CHECK_FOR_INTERRUPTS in the same maintenance-interrupts pass, independent
+-- of chain_ensure, and bm25_seal_index is drain-then-build -- drain's check
+-- catches a small timeout before the build phase chain_ensure covers is ever
+-- reached. Verified: chain_ensure reverted alone, boundary still holds
+-- (t, ~13 ms). Reverting BOTH bm25_seg_build.c and bm25_pending.c together
+-- DOES fail it: the same 10 ms timeout then lands at ~660 ms, past the
+-- 300 ms boundary (f).
+--
+-- THAT SECOND RESULT NO LONGER REPRODUCES, and the honest thing is to record why
+-- rather than leave a claim that a reader would find false. Re-run 2026-09-22 with
+-- both checks deleted and everything else current: the seal cancels at 1,124 work
+-- units of 15,822 (~65 ms), not at ~56% of the work. The overlap this section is
+-- already about has simply deepened -- #146 made the drain seal CHUNKS inside its
+-- own page loop, so bm25_page_alloc's check (bm25_meta.c) and the accumulator's
+-- (bm25_accum.c) are now on the drain path too, and they catch a small timeout
+-- long before the whole pending list is consumed. Deleting those two checks is no
+-- longer enough to make a seal uncancellable, which is defense in depth working,
+-- not a test gap -- but it does mean the deletion A/B no longer separates the two
+-- trees, under EITHER the old boundary or the new bound.
+--
+-- What does separate them, and is the honest model of the defect class in the
+-- first place (the original was "no interrupt handling on this path"; every
+-- instance since has been "the check is there and DEAD because a buffer content
+-- lock is held across it"): holding interrupts across the drain's page loop.
+-- Measured 2026-09-22, with a HOLD_INTERRUPTS/RESUME_INTERRUPTS pair around it and
+-- nothing else changed -- the cancelled count goes 245 -> 14,995 of 15,822 (94.8%
+-- of the work, ~800 ms), 9.5x over the 1,582 bound, and this assertion returns f
+-- with that one line the only diff in the file. RE-VERIFIED 2026-10-06 against the
+-- injected mid-loop cancel, three runs each: 501 -> 14,899 units every time, and f,
+-- both with that pair and with interrupts held only from the loop's FIRST check to
+-- its end (the shape of a lock taken during the first iteration).
+-- So this suite is a real, verified regression guard
+-- for "seal stopped being promptly cancellable" -- the ORIGINAL defect --
+-- but, by construction, cannot attribute a future failure to one specific
+-- function when two independently-added checks cover the same call path.
+-- That overlap is intentional defense in depth, not a test gap.
+--
+-- A merge-cancellation case (bm25_merge()) was also tried and dropped. Its
+-- read side has independent checks in bm25_merge.c and bm25_seg_read.c on
+-- top of bm25_seg_build.c's, AND the shared bm25_page_alloc allocator
+-- (bm25_meta.c) has its own -- reverting all four together still cancelled a
+-- 200,000-doc same-layer merge in ~12 ms. Chasing a scale where merge's
+-- revert reliably shows a slow, uncancelled run would have meant growing it
+-- well past what stays cheap, for a case seal already covers end to end
+-- (bm25_merge_maybe calls bm25_seal_index first, so a stuck seal inside a
+-- merge is the same defect this suite already catches). Not worth it.
+--
+-- Autovacuum is disabled below. Without it, autovacuum can (and during
+-- development, did) race an explicit bm25_seal() call and silently drain the
+-- very pending list this suite is about to time, making the "still pending"
+-- check after a cancel fail nondeterministically.
+SET jit = off;
+CREATE EXTENSION bm25_native;
+
+-- Land everything in the pending list: CREATE INDEX first (empty), THEN
+-- insert, so nothing is sealed yet -- every row goes through aminsert's
+-- tokenize-and-append, landing in the pending list rather than being folded
+-- into a sealed segment by the build scan. Raise the opportunistic
+-- seal_threshold so 500,000 rows of pending data survive as ONE pending list
+-- instead of auto-sealing partway through the INSERT (bm25_native.
+-- seal_threshold default is a 4 MB pending-list-size trigger).
+CREATE TABLE mi_pending (id int, body text) WITH (autovacuum_enabled = false);
+CREATE INDEX mi_pending_idx ON mi_pending USING bm25_native (body);
+SET bm25_native.seal_threshold = 2000000000;
+INSERT INTO mi_pending
+SELECT g, 'alpha common ' || (g % 500) || ' ' || md5(g::text)
+FROM generate_series(1, 500000) g;
+RESET bm25_native.seal_threshold;
+
+-- Baseline: two specific rows (by their own unique term, df=1 -- cheap) are
+-- findable through the pending-list scan path before anything is sealed.
+SELECT id FROM mi_pending WHERE body @@@ md5('1');
+SELECT id FROM mi_pending WHERE body @@@ md5('500000');
+
+-- Both assertions in this file park their two work counts here and compare them
+-- afterwards. A table rather than a session variable because the numerator is
+-- produced inside a cancelled subtransaction and the denominator seconds later, and
+-- the comparison has to outlive both.
+CREATE TABLE mi_work (what text, units bigint);
+
+CREATE FUNCTION mi_seal_cancel_test(arrival int) RETURNS bigint AS $$
+DECLARE
+    work bigint;
+BEGIN
+    /* Nothing between this reset and the measured call touches a bm25 index, so
+     * the counter reads as a delta even though it is one process-wide global. */
+    PERFORM bm25_debug_work_reset();
+    BEGIN
+        /* is_local: the lever belongs to this block's subtransaction, so the abort
+         * that services the cancel also reverts it, and the uncancelled seal below
+         * cannot inherit it. */
+        PERFORM set_config('bm25_native.debug_cancel_at', 'drain_pending_page', true);
+        PERFORM set_config('bm25_native.debug_cancel_after', arrival::text, true);
+        PERFORM bm25_seal('mi_pending_idx');
+        RAISE EXCEPTION 'seal completed WITHOUT cancellation -- the injected cancel never arrived';
+    EXCEPTION WHEN query_canceled THEN
+        /* Readable HERE, after the subtransaction this block ran in has already
+         * aborted, only because the counter is a C global. Anything this block had
+         * written to a table would be gone -- which is why the design is a backend
+         * global and not, say, a debug table the seal appends to. */
+        work := bm25_debug_work_units();
+    END;
+    RETURN work;
+END;
+$$ LANGUAGE plpgsql;
+
+-- The cancel arrives at the first pending page reached after 500 units, well inside
+-- the drain's ~14,900 rather than on its first page, for the reason sql/66 gives: a
+-- first-page cancel shows only that the first iteration's check is live.
+INSERT INTO mi_work VALUES ('seal_arrival', 500);
+INSERT INTO mi_work
+SELECT 'seal_cancelled', mi_seal_cancel_test(units::int) FROM mi_work WHERE what = 'seal_arrival';
+
+-- Healthy after cancellation: nothing published (no orphan/partial segment
+-- visible through the catalog), and both rows are still findable exactly as
+-- before -- the drain accumulator was discarded in memory; the on-disk
+-- pending list was never touched (pending_head only advances in the publish
+-- record, which a cancelled call never reaches).
+SELECT count(*) AS segments_after_cancel FROM bm25_debug_merge_plan('mi_pending_idx'::regclass);
+SELECT id FROM mi_pending WHERE body @@@ md5('1');
+SELECT id FROM mi_pending WHERE body @@@ md5('500000');
+
+-- Uncancelled, the seal completes and the backend is left fully healthy: every
+-- document published with the right count, and both rows still findable, now
+-- through the sealed segment(s) instead of the pending list.
+--
+-- TOTALS, not the per-segment listing this used to print. Since #146 the drain
+-- seals a chunk and starts a fresh accumulator whenever it crosses the maintenance
+-- memory budget, so a half-million-document pending list publishes as SEVERAL
+-- segments -- and how many depends on maintenance_work_mem and on struct padding,
+-- neither of which belongs in an expected file. This is also the one existing suite
+-- whose corpus is large enough to reach a chunk boundary at the DEFAULT budget;
+-- everywhere else the default still yields exactly one segment. What this section
+-- is actually about is unchanged: the seal either cancels cleanly or completes with
+-- nothing lost and nothing duplicated.
+--
+-- This uncancelled seal is ALSO the denominator for the cancellation assertion
+-- above: it is the same operation, over the same pending list, doing exactly the
+-- work the cancelled call was stopped from doing. Hence the reset immediately
+-- before it -- the three health checks on the lines above do their own indexed
+-- work and must not be counted.
+SELECT bm25_debug_work_reset();
+SELECT bm25_seal('mi_pending_idx');
+INSERT INTO mi_work SELECT 'seal_full', bm25_debug_work_units();
+SELECT count(*) > 0 AS sealed_segments,
+       sum(ndocs) AS ndocs, sum(live_ndocs) AS live_ndocs
+  FROM bm25_debug_merge_plan('mi_pending_idx'::regclass);
+SELECT id FROM mi_pending WHERE body @@@ md5('1');
+SELECT id FROM mi_pending WHERE body @@@ md5('500000');
+
+-- Non-vacuity canary, stated separately from the ratio so a failure says WHICH of
+-- the two things went wrong. 15,822 units measured; a floor of 1,000 is 15x below
+-- that and fails loudly if the instrumented loops ever stop being on the seal path,
+-- which would otherwise make the ratio below trivially satisfiable. It is also twice
+-- the 500-unit arrival, so the cancel cannot land in the seal's last few pages.
+SELECT (SELECT units FROM mi_work WHERE what = 'seal_full') > 1000 AS seal_full_work_nontrivial;
+
+-- THE ASSERTION. Once the cancel arrived, the seal did under a tenth of the work it
+-- had left: (cancelled - arrival) * 10 < (full - arrival).
+SELECT (c - a) * 10 < (f - a) AS seal_cancelled_early
+  FROM (SELECT max(units) FILTER (WHERE what = 'seal_arrival')   AS a,
+               max(units) FILTER (WHERE what = 'seal_cancelled') AS c,
+               max(units) FILTER (WHERE what = 'seal_full')      AS f
+          FROM mi_work) w;
+
+DROP FUNCTION mi_seal_cancel_test(int);
+DROP TABLE mi_pending;
+
+-- ===========================================================================
+-- SEGREAD-10 (issue #145): the debug SRFs' DICT-page lock hold
+-- ===========================================================================
+-- bm25_debug_postings walks a segment's DICT chain and, for EVERY entry on a
+-- page, runs an entire nested postings replay (POST pages + a NORMS doclen
+-- lookup per posting + a tuplestore row per posting). All of that used to run
+-- with the DICT page still SHARE-locked -- the lock was taken at the top of the
+-- page and released only after the last entry on it. A buffer content lock is
+-- an LWLock and LWLockAcquire does HOLD_INTERRUPTS(), so
+-- bm25_seg_scan_postings' own per-POST-page CHECK_FOR_INTERRUPTS and
+-- chain_read_at's were both silent no-ops for that whole span, and the SRF was
+-- uncancellable for one DICT page's worth of terms at a time. The fix copies
+-- each DICT page under its lock and releases before the entry loop.
+--
+-- SAME HARNESS, SAME REASON AS THE SEAL CASE ABOVE: the defect is LATENCY, so
+-- pg_regress output cannot see it (the query is cancelled either way, just far
+-- later), and the work-count-under-a-ratio wrapper, with its cancel injected at a
+-- fixed step, is what makes the latency output-comparable without making it a
+-- property of the runner. The wrapper RAISEs if the SRF ever completes, so a cancel
+-- that never arrives fails loudly rather than passing vacuously.
+--
+-- FIXTURE SHAPE IS THE WHOLE POINT: exactly 50 distinct terms, each with a huge
+-- df. Fifty short dict entries fit on ONE DICT page, so the entire 6,576,000-
+-- posting replay falls inside a single pre-fix lock window. A fixture with many
+-- distinct terms (md5-per-row, say) would spread them over many DICT pages and
+-- shrink that window to nothing, and the test would not discriminate. The index
+-- is built by CREATE INDEX over a populated table, so it seals directly into one
+-- segment and needs no bm25_seal call -- with maintenance_work_mem raised for that
+-- one statement, because at this size the default 64MB budget cuts the build into
+-- many segments and even 256MB into three (BUILD-04; 256MB holds ~546,000 of these
+-- docs), and the one-DICT-page premise would no longer hold.
+--
+-- SIZING (development machine, Apple silicon, PG 18.6, 2026-10-06):
+--   1,200,000 docs x 6 terms from a 50-term pool = 6,576,000 postings, ONE segment,
+--   ONE DICT page. Fixture cost ~5 s (1.3 s INSERT + 3.6 s CREATE INDEX).
+--     uncancelled work:       1,932 units (50 dictionary entries + the POST pages
+--                                          their nested replays decode)
+--     arrival:                the first dictionary entry after 200 units
+--     cancelled work:         206 units, every run
+--     bound asserted:         (cancelled - 200) * 10 < 1,932 - 200, i.e.
+--                             cancelled < 373.2
+--   The pre-fix behaviour misses the bound by an order of magnitude: a pre-fix cancel
+--   cannot land until the WHOLE DICT page's replay is over, i.e. at essentially the
+--   full count.
+--
+--   THE ROW COUNT IS A LEFTOVER OF THE TIMED FORM. It was 100,000 docs until #225,
+--   400,000 until 2026-09-27, then 1,200,000, each step bought to tolerate a later
+--   10 ms timer: at 400,000 the bound was reached by a cancel landing at ~40 ms, and
+--   macos-latest delivered one that late. With the cancel injected, the count does
+--   not grow with the machine, so a smaller fixture would do. The size is left alone
+--   here so the delivery mechanism is the only change in this file. Shrinking it is
+--   a free speed-up for a later edit, which must keep ONE DICT page, keep the 200-unit
+--   arrival well inside the walk, and lower the 480-unit canary floor below to match.
+--
+-- WHERE THIS RUNS. Everywhere, as of #156. The macOS leg in ci.yml used to SKIP
+-- this whole file (and sql/66_scan_interrupts) because both asserted wall-clock
+-- boundaries, which are properties of the runner; ADR 0070 recorded that exclusion
+-- and its addenda the lift and why it took a second step. The behaviour-preservation
+-- half of the same issue (#145) still lives in sql/47_m6_wildcard, which asserts no
+-- timings at all.
+--
+-- A/B VERIFIED (2026-08-23), not guessed. With src/bm25_segment.c reverted to
+-- its pre-fix form and everything else identical, the wall-clock form of this
+-- assertion returned f with elapsed ~1.16-1.17 s (three fresh sessions:
+-- 1169/1157/1174 ms) against ~11 ms fixed. RE-VERIFIED 2026-09-22 against the work
+-- form, by holding interrupts across the same DICT entry loop (a HOLD_INTERRUPTS /
+-- RESUME_INTERRUPTS pair, which is what the held page lock amounted to): the
+-- cancelled count goes 5 -> 251, i.e. the ENTIRE walk, 10x over the 25.1 bound, and
+-- this assertion returns f with that one line the only diff. So the pair genuinely
+-- separates "cancels within a term" from "cancels after the whole DICT page's
+-- worth of postings replays" -- which is the property under test, and the one a
+-- pg_regress outcome-only assertion cannot express. Re-verified 2026-09-27 at the
+-- 1,200,000-doc size with the same pair: the cancelled count goes 21-22 -> 1,932,
+-- the whole walk, and this assertion returns f. Re-verified 2026-10-06 against the
+-- injected mid-loop cancel, three runs each: 206 -> 1,932 every time, and f, both
+-- with that pair and with interrupts held only from the loop's first check to its
+-- end.
+CREATE TABLE mi_dbg (id int, body text) WITH (autovacuum_enabled = false);
+INSERT INTO mi_dbg
+SELECT g, 'term' || (g % 50) || ' term' || ((g * 7) % 50) || ' term' || ((g * 13) % 50)
+       || ' term' || ((g * 17) % 50) || ' term' || ((g * 23) % 50)
+       || ' term' || ((g * 29) % 50)
+FROM generate_series(1, 1200000) g;
+SET maintenance_work_mem = '1GB';
+CREATE INDEX mi_dbg_idx ON mi_dbg USING bm25_native (body);
+RESET maintenance_work_mem;
+
+-- Fixture witness: ONE segment, and a 50-entry dictionary (i.e. one DICT page),
+-- which is what makes the pre-fix lock window span the whole replay.
+SELECT gen, ndocs FROM bm25_debug_merge_plan('mi_dbg_idx'::regclass);
+SELECT count(*) AS dbg_distinct_terms FROM bm25_debug_terms('mi_dbg_idx');
+
+CREATE FUNCTION mi_debug_postings_cancel_test(arrival int) RETURNS bigint AS $$
+DECLARE
+    work bigint;
+BEGIN
+    PERFORM bm25_debug_work_reset();
+    BEGIN
+        /* Local to this block, as in the seal wrapper above. */
+        PERFORM set_config('bm25_native.debug_cancel_at', 'debug_dict_entry', true);
+        PERFORM set_config('bm25_native.debug_cancel_after', arrival::text, true);
+        PERFORM count(*) FROM bm25_debug_postings('mi_dbg_idx');
+        RAISE EXCEPTION 'bm25_debug_postings completed WITHOUT cancellation -- the injected cancel never arrived';
+    EXCEPTION WHEN query_canceled THEN
+        /* Readable after the abort only because the counter is a C global; see the
+         * seal wrapper above. */
+        work := bm25_debug_work_units();
+    END;
+    RETURN work;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Arrives at the first dictionary entry reached after 200 units, a few entries into
+-- the one DICT page, so the window a held page lock would span is still open behind
+-- it and the first entry's check is not the only one exercised.
+INSERT INTO mi_work VALUES ('dbg_arrival', 200);
+INSERT INTO mi_work
+SELECT 'dbg_cancelled', mi_debug_postings_cancel_test(units::int) FROM mi_work WHERE what = 'dbg_arrival';
+
+-- Healthy after the cancellation: the SAME SRF runs to completion over the SAME
+-- DICT page, and a second walker reports the same dictionary.
+--
+-- This is a smoke test, NOT a leaked-lock detector, and the difference is worth
+-- stating so nobody strengthens the claim later. A leaked SHARE content lock
+-- would be held by THIS backend, and LWLockAcquire in shared mode is
+-- self-compatible with no held-by-me assertion, so a second walk would neither
+-- block nor error on it. It could not survive the cancellation anyway:
+-- AbortSubTransaction/AbortTransaction run LWLockReleaseAll() unconditionally.
+-- What this does check is that the cancelled call left no torn scan state and
+-- that the SRF is re-runnable.
+--
+-- The full walk is ALSO the denominator for the assertion above -- one run serving
+-- both jobs, so the ratio costs one extra ~1.6 s walk and buys a strictly stronger
+-- health check than the dictionary re-read alone (it re-runs the very SRF that was
+-- cancelled, not its twin). 6,576,000 is the posting count the fixture's arithmetic
+-- fixes: 1,200,000 docs x 6 term slots, less the slots that collide within a document.
+SELECT bm25_debug_work_reset();
+SELECT count(*) AS dbg_postings_total FROM bm25_debug_postings('mi_dbg_idx');
+INSERT INTO mi_work SELECT 'dbg_full', bm25_debug_work_units();
+SELECT count(*) AS dbg_distinct_terms_after FROM bm25_debug_terms('mi_dbg_idx');
+
+-- Non-vacuity canary, for the reason given on the seal case's. 1,932 units measured;
+-- a floor of 480 is 4x below that, and is also above the 373.2-unit ceiling the
+-- assertion allows the cancelled run -- so the two cannot both be satisfied by a
+-- counter that has quietly stopped counting this path.
+SELECT (SELECT units FROM mi_work WHERE what = 'dbg_full') > 480 AS dbg_full_work_nontrivial;
+
+-- THE ASSERTION. Once the cancel arrived, the walk did under a tenth of the work it
+-- had left: (cancelled - arrival) * 10 < (full - arrival).
+SELECT (c - a) * 10 < (f - a) AS debug_postings_cancelled_early
+  FROM (SELECT max(units) FILTER (WHERE what = 'dbg_arrival')   AS a,
+               max(units) FILTER (WHERE what = 'dbg_cancelled') AS c,
+               max(units) FILTER (WHERE what = 'dbg_full')      AS f
+          FROM mi_work) w;
+
+DROP FUNCTION mi_debug_postings_cancel_test(int);
+DROP TABLE mi_work;
+DROP TABLE mi_dbg;
+
+RESET jit;
+DROP EXTENSION bm25_native;

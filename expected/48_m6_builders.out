@@ -1,0 +1,522 @@
+-- 48_m6_builders: M6 Task 1 (C-API) — jsonb query builder functions.
+-- Nothing evaluates a jsonb query yet (bm25_rescan learns to parse jsonb in
+-- Task 3); this test is scoped to the jsonb SHAPE the builders produce and
+-- how they compose/nest. The (text,jsonb) @@@/&@@ operators + opclass
+-- strategies are registered by the extension script but are not exercised
+-- here — they are inert until Task 3.
+--
+-- Naming note: the "match" builder is bm25_match_terms(field,terms), not
+-- bm25_match(field,terms) as sketched in the M6 design/task brief -- that
+-- exact (text,text) signature is already taken by the pre-existing
+-- bm25_match(text,text) RETURNS bool (the @@@ (text,text) seqscan anchor).
+-- See the naming-note comment above the builder in bm25_native--0.1.sql.
+CREATE EXTENSION bm25_native;
+-- Builders produce the canonical jsonb shapes and compose/nest.
+SELECT bm25_match_terms('body','tort battery') = '{"match":{"field":"body","terms":"tort battery"}}'::jsonb AS m;
+ m 
+---
+ t
+(1 row)
+
+SELECT bm25_term('body','tort')          = '{"term":{"field":"body","value":"tort"}}'::jsonb        AS t;
+ t 
+---
+ t
+(1 row)
+
+SELECT bm25_wildcard('body','judg*')     = '{"wildcard":{"field":"body","pattern":"judg*"}}'::jsonb AS w;
+ w 
+---
+ t
+(1 row)
+
+SELECT bm25_boost(2.0, bm25_term('title','tort'))
+       = '{"boost":{"weight":2.0,"query":{"term":{"field":"title","value":"tort"}}}}'::jsonb        AS b;
+ b 
+---
+ t
+(1 row)
+
+SELECT bm25_boolean(
+         must => ARRAY[bm25_match_terms('body','tort')],
+         must_not => ARRAY[bm25_term('body','battery')])
+       = '{"boolean":{"must":[{"match":{"field":"body","terms":"tort"}}],"should":[],"must_not":[{"term":{"field":"body","value":"battery"}}]}}'::jsonb AS bool_compose;
+ bool_compose 
+--------------
+ t
+(1 row)
+
+-- Bound-param safety at the SHAPE level: a term literally 'AND' is a jsonb value, not an operator.
+SELECT bm25_match_terms('body','AND') = '{"match":{"field":"body","terms":"AND"}}'::jsonb AS literal_and;
+ literal_and 
+-------------
+ t
+(1 row)
+
+-- Task 3 update: the (text,jsonb) @@@/&@@ overloads registered above put
+-- jsonb-RHS queries into the SAME text_bm25_ops opfamily as the (text,text)
+-- pair, so the planner picks the bm25_native index for a jsonb RHS (confirmed via
+-- EXPLAIN: both the ORDER BY form and the bare-qual form below plan to an
+-- Index Scan, not a seqscan fallback) -- both reach bm25_rescan's jsonb
+-- branch. A single term/match-leaf jsonb query must be text-equivalent on
+-- BOTH the scored (&@@) path AND the filter-only (@@@, no ORDER BY) path --
+-- the latter is NOT exercised by 46_m6_boolean.sql's bigger equivalence test,
+-- which only drives the scored path, so it is covered here instead.
+CREATE TABLE jg (id int, body text);
+INSERT INTO jg VALUES (1,'quick brown'),(2,'quick fox');
+CREATE INDEX jg_bm25 ON jg USING bm25_native (body);
+SET enable_seqscan = off;
+SELECT (SELECT array_agg(id) FROM (SELECT id FROM jg WHERE body @@@ bm25_term('body','quick') ORDER BY body &@@ bm25_term('body','quick'), id) a)
+     = (SELECT array_agg(id) FROM (SELECT id FROM jg WHERE body @@@ 'quick'                    ORDER BY body &@@ 'quick', id) b)
+  AS jsonb_scored_equals_text;   -- expect t
+ jsonb_scored_equals_text 
+--------------------------
+ t
+(1 row)
+
+SELECT (SELECT array_agg(id) FROM (SELECT id FROM jg WHERE body @@@ bm25_term('body','quick') ORDER BY id) a)
+     = (SELECT array_agg(id) FROM (SELECT id FROM jg WHERE body @@@ 'quick'                    ORDER BY id) b)
+  AS jsonb_filter_equals_text;   -- expect t (filter-only @@@, no ORDER BY -- never touches the scorer)
+ jsonb_filter_equals_text 
+--------------------------
+ t
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE jg;
+-- M6 Task 2 (C-AST): BM25Query parser + validation, via the bm25_debug_query_parse
+-- introspection SRF (no real scan needed -- it opens the index itself and parses
+-- against its baked field config).
+CREATE TABLE qp (id int, title text, body text);
+INSERT INTO qp VALUES (1,'a','b');
+CREATE INDEX qp_bm25 ON qp USING bm25_native (title, body);
+-- Parser renders a canonical AST (fields resolved to ids: title=0, body=1).
+SELECT bm25_debug_query_parse('qp_bm25',
+  bm25_boolean(must=>ARRAY[bm25_match_terms('body','tort'), bm25_wildcard('title','jud*')]));
+                bm25_debug_query_parse                 
+-------------------------------------------------------
+ BOOLEAN(must=[MATCH(f1,"tort"), WILDCARD(f0,"jud*")])
+(1 row)
+
+-- must_not-only -> ERROR (D6: no positive clause).
+SELECT bm25_debug_query_parse('qp_bm25', bm25_boolean(must_not=>ARRAY[bm25_term('body','x')]));
+ERROR:  bm25: query must have at least one positive (must/should) clause
+-- an entirely empty boolean is NOT an error (the empty-match sentinel).
+SELECT bm25_debug_query_parse('qp_bm25', bm25_boolean());
+ bm25_debug_query_parse 
+------------------------
+ BOOLEAN()
+(1 row)
+
+-- unknown field -> ERROR.
+SELECT bm25_debug_query_parse('qp_bm25', bm25_term('nosuch','x'));
+ERROR:  bm25: unknown search field "nosuch"
+-- malformed node (unrecognized key) -> ERROR.
+SELECT bm25_debug_query_parse('qp_bm25', '{"bogus":{}}'::jsonb);
+ERROR:  bm25: unknown query node "bogus"
+-- wildcard with no '*' -> ERROR at parse (path-independent: this is the
+-- @@@-vs-&@@ debug entry point, but bm25_rescan runs the SAME parser).
+SELECT bm25_debug_query_parse('qp_bm25', bm25_wildcard('body','judg'));
+ERROR:  bm25: wildcard pattern "judg" has no '*'
+-- wildcard prefix shorter than bm25_native.wildcard_min_prefix (default 3) -> ERROR.
+SELECT bm25_debug_query_parse('qp_bm25', bm25_wildcard('body','a*'));
+ERROR:  bm25: wildcard prefix too short (min 3)
+-- nested boost + phrase render too.
+SELECT bm25_debug_query_parse('qp_bm25',
+  bm25_boost(2.5, bm25_phrase('body','tort battery', 1, false)));
+                      bm25_debug_query_parse                      
+------------------------------------------------------------------
+ BOOST(weight=2.5,PHRASE(f1,"tort battery",slop=1,ordered=false))
+(1 row)
+
+-- bm25_query_flatten: leaf_bit assignment, top-down boost folding, and
+-- must_not negation propagating through a NESTED boolean (the inner must[]
+-- leaf is still presence-only, D11) -- two leaves, in root->leaf order.
+SELECT bm25_debug_query_flatten('qp_bm25',
+  bm25_boolean(
+    must     => ARRAY[bm25_boost(2.0, bm25_term('body','tort'))],
+    must_not => ARRAY[bm25_boolean(must => ARRAY[bm25_term('body','battery')])]));
+         bm25_debug_query_flatten         
+------------------------------------------
+ [0] boost=2 negated=f TERM(f1,"tort")   +
+ [1] boost=1 negated=t TERM(f1,"battery")
+(1 row)
+
+-- Leaf-cap (BM25_QUERY_MAX_LEAVES=64). Since #68 the cap fires as each leaf is
+-- PARSED (bm25_query_count_leaf, called from parse_leaf) -- so
+-- bm25_debug_query_parse, which never flattens, rejects 65 leaves too; sql/98
+-- pins that half. flatten_recurse keeps its own check where leaf_bit is
+-- assigned into the uint64 mask, but every tree that reaches it has already
+-- passed the parse-time count, so that check cannot currently fire and nothing
+-- here exercises it (ADR 0099): the 65-leaf case below errors inside
+-- bm25_query_parse, before flatten runs. bm25_debug_query_flatten is still the
+-- entry point used here because the 64-leaf assertion is about the leaf COUNT
+-- flatten produced, not merely about the cap firing. 64 leaves must succeed
+-- (boundary, not off-by-one); counting lines rather than dumping all 64 avoids
+-- bloating this file.
+SELECT array_length(string_to_array(
+         bm25_debug_query_flatten('qp_bm25',
+           bm25_boolean(must => ARRAY(
+             SELECT bm25_term('body', 'v' || g) FROM generate_series(1, 64) g))),
+         E'\n'), 1) AS leaves_at_cap;
+ leaves_at_cap 
+---------------
+            64
+(1 row)
+
+-- One more leaf (65) must ERROR with the total-leaf-cap message.
+SELECT bm25_debug_query_flatten('qp_bm25',
+  bm25_boolean(must => ARRAY(
+    SELECT bm25_term('body', 'v' || g) FROM generate_series(1, 65) g)));
+ERROR:  bm25: query has more than 64 leaf clauses (must + should + must_not)
+-- boost folds even on a must_not (presence-only) leaf: negated=t AND boost=2.
+SELECT bm25_debug_query_flatten('qp_bm25',
+  bm25_boolean(
+    must     => ARRAY[bm25_term('body','x')],
+    must_not => ARRAY[bm25_boost(2.0, bm25_term('title','y'))]));
+      bm25_debug_query_flatten      
+------------------------------------
+ [0] boost=1 negated=f TERM(f1,"x")+
+ [1] boost=2 negated=t TERM(f0,"y")
+(1 row)
+
+-- nested boost multiplies (2.0 * 3.0 = 6), not just takes the innermost/outermost.
+SELECT bm25_debug_query_flatten('qp_bm25',
+  bm25_boost(2.0, bm25_boost(3.0, bm25_term('body','z'))));
+      bm25_debug_query_flatten      
+------------------------------------
+ [0] boost=6 negated=f TERM(f1,"z")
+(1 row)
+
+-- a "should" array renders too (must/must_not aren't the only groups exercised).
+SELECT bm25_debug_query_parse('qp_bm25',
+  bm25_boolean(should=>ARRAY[bm25_term('body','a'), bm25_wildcard('title','foo*')]));
+               bm25_debug_query_parse                
+-----------------------------------------------------
+ BOOLEAN(should=[TERM(f1,"a"), WILDCARD(f0,"foo*")])
+(1 row)
+
+-- boost.weight <= 0 -> ERROR at parse (path-independent, same reasoning as the
+-- wildcard min-prefix guard above): a boost of exactly 0 makes idf_f fold to
+-- 0, which the scorer/drain treat as "no match" and silently drop the doc
+-- even though its presence bit is set. Reject zero, negative, and nested.
+SELECT bm25_debug_query_parse('qp_bm25', bm25_boost(0.0, bm25_term('body','x')));
+ERROR:  bm25: "boost.weight" must be positive (got 0)
+SELECT bm25_debug_query_parse('qp_bm25', bm25_boost(-1.0, bm25_term('body','x')));
+ERROR:  bm25: "boost.weight" must be positive (got -1)
+SELECT bm25_debug_query_parse('qp_bm25',
+  bm25_boost(2.0, bm25_boost(0.0, bm25_term('body','x'))));
+ERROR:  bm25: "boost.weight" must be positive (got 0)
+-- phrase.slop < 0 -> ERROR at parse (path-independent, same reasoning as the
+-- boost<=0 guard above): a negative slop threads an impossible max-gap span
+-- into the M4 positional recheck, which pre-fix parsed clean and silently
+-- matched NOTHING rather than erroring -- reject at parse so every path
+-- (debug SRF, @@@, &@@) errors identically instead of one going quiet.
+SELECT bm25_debug_query_parse('qp_bm25', bm25_phrase('body','tort battery',-1,true));
+ERROR:  bm25: "phrase.slop" must be non-negative (got -1)
+DROP TABLE qp;
+-- bm25_glob_match unit checks (the matcher a later M6 task's wildcard
+-- expansion calls): prefix, embedded, multi-star, and negative cases.
+SELECT bm25_debug_glob_match('judg*', 'judgment')  AS prefix_hit;
+ prefix_hit 
+------------
+ t
+(1 row)
+
+SELECT bm25_debug_glob_match('judg*', 'judo')       AS prefix_miss;
+ prefix_miss 
+-------------
+ f
+(1 row)
+
+SELECT bm25_debug_glob_match('wom*n', 'woman')      AS embedded_hit;
+ embedded_hit 
+--------------
+ t
+(1 row)
+
+SELECT bm25_debug_glob_match('wom*n', 'wombat')     AS embedded_miss;
+ embedded_miss 
+---------------
+ f
+(1 row)
+
+SELECT bm25_debug_glob_match('a*b*c', 'aXbXXc')     AS multi_star_hit;
+ multi_star_hit 
+----------------
+ t
+(1 row)
+
+SELECT bm25_debug_glob_match('a*b*c', 'aXbXXd')     AS multi_star_miss;
+ multi_star_miss 
+-----------------
+ f
+(1 row)
+
+-- M6 Task 5 (C-EVAL): query-time boost weighting. The scorer already applies
+-- leaf->boost (bm25_stats.c: idf_f[f] = w->boost * bm25_idf(...), landed with
+-- the Task 4 evaluator) -- this is a proof, not new scoring code. The
+-- discriminating shape: the SAME should=[title-clause, body-clause] query,
+-- with a 10x boost moved from one clause to the other, must FLIP the doc
+-- order. If boost were a no-op, both orderings would come out identical (TID
+-- tie-break) and this test would fail.
+--
+-- No ", id" tie-break here (unlike other ranking checks in this suite): when
+-- this test was written, adding a secondary ORDER BY key to a BOOLEAN/jsonb
+-- tree put an Incremental Sort on top of the Index Scan, and every row tied.
+-- The mechanism is NOT that the Sort re-derived a key it could have reused --
+-- that attribution was itself corrected (ADR 0005). &@@ is projected per row as
+-- a resjunk column on the Index Scan's OWN target list whenever anything forces
+-- the value to be materialized, and it then returned a constant +infinity, so
+-- the Sort saw every row tie and fell back to id order.
+--
+-- The mechanism this comment used to name is no longer the code. It said
+-- bm25_distance_jsonb returns a constant +infinity by design and is meant to be
+-- reachable ONLY on a fallback seqscan/plain-Sort plan. That WAS the original
+-- body, but since #138 the function resolves through the shared
+-- bm25_distance_for_query and returns the stashed distance of the row the
+-- OWNING scan most recently emitted; it degrades to +infinity only off the
+-- index, or when no live scan ranked the projected query. See its header in
+-- bm25_handler.c, bm25_distance's header in bm25_score.c, and
+-- sql/87_distance_scan_identity, which pins the resolver.
+--
+-- The bare single-key ORDER BY below is kept regardless: it is this suite's
+-- standing shape for a ranked SEQUENCE assertion, because it goes straight from
+-- Index Scan to Limit and so does not depend on which nodes the planner
+-- interposes.
+CREATE TABLE bo (id int, title text, body text);
+INSERT INTO bo VALUES (1,'tort','filler'), (2,'filler','tort');  -- doc1: title hit; doc2: body hit
+CREATE INDEX bo_bm25 ON bo USING bm25_native (title, body);
+SELECT bm25_seal('bo_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SET enable_seqscan=off;
+-- Boost the TITLE clause 10x -> doc 1's title hit must outrank doc 2's body hit.
+SELECT array_agg(id) FROM (
+  SELECT id FROM bo
+   WHERE title @@@ bm25_boolean(should=>ARRAY[bm25_boost(10.0,bm25_term('title','tort')), bm25_term('body','tort')])
+   ORDER BY title &@@ bm25_boolean(should=>ARRAY[bm25_boost(10.0,bm25_term('title','tort')), bm25_term('body','tort')]) LIMIT 2) s;
+ array_agg 
+-----------
+ {1,2}
+(1 row)
+
+-- expect {1,2}
+-- Move the SAME 10x boost onto the BODY clause instead -> the order must flip.
+SELECT array_agg(id) FROM (
+  SELECT id FROM bo
+   WHERE title @@@ bm25_boolean(should=>ARRAY[bm25_term('title','tort'), bm25_boost(10.0,bm25_term('body','tort'))])
+   ORDER BY title &@@ bm25_boolean(should=>ARRAY[bm25_term('title','tort'), bm25_boost(10.0,bm25_term('body','tort'))]) LIMIT 2) s;
+ array_agg 
+-----------
+ {2,1}
+(1 row)
+
+-- expect {2,1}
+-- Nested boost sanity: 2.0 * 5.0 folds to 10 at flatten time (same factor as above).
+SELECT bm25_debug_query_flatten('bo_bm25',
+  bm25_boost(2.0, bm25_boost(5.0, bm25_term('title','tort'))));
+        bm25_debug_query_flatten        
+----------------------------------------
+ [0] boost=10 negated=f TERM(f0,"tort")
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE bo;
+-- ===========================================================================
+-- M6 Task 9 Part B (1): bound-parameter plan-reuse CRASH REGRESSION LOCK --
+-- the single most important test in M6. Task 8 fixed a NULL-deref crash: a
+-- multi-leaf jsonb tree leaves so->qterm NULL and never sets so->qtermlen, but
+-- bm25_rescan wasn't resetting qtermlen to 0 on entry -- so a STALE nonzero
+-- length carried over from a PRIOR rescan (bound to a single-leaf/text query,
+-- which DOES set qtermlen) survived into the CURRENT rescan's multi-leaf
+-- branch, and bm25_analyze(NULL, stale_len>0) NULL-dereffed. This requires
+-- MULTIPLE bm25_rescan calls on the SAME BM25ScanOpaqueData with alternating
+-- single-leaf/multi-leaf jsonb -- two shapes that both hit it:
+--  (a) a PREPARE/EXECUTE plan forced generic (plan_cache_mode=force_generic_plan,
+--      so every EXECUTE binds a fresh $1 through the identical cached plan
+--      rather than possibly replanning) across >=6 executions, both orders;
+--  (b) a CORRELATED SUBQUERY (a SubPlan whose inner Index Scan is driven by an
+--      outer Var, i.e. genuinely rescanned once per outer row) -- the reviewer's
+--      actual crash repro shape.
+-- Both must NOT crash and must return the CORRECT count every time.
+-- ===========================================================================
+CREATE TABLE bp (id int, body text);
+INSERT INTO bp VALUES (1,'quick brown fox'), (2,'quick brown dog'), (3,'lazy fox only');
+CREATE INDEX bp_bm25 ON bp USING bm25_native (body);
+SELECT bm25_seal('bp_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SET enable_seqscan = off;
+SET plan_cache_mode = force_generic_plan;
+-- single-leaf term('quick') -> {1,2} = 2; multi-leaf boolean(quick AND NOT fox)
+-- -> {2} = 1. Alternate both orders across 6 EXECUTEs on ONE cached plan.
+PREPARE bp_plan(jsonb) AS SELECT count(*) FROM bp WHERE body @@@ $1;
+EXECUTE bp_plan(bm25_term('body','quick'));                                                                       -- expect 2
+ count 
+-------
+     2
+(1 row)
+
+EXECUTE bp_plan(bm25_boolean(must=>ARRAY[bm25_term('body','quick')], must_not=>ARRAY[bm25_term('body','fox')]));  -- expect 1
+ count 
+-------
+     1
+(1 row)
+
+EXECUTE bp_plan(bm25_term('body','quick'));                                                                       -- expect 2
+ count 
+-------
+     2
+(1 row)
+
+EXECUTE bp_plan(bm25_boolean(must=>ARRAY[bm25_term('body','quick')], must_not=>ARRAY[bm25_term('body','fox')]));  -- expect 1
+ count 
+-------
+     1
+(1 row)
+
+EXECUTE bp_plan(bm25_boolean(must=>ARRAY[bm25_term('body','quick')], must_not=>ARRAY[bm25_term('body','fox')]));  -- expect 1 (multi-leaf twice in a row)
+ count 
+-------
+     1
+(1 row)
+
+EXECUTE bp_plan(bm25_term('body','quick'));                                                                       -- expect 2
+ count 
+-------
+     2
+(1 row)
+
+DEALLOCATE bp_plan;
+RESET plan_cache_mode;
+-- (b) correlated subquery: ONE inner index scan node, rescanned once per outer
+-- row via a nested-loop SubPlan, parameter bound through a correlated Var (not
+-- a prepared-statement Param) -- the reviewer's actual crash repro shape.
+-- (The SubPlan / inner-Index-Scan plan shape was confirmed at authoring time; an
+-- EXPLAIN is intentionally NOT pinned here because PG 18's "Disabled:" disabled-node
+-- annotation under enable_seqscan=off is version-specific and breaks the 16/17/18
+-- cross-version suite. The value of this case is that it RUNS the crash-prone
+-- correlated-rescan shape and returns the correct counts without crashing.)
+CREATE TABLE bp_params (ord int, q jsonb);
+INSERT INTO bp_params VALUES
+  (1, bm25_term('body','quick')),
+  (2, bm25_boolean(must=>ARRAY[bm25_term('body','quick')], must_not=>ARRAY[bm25_term('body','fox')])),
+  (3, bm25_term('body','quick')),
+  (4, bm25_boolean(must=>ARRAY[bm25_term('body','quick')], must_not=>ARRAY[bm25_term('body','fox')])),
+  (5, bm25_boolean(must=>ARRAY[bm25_term('body','quick')], must_not=>ARRAY[bm25_term('body','fox')])),
+  (6, bm25_term('body','quick'));
+SELECT p.ord, (SELECT count(*) FROM bp WHERE body @@@ p.q) AS n
+FROM bp_params p ORDER BY p.ord;   -- expect (1,2)(2,1)(3,2)(4,1)(5,1)(6,2), no crash
+ ord | n 
+-----+---
+   1 | 2
+   2 | 1
+   3 | 2
+   4 | 1
+   5 | 1
+   6 | 2
+(6 rows)
+
+DROP TABLE bp_params;
+RESET enable_seqscan;
+DROP TABLE bp;
+-- ===========================================================================
+-- M6 Task 9 Part B (2): DSL-injection safety -- jsonb values are DATA, never
+-- operators; there is no text round-trip to inject into. Discriminator:
+-- term('judg*') must NOT wildcard-expand -- the builder's value is just text
+-- run through the SAME analyzer as any indexed field, so '*' is a non-alnum
+-- delimiter the tokenizer strips, leaving the literal word 'judg'. Verified via
+-- bm25_debug_tokenize: 'judge' stems to 'judg' too (matching doc 1 only), while
+-- 'judgment'/'judgement' stem to themselves (NOT 'judg') and 'judo' is unrelated
+-- -- so term('body','judg*') matches EXACTLY {1}, a proper subset of
+-- wildcard('body','judg*')'s real prefix expansion {1,2,3}.
+-- ===========================================================================
+CREATE TABLE dsl (id int, body text);
+INSERT INTO dsl VALUES (1,'judge'),(2,'judgment'),(3,'judgement'),(4,'judo'),(5,'b standalone term');
+CREATE INDEX dsl_bm25 ON dsl USING bm25_native (body);
+SELECT bm25_seal('dsl_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SET enable_seqscan = off;
+SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM dsl WHERE body @@@ bm25_term('body','judg*') ORDER BY body &@@ bm25_term('body','judg*'), id) s;       -- expect {1}
+ array_agg 
+-----------
+ {1}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM dsl WHERE body @@@ bm25_wildcard('body','judg*') ORDER BY body &@@ bm25_wildcard('body','judg*'), id) s; -- expect {1,2,3}
+ array_agg 
+-----------
+ {1,2,3}
+(1 row)
+
+SELECT (SELECT count(*) FROM dsl WHERE body @@@ bm25_term('body','judg*'))
+     < (SELECT count(*) FROM dsl WHERE body @@@ bm25_wildcard('body','judg*'))
+  AS term_strict_subset_of_wildcard;   -- expect t: term is a PROPER subset of wildcard, never equal/superset
+ term_strict_subset_of_wildcard 
+--------------------------------
+ t
+(1 row)
+
+-- 'AND'/'(a OR b)' are analyzed as plain text, never parsed as boolean
+-- operators. bm25_debug_tokenize('AND') = {} (a stopword -> term('body','AND')
+-- matches NOTHING, not "match everything" a DSL-parsing bug might produce, and
+-- not a syntax error). bm25_debug_tokenize('(a OR b)') = {b} ('a'/'OR' are
+-- stopwords, '(' ')' are delimiters) -- term('body','(a OR b)') matches purely
+-- on the LITERAL token 'b', proven by a doc containing the literal word 'b'.
+SELECT count(*) = 0 AS and_matches_nothing FROM dsl WHERE body @@@ bm25_term('body','AND');   -- expect t
+ and_matches_nothing 
+---------------------
+ t
+(1 row)
+
+SELECT array_agg(id ORDER BY id) = ARRAY[5] AS aorb_matches_literal_b
+FROM ( SELECT id FROM dsl WHERE body @@@ bm25_term('body','(a OR b)')
+        ORDER BY body &@@ bm25_term('body','(a OR b)'), id ) s;   -- expect t
+ aorb_matches_literal_b 
+------------------------
+ t
+(1 row)
+
+DROP TABLE dsl;
+-- ===========================================================================
+-- M6 Task 9 Part B (3): backward-compat guard -- the (text,text) path is
+-- untouched by M6 (existing M0-M5 suites already pin it exhaustively; this is
+-- a light spot-check, not new coverage). A representative @@@ filter and a
+-- ranked &@@ query return the expected results with no behavior change.
+-- ===========================================================================
+CREATE TABLE bc (id int, body text);
+INSERT INTO bc VALUES (1,'alpha beta'),(2,'alpha only'),(3,'nothing here');
+CREATE INDEX bc_bm25 ON bc USING bm25_native (body);
+SELECT bm25_seal('bc_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT array_agg(id ORDER BY id) = ARRAY[1,2] AS text_filter_ok FROM bc WHERE body @@@ 'alpha';
+ text_filter_ok 
+----------------
+ t
+(1 row)
+
+SELECT array_agg(id ORDER BY id) = ARRAY[1,2] AS text_ranked_ok
+FROM ( SELECT id FROM bc WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha', id ) s;
+ text_ranked_ok 
+----------------
+ t
+(1 row)
+
+DROP TABLE bc;
+RESET enable_seqscan;
+DROP EXTENSION bm25_native;

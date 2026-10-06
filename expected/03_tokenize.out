@@ -1,0 +1,23 @@
+-- ASCII-era tokenizer cases, updated to the M3 english analyzer: "the" is a
+-- stopword (dropped); "quick"/"brown"/"fox" pass through (no inflection);
+-- whitespace/punctuation normalized; empty input -> empty array.
+CREATE EXTENSION bm25_native;
+SELECT bm25_debug_tokenize('The Quick, BROWN fox!');
+ bm25_debug_tokenize 
+---------------------
+ {quick,brown,fox}
+(1 row)
+
+SELECT bm25_debug_tokenize('  multiple   spaces  ');
+ bm25_debug_tokenize 
+---------------------
+ {multipl,space}
+(1 row)
+
+SELECT bm25_debug_tokenize('');
+ bm25_debug_tokenize 
+---------------------
+ {}
+(1 row)
+
+DROP EXTENSION bm25_native;

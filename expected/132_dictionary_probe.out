@@ -1,0 +1,175 @@
+-- 132_dictionary_probe: the analyzer fingerprint sees what the stemming dictionary
+-- DOES, not only which dictionary it is (#296, analyzer revision 6).
+--
+-- Components 1-6 of the fingerprint identify the dictionary by schema-qualified name
+-- and template (ADR 0080), plus language, stopword tag, tokenizer, revision and
+-- encoding. None of them moves when the dictionary's BEHAVIOUR changes under an
+-- unchanged name -- the PostgreSQL 17 -> 18 Snowball update (added: ad -> add) across a
+-- pg_upgrade, or an in-place ALTER TEXT SEARCH DICTIONARY. Component 7 hashes the
+-- dictionary's output over a fixed probe word list, so both now trip the gate.
+--
+-- A pg_upgrade cannot be staged inside one server, so this suite uses the in-place
+-- shape of the same defect: ALTER a dictionary's options (same OID, same name, same
+-- template) and check that the gate fires at the next statement of the SAME session.
+-- That also pins the probe cache's TSDICTOID invalidation: a cache that missed it
+-- would keep serving the pre-ALTER hash and the gate would stay silent.
+--
+-- The dictionary is the suite's own, created in pg_catalog (the only namespace a
+-- CREATE INDEX can resolve on PG17+; see sql/65_multilexeme_tokens), so the core
+-- english_stem is never modified and a failure here cannot leak into other suites.
+--
+-- Index-path proof without EXPLAIN: a seqscan-evaluated @@@ is not gated at all, so
+-- "the gate fired" can only be observed through the index path. A plan that fell back
+-- to a seqscan would make the post-fix assertions fail, not pass vacuously.
+CREATE EXTENSION bm25_native;
+-- Snowball English WITHOUT a stoplist: "the" is an ordinary term here.
+CREATE TEXT SEARCH DICTIONARY pg_catalog.bm25probe_stem (TEMPLATE = snowball, Language = english);
+CREATE TABLE dp_docs (id int PRIMARY KEY, body text);
+INSERT INTO dp_docs VALUES (1, 'the quick fox'), (2, 'running dogs'), (3, 'the end');
+CREATE INDEX dp_bm ON dp_docs USING bm25_native (body) WITH (language = 'bm25probe');
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Baseline: stored and recomputed fingerprints agree, and the index answers.
+SELECT (bm25_stats('dp_bm')).analyzer_fingerprint AS stored_fp \gset
+SELECT bm25_debug_analyzer_fingerprint('dp_bm') = :stored_fp AS baseline_matches;
+ baseline_matches 
+------------------
+ t
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS baseline_the FROM dp_docs WHERE body @@@ 'the';
+ baseline_the 
+--------------
+ {1,3}
+(1 row)
+
+-- ---------------------------------------------------------------- Part 1
+-- Add a stoplist in place. Same OID, same name, same template: components 1-6 are
+-- byte-identical, so before #296 the fingerprint did not move. "the" is a probe word
+-- and is now dropped by the dictionary, so the probe hash -- and the fingerprint --
+-- must move, in this session, with no reconnect.
+SELECT oid AS dict_oid FROM pg_ts_dict WHERE dictname = 'bm25probe_stem' \gset
+ALTER TEXT SEARCH DICTIONARY pg_catalog.bm25probe_stem (StopWords = english);
+SELECT oid = :dict_oid AS same_dictionary_oid FROM pg_ts_dict WHERE dictname = 'bm25probe_stem';
+ same_dictionary_oid 
+---------------------
+ t
+(1 row)
+
+SELECT bm25_debug_analyzer_fingerprint('dp_bm') <> :stored_fp AS stoplist_change_moves_fingerprint;
+ stoplist_change_moves_fingerprint 
+-----------------------------------
+ t
+(1 row)
+
+-- The scan-start gate refuses (require_analyzer_match defaults to true). Against the
+-- pre-fix build the query runs and returns {1,3} with no error, and the block falls
+-- through to its own RAISE.
+DO $$
+BEGIN
+  PERFORM id FROM dp_docs WHERE body @@@ 'quick';
+  RAISE EXCEPTION 'scan gate did NOT fire after ALTER TEXT SEARCH DICTIONARY (unexpected)';
+EXCEPTION
+  WHEN feature_not_supported THEN
+    IF SQLERRM NOT LIKE 'bm25: analyzer fingerprint mismatch (query %' THEN
+      RAISE EXCEPTION 'wrong feature_not_supported: %', SQLERRM;
+    END IF;
+    RAISE NOTICE 'scan gate fired after the stoplist change, as expected';
+END $$;
+NOTICE:  scan gate fired after the stoplist change, as expected
+-- The ingest gate refuses too: a row analyzed under the altered dictionary would be
+-- stored next to terms written under the old one.
+DO $$
+BEGIN
+  INSERT INTO dp_docs VALUES (4, 'the slow fox');
+  RAISE EXCEPTION 'ingest gate did NOT fire after ALTER TEXT SEARCH DICTIONARY (unexpected)';
+EXCEPTION
+  WHEN feature_not_supported THEN
+    IF SQLERRM NOT LIKE 'bm25: analyzer fingerprint mismatch on insert%' THEN
+      RAISE EXCEPTION 'wrong feature_not_supported: %', SQLERRM;
+    END IF;
+    RAISE NOTICE 'ingest gate fired after the stoplist change, as expected';
+END $$;
+NOTICE:  ingest gate fired after the stoplist change, as expected
+-- require_analyzer_match = false downgrades the refusal to a WARNING and proceeds.
+-- client_min_messages = error hides the WARNING (its line carries the
+-- encoding-dependent fingerprint integers); the rows coming back are the assertion.
+ALTER INDEX dp_bm SET (require_analyzer_match = false);
+SET client_min_messages = error;
+SELECT array_agg(id ORDER BY id) AS relaxed_quick FROM dp_docs WHERE body @@@ 'quick';
+ relaxed_quick 
+---------------
+ {1}
+(1 row)
+
+RESET client_min_messages;
+ALTER INDEX dp_bm RESET (require_analyzer_match);
+-- Removing the stoplist again restores the original behaviour, and with it the
+-- original fingerprint exactly: the probe hashes output, so it is reversible, not
+-- merely sensitive. The index is usable again without a REINDEX.
+ALTER TEXT SEARCH DICTIONARY pg_catalog.bm25probe_stem (StopWords);
+SELECT bm25_debug_analyzer_fingerprint('dp_bm') = :stored_fp AS fingerprint_restored;
+ fingerprint_restored 
+----------------------
+ t
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS restored_the FROM dp_docs WHERE body @@@ 'the';
+ restored_the 
+--------------
+ {1,3}
+(1 row)
+
+-- ---------------------------------------------------------------- Part 2
+-- A STEMMER change rather than a stoplist change -- the shape of the 17 -> 18 Snowball
+-- update. Switching the template's language keeps the name, OID and template, and
+-- changes what the probe words stem to.
+ALTER TEXT SEARCH DICTIONARY pg_catalog.bm25probe_stem (Language = german);
+SELECT bm25_debug_analyzer_fingerprint('dp_bm') <> :stored_fp AS stemmer_change_moves_fingerprint;
+ stemmer_change_moves_fingerprint 
+----------------------------------
+ t
+(1 row)
+
+DO $$
+BEGIN
+  PERFORM id FROM dp_docs WHERE body @@@ 'quick';
+  RAISE EXCEPTION 'scan gate did NOT fire after a stemmer change (unexpected)';
+EXCEPTION
+  WHEN feature_not_supported THEN
+    RAISE NOTICE 'scan gate fired after the stemmer change, as expected';
+END $$;
+NOTICE:  scan gate fired after the stemmer change, as expected
+-- REINDEX is the cure: it restamps from the dictionary as it now is.
+REINDEX INDEX dp_bm;
+SELECT bm25_debug_analyzer_fingerprint('dp_bm') = (bm25_stats('dp_bm')).analyzer_fingerprint
+  AS reindex_restamps;
+ reindex_restamps 
+------------------
+ t
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS after_reindex_quick FROM dp_docs WHERE body @@@ 'quick';
+ after_reindex_quick 
+---------------------
+ {1}
+(1 row)
+
+-- ---------------------------------------------------------------- Part 3
+-- Differentiation, as a regression guard (this already held before #296: language
+-- and dictionary name differ). Integers are never pinned -- component 6 is the
+-- database encoding.
+CREATE INDEX dp_en ON dp_docs USING bm25_native (body) WITH (language = 'english');
+CREATE INDEX dp_de ON dp_docs USING bm25_native (body) WITH (language = 'german');
+SELECT bm25_debug_analyzer_fingerprint('dp_en') <> bm25_debug_analyzer_fingerprint('dp_de')
+  AS english_german_differ;
+ english_german_differ 
+-----------------------
+ t
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE dp_docs;
+DROP TEXT SEARCH DICTIONARY pg_catalog.bm25probe_stem;
+DROP EXTENSION bm25_native;

@@ -1,0 +1,234 @@
+-- H16 (issue #55): bm25_seg_doclen_field, bm25_seg_doc_is_live and
+-- bm25_seg_docid_to_tid each re-walked their page chain FROM THE ROOT on every call,
+-- and all three are called PER SCORED POSTING (seg_posting_cb) plus per doc per field
+-- in the merge replay. A 1M-doc single-field segment has a ~490-page NORMS chain, so a
+-- term with df = 500k cost ~1.2e8 ReadBuffer + LWLock pairs for that one term, growing
+-- quadratically with segment size. bm25_seg_doclen multiplied it by field_count for
+-- cells the writer laid out contiguously.
+--
+-- Fixed by BM25SegReader: one forward cursor per chain, resuming each lookup from the
+-- page the previous one landed on. Every hot caller walks docids forward (D-ACCUM's
+-- ascending-(docid,field_id) posting order, the merge's `for d in 0..ndocs`, WAND's
+-- forward-only skipping), so ascending access becomes O(1) amortized.
+--
+-- Measured, this machine (Apple silicon, PG 18.3), 100k-doc single-field segment,
+-- df = 100k, exhaustive scorer (wand_top_k = 0), warm cache:
+--      ranked query      ~500 ms  ->  ~49 ms
+--      4x25k-doc merge    253 ms  ->  154 ms   (chains are only ~13 pages at that size;
+--                                               the merge gain grows with segment size)
+--
+-- WHAT THIS SUITE PINS. The timing is not assertable in pg_regress, and a cursor cannot
+-- change an answer by design (it supplies only a starting point, the walk restarts from
+-- the root on a backward jump, and every page actually read is still seg_gen-validated).
+-- So what matters here is the failure mode if that reasoning is ever wrong: reading the
+-- WRONG CELL of a dense per-docid array is silent, and it surfaces as a wrong doclen ->
+-- wrong score -> wrong ranked set, or a wrong liveness bit -> a deleted row coming back.
+-- Both are asserted below, deliberately over chains that SPAN PAGES, because a
+-- single-page chain never advances the cursor and would pass no matter what.
+CREATE EXTENSION bm25_native;
+
+-- Wait until no other backend in this database holds a snapshot, so the VACUUM
+-- below can actually tombstone. VACUUM only hands a TID to bulkdelete if the dead
+-- tuple is REMOVABLE; under an older snapshot it is merely "recently dead" and the
+-- LIVEDOCS assertions read the pre-delete state. See
+-- docs/adr/0031-vacuum-tests-wait-for-xmin-horizon.md for the full rationale --
+-- including why pg_stat_clear_snapshot() below is load-bearing.
+CREATE FUNCTION pg_temp.wait_for_xmin_horizon() RETURNS void AS $$
+DECLARE
+  deadline timestamptz := clock_timestamp() + interval '30 seconds';
+BEGIN
+  LOOP
+    PERFORM pg_stat_clear_snapshot();
+    EXIT WHEN NOT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND backend_xmin IS NOT NULL);
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION
+        'xmin horizon still held by another backend after 30s; VACUUM cannot reclaim';
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+-- ---------------------------------------------------------------- NORMS across pages
+-- Single-field NORMS is 4 bytes per doc, so a ~8100-byte content area holds ~2025 docs
+-- and 6000 docs span 3+ pages. Every doc gets the query term exactly once (tf = 1 for
+-- all), so the BM25 score is a pure function of the doc's LENGTH -- which is read from
+-- exactly the NORMS cell this fix changed how we find. Five docs get a length of 1 and
+-- everything else 31; the five are placed to straddle the page boundaries (1 on the
+-- first page, 2000/2030 around the first, 4060 around the second, 5999 on the last).
+CREATE TABLE sc (id int, body text);
+INSERT INTO sc
+SELECT g, CASE WHEN g IN (1, 2000, 2030, 4060, 5999)
+               THEN 'database'
+               ELSE 'database ' || repeat('filler ', 30) END
+FROM generate_series(1, 6000) g;
+CREATE INDEX sc_idx ON sc USING bm25_native (body);
+SELECT bm25_seal('sc_idx');
+SET enable_seqscan = off;
+
+-- The five short docs are the only ones with doclen 1, so they are the unambiguous
+-- top 5 by score. A NORMS cell read at the wrong offset gives one of them the long
+-- doclen (or a long doc the short one) and this set changes.
+SELECT array_agg(id ORDER BY id) AS top5_shortest FROM (
+  SELECT id FROM sc WHERE body @@@ 'database' ORDER BY body &@@ 'database' LIMIT 5) s;
+
+-- Same set at every WAND setting: the exhaustive scorer and the WAND cursor read NORMS
+-- through separate reader instances, so this also pins that both cursors agree.
+SET bm25_native.wand_top_k = 0;
+SELECT array_agg(id ORDER BY id) AS top5_exhaustive FROM (
+  SELECT id FROM sc WHERE body @@@ 'database' ORDER BY body &@@ 'database' LIMIT 5) s;
+SET bm25_native.wand_top_k = 5;
+SELECT array_agg(id ORDER BY id) AS top5_wand_k5 FROM (
+  SELECT id FROM sc WHERE body @@@ 'database' ORDER BY body &@@ 'database' LIMIT 5) s;
+SET bm25_native.wand_top_k = 100;
+SELECT array_agg(id ORDER BY id) AS top5_wand_k100 FROM (
+  SELECT id FROM sc WHERE body @@@ 'database' ORDER BY body &@@ 'database' LIMIT 5) s;
+RESET bm25_native.wand_top_k;
+
+-- Every doc is still reachable, and the scores are identical whichever driver ran:
+-- the count is the whole df, so this walks the NORMS chain end to end.
+SELECT count(*) AS all_reachable FROM sc WHERE body @@@ 'database';
+SET bm25_native.wand_top_k = 0;
+SELECT round(bm25_score(ctid)::numeric, 6) AS score_short_exhaustive
+  FROM sc WHERE body @@@ 'database' ORDER BY body &@@ 'database' LIMIT 1;
+SET bm25_native.wand_top_k = 100;
+SELECT round(bm25_score(ctid)::numeric, 6) AS score_short_wand
+  FROM sc WHERE body @@@ 'database' ORDER BY body &@@ 'database' LIMIT 1;
+RESET bm25_native.wand_top_k;
+
+-- ---------------------------------------------------------------- DOCMAP across pages
+-- DOCMAP is 6 bytes per doc (~1350 per page), so 6000 docs span 5+ pages. A wrong cell
+-- returns another doc's TID, so the id the scan reports would not be the id whose body
+-- actually matches -- checked here by requiring the reported ids to match a term that
+-- only those rows carry.
+UPDATE sc SET body = body || ' uniquemarker' WHERE id IN (3, 1400, 2700, 4100, 5500);
+SELECT bm25_seal('sc_idx');
+SELECT array_agg(id ORDER BY id) AS docmap_spread FROM sc WHERE body @@@ 'uniquemarker';
+
+-- ---------------------------------------------------------------- LIVEDOCS
+-- Tombstones are read through the same cursor. Deleting a spread of docids and then
+-- rebuilding must drop exactly those rows: a wrong liveness BIT either resurrects a
+-- deleted row or hides a live one.
+DELETE FROM sc WHERE id IN (1, 2030, 4060);
+SELECT pg_temp.wait_for_xmin_horizon();
+VACUUM sc;
+-- LIMIT 2, not 5: only 2000 and 5999 still have doclen 1, and every remaining doc ties
+-- at doclen 31. Asking for 5 would pin an arbitrary tie-break among ~5993 equal-scoring
+-- docs -- an order that is free to change with segment layout or server version.
+SELECT array_agg(id ORDER BY id) AS top2_after_delete FROM (
+  SELECT id FROM sc WHERE body @@@ 'database' ORDER BY body &@@ 'database' LIMIT 2) s;
+SELECT count(*) AS live_after_delete FROM sc WHERE body @@@ 'database';
+-- The deleted ids are gone, and no undeleted id vanished with them.
+SELECT count(*) AS deleted_still_visible
+  FROM sc WHERE body @@@ 'database' AND id IN (1, 2030, 4060);
+SELECT count(*) AS survivors_visible
+  FROM sc WHERE body @@@ 'database' AND id IN (2000, 5999, 3, 1400, 2700, 4100, 5500);
+-- The one-shot (cursor-less) path is what the debug probes use; it must agree.
+SELECT bm25_debug_seg_doc_live('sc_idx', 0, 0)    AS live_docid_0;
+SELECT bm25_debug_seg_doc_live('sc_idx', 0, 2500) AS live_docid_2500;
+SELECT bm25_debug_seg_doc_live('sc_idx', 0, 5000) AS live_docid_5000;
+
+-- ---------------------------------------------------------------- merge replay
+-- The merge reads live/tid/doclen for every doc of every source segment -- the heaviest
+-- user of these chains. Four sealed segments merged into one must preserve the ranking,
+-- which it can only do if each source doc's per-field doclens were read correctly.
+CREATE TABLE scm (id int, body text);
+CREATE INDEX scm_idx ON scm USING bm25_native (body);
+DO $$ DECLARE k int; BEGIN
+  FOR k IN 1..4 LOOP
+    INSERT INTO scm
+    SELECT k*100000+g, CASE WHEN g = 1 THEN 'database'
+                            ELSE 'database ' || repeat('filler ', 30) END
+    FROM generate_series(1, 3000) g;
+    PERFORM bm25_seal('scm_idx');
+  END LOOP;
+END $$;
+SELECT array_agg(id ORDER BY id) AS top4_premerge FROM (
+  SELECT id FROM scm WHERE body @@@ 'database' ORDER BY body &@@ 'database' LIMIT 4) s;
+SELECT count(*) AS segs_before FROM bm25_debug_segcat('scm_idx');
+SELECT bm25_merge('scm_idx');
+SELECT count(*) AS segs_after FROM bm25_debug_segcat('scm_idx');
+-- Same four shortest docs, same total, after the replay read every doc through cursors.
+SELECT array_agg(id ORDER BY id) AS top4_postmerge FROM (
+  SELECT id FROM scm WHERE body @@@ 'database' ORDER BY body &@@ 'database' LIMIT 4) s;
+SELECT count(*) AS all_after_merge FROM scm WHERE body @@@ 'database';
+
+-- ---------------------------------------------------------------- multi-field row
+-- bm25_seg_doclen sums field_count CONTIGUOUS NORMS cells for one docid; it now reads
+-- the whole row with one local cursor instead of field_count root walks. With 3 fields
+-- the row is 12 bytes, so 6000 docs span 9+ pages. Per-field scoping proves the cells
+-- are not crossed: a wrong stride would attribute one field's length to another.
+CREATE TABLE scf (id int, a text, b text, c text);
+INSERT INTO scf
+SELECT g, 'alpha ' || repeat('x ', 5), 'beta ' || repeat('y ', 20),
+          CASE WHEN g IN (10, 3000, 5900) THEN 'gamma' ELSE 'gamma ' || repeat('z ', 40) END
+FROM generate_series(1, 6000) g;
+CREATE INDEX scf_idx ON scf USING bm25_native (a, b, c);
+SELECT bm25_seal('scf_idx');
+-- Field c's three short docs are the top 3 for a c-scoped query.
+SELECT array_agg(id ORDER BY id) AS top3_field_c FROM (
+  SELECT id FROM scf WHERE a @@@ 'c:gamma' ORDER BY a &@@ 'c:gamma' LIMIT 3) s;
+-- Field scoping still resolves per field across the multi-page chain.
+SELECT count(*) AS field_a_all FROM scf WHERE a @@@ 'a:alpha';
+SELECT count(*) AS field_b_all FROM scf WHERE a @@@ 'b:beta';
+SELECT count(*) AS field_c_all FROM scf WHERE a @@@ 'c:gamma';
+
+-- ------------------------------------------- cursor / chain identity (SEGREAD-14, #154)
+-- Everything above pins that the cursors produce the right answers for the callers
+-- that exist. This section pins the reason they do.
+--
+-- The resume test used to be blk/seen only: "is the cursor positioned, and is the
+-- target at or after its page". Both of those are quantities OF ONE CHAIN -- `seen` is
+-- a byte origin, `blk` a page of that chain -- so a cursor handed a second chain
+-- resumed at the first chain's page with the first chain's origin. The header comments
+-- claimed a cursor "cannot affect the answer" and "correctness does not depend on the
+-- reader matching the segment", and both were true, but only because every caller
+-- re-inits per segment and keeps one cursor per chain. They were statements about the
+-- call sites, not about the code, and nothing tested them.
+--
+-- bm25_debug_chain_cursor_crosstalk does the thing no caller does: it positions one
+-- cursor on the NORMS chain and then reads DOCMAP through it. NORMS cells are 4 bytes
+-- against DOCMAP's 6, so the NORMS origin is always <= the DOCMAP offset for the same
+-- doc-id and the old test resumed for EVERY doc-id, including 0 -- there is no lucky
+-- value here. With the chain-root test in place the cursor is ignored, the walk starts
+-- at docmap_root, and the TID that comes back is the row's real ctid; without it the
+-- read lands in the NORMS chain.
+--
+-- Compared against ctid from the heap, not against a second call of the same reader:
+-- two readings of the same bytes agree whether or not the bytes are right.
+CREATE TABLE cx (id int, body text);
+INSERT INTO cx SELECT g, 'database ' || repeat('filler ', 30)
+  FROM generate_series(1, 6000) g;
+CREATE INDEX cx_idx ON cx USING bm25_native (body);
+SELECT bm25_seal('cx_idx');
+
+-- local docid 0 is the first row indexed, and the build walks the heap in ctid order,
+-- so docid d maps to the (d+1)'th row by ctid. Three doc-ids: the first (cursor on the
+-- NORMS root page, seen = 0 -- the case a "cursor not yet advanced" argument would
+-- wrongly think safe), and two that land on later NORMS pages, where the resumed
+-- origin is a nonzero byte count belonging to the wrong chain.
+SELECT bm25_debug_chain_cursor_crosstalk('cx_idx', 0, 0) =
+       (SELECT ctid FROM cx ORDER BY ctid LIMIT 1 OFFSET 0) AS crosstalk_docid_0;
+SELECT bm25_debug_chain_cursor_crosstalk('cx_idx', 0, 3000) =
+       (SELECT ctid FROM cx ORDER BY ctid LIMIT 1 OFFSET 3000) AS crosstalk_docid_3000;
+SELECT bm25_debug_chain_cursor_crosstalk('cx_idx', 0, 5999) =
+       (SELECT ctid FROM cx ORDER BY ctid LIMIT 1 OFFSET 5999) AS crosstalk_docid_5999;
+
+-- The probe range-checks its doc-id like every other segment probe (#149).
+\set VERBOSITY terse
+SELECT bm25_debug_chain_cursor_crosstalk('cx_idx', 0, 6000);
+SELECT bm25_debug_chain_cursor_crosstalk('cx_idx', 0, -1);
+SELECT bm25_debug_chain_cursor_crosstalk('cx_idx', 4, 0);
+\set VERBOSITY default
+
+DROP TABLE cx;
+
+RESET enable_seqscan;
+DROP TABLE scf;
+DROP TABLE scm;
+DROP TABLE sc;
+DROP EXTENSION bm25_native;

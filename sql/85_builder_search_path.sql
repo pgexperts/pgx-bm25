@@ -1,0 +1,167 @@
+-- 85_builder_search_path: the six M6 jsonb query builders must resolve their
+-- own pg_catalog calls regardless of the CALLER's search_path (M1 #58.1,
+-- ADR 0051).
+--
+-- Why this needs its own suite. The builders are LANGUAGE sql with STRING
+-- bodies, so the body is re-parsed at CALL time under whatever search_path the
+-- caller happens to have -- the CVE-2018-1058 pattern. Every other builder
+-- suite (48_m6_builders, 46_m6_boolean, 47_m6_wildcard, 49_m6_acceptance)
+-- calls them under pg_regress's DEFAULT path, where the hijack is invisible
+-- and the pre-fix code is indistinguishable from the fixed code. Nothing in
+-- the tree could have caught this defect, or would catch the qualification
+-- being stripped back out.
+--
+-- The load-bearing part of the design is the CANARIES in Part 3: unqualified
+-- twins of three builder bodies, created here in the suite. They must come back
+-- HIJACKED. Without them a "builders still return the right tree" assertion
+-- would also pass if the shadow functions were never eligible in the first
+-- place -- i.e. the suite would be green for the wrong reason and would keep
+-- being green after someone deleted every pg_catalog. prefix.
+--
+-- The third canary was added with #148 SQL-01 after exactly that near-miss: the
+-- bm25_boost body's inner argument moved from float8 to numeric, the shadow shaped
+-- for the old signature stopped matching, and the suite stayed green while covering
+-- one less thing. A shadow's signature is part of the assertion, not scenery.
+CREATE EXTENSION bm25_native;
+
+-- ---------------------------------------------------------------- Part 1
+-- Baseline: canonical trees under an ordinary search_path. Part 3 re-runs
+-- these verbatim under a hostile one; the two results must be identical.
+SELECT bm25_match_terms('body','tort battery') = '{"match":{"field":"body","terms":"tort battery"}}'::jsonb AS m;
+SELECT bm25_term('body','tort')      = '{"term":{"field":"body","value":"tort"}}'::jsonb AS t;
+SELECT bm25_wildcard('body','judg*') = '{"wildcard":{"field":"body","pattern":"judg*"}}'::jsonb AS w;
+SELECT bm25_phrase('body','res ipsa',1,false)
+       = '{"phrase":{"field":"body","phrase":"res ipsa","slop":1,"ordered":false}}'::jsonb AS p;
+SELECT bm25_boost(2.0, bm25_term('title','tort'))
+       = '{"boost":{"weight":2.0,"query":{"term":{"field":"title","value":"tort"}}}}'::jsonb AS b;
+SELECT bm25_boolean(must => ARRAY[bm25_term('body','tort')])
+       = '{"boolean":{"must":[{"term":{"field":"body","value":"tort"}}],"should":[],"must_not":[]}}'::jsonb AS bl;
+
+-- ---------------------------------------------------------------- Part 2
+-- Static pin, independent of the shadow shapes below: EVERY jsonb_build_object
+-- and to_jsonb reference in a builder body is pg_catalog-qualified. Counting
+-- (occurrences of the bare name) against (occurrences of the qualified name)
+-- catches a stripped prefix AND a NEWLY ADDED builder that forgot one -- the
+-- behavioral test in Part 3 can only see the argument shapes it happens to
+-- shadow, so it would silently miss a seventh builder.
+SELECT p.proname,
+       (length(p.prosrc) - length(replace(p.prosrc, 'jsonb_build_object', ''))) / length('jsonb_build_object')
+         = (length(p.prosrc) - length(replace(p.prosrc, 'pg_catalog.jsonb_build_object', ''))) / length('pg_catalog.jsonb_build_object')
+         AS jsonb_build_object_all_qualified,
+       (length(p.prosrc) - length(replace(p.prosrc, 'to_jsonb', ''))) / length('to_jsonb')
+         = (length(p.prosrc) - length(replace(p.prosrc, 'pg_catalog.to_jsonb', ''))) / length('pg_catalog.to_jsonb')
+         AS to_jsonb_all_qualified
+FROM pg_proc p
+WHERE p.proname IN ('bm25_match_terms','bm25_term','bm25_phrase',
+                    'bm25_wildcard','bm25_boolean','bm25_boost')
+  AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'sql')
+ORDER BY p.proname;
+
+-- ---------------------------------------------------------------- Part 3
+-- Hostile search_path.
+--
+-- One shadow per argument shape the builder bodies actually call. Note these
+-- are NOT variadic: that is the point. pg_catalog is searched implicitly first
+-- only as a tiebreak among candidates with IDENTICAL argument-type lists
+-- (FuncnameGetCandidates); once the type lists differ, func_select_candidate
+-- ranks by COUNT OF EXACT INPUT-TYPE MATCHES, and a concrete signature beats
+-- pg_catalog.jsonb_build_object(VARIADIC "any")'s zero exact matches outright,
+-- whatever the schema order. So `SET search_path = public, shadow` -- shadow
+-- LAST -- would not save an unqualified body either.
+CREATE SCHEMA shadow;
+-- outer call of all six builders: (text, jsonb)
+CREATE FUNCTION shadow.jsonb_build_object(text, jsonb) RETURNS jsonb
+  LANGUAGE sql IMMUTABLE AS $$ SELECT '{"HIJACKED":"outer"}'::jsonb $$;
+-- inner call of bm25_match_terms / bm25_term / bm25_wildcard: (text,text,text,text)
+CREATE FUNCTION shadow.jsonb_build_object(text, text, text, text) RETURNS jsonb
+  LANGUAGE sql IMMUTABLE AS $$ SELECT '{"HIJACKED":"inner4"}'::jsonb $$;
+-- inner call of bm25_phrase
+CREATE FUNCTION shadow.jsonb_build_object(text, text, text, text, text, int, text, boolean) RETURNS jsonb
+  LANGUAGE sql IMMUTABLE AS $$ SELECT '{"HIJACKED":"phrase"}'::jsonb $$;
+-- inner call of bm25_boost. NOTE the numeric, not float8: #148 SQL-01 changed the
+-- body to render the weight as `weight::pg_catalog.numeric` so the result stops
+-- depending on extra_float_digits, which moved this call's argument types. A shadow
+-- whose type list no longer matches is not a weaker test, it is NO test -- the
+-- builder would come back un-hijacked whether or not the qualification was there --
+-- so this signature has to track the body.
+CREATE FUNCTION shadow.jsonb_build_object(text, numeric, text, jsonb) RETURNS jsonb
+  LANGUAGE sql IMMUTABLE AS $$ SELECT '{"HIJACKED":"boost"}'::jsonb $$;
+-- inner call of bm25_boolean
+CREATE FUNCTION shadow.jsonb_build_object(text, jsonb, text, jsonb, text, jsonb) RETURNS jsonb
+  LANGUAGE sql IMMUTABLE AS $$ SELECT '{"HIJACKED":"boolean"}'::jsonb $$;
+-- bm25_boolean's array wrapper
+CREATE FUNCTION shadow.to_jsonb(jsonb[]) RETURNS jsonb
+  LANGUAGE sql IMMUTABLE AS $$ SELECT '{"HIJACKED":"to_jsonb"}'::jsonb $$;
+
+-- The canaries. Same bodies as bm25_term / bm25_boolean's array wrapper, minus
+-- the qualification. Created under the CLEAN path -- check_function_bodies
+-- validates them against pg_catalog here and they are accepted -- which is
+-- itself the demonstration that creation-time validation says nothing about
+-- what a string body will resolve to at CALL time.
+CREATE FUNCTION public.canary_build_object(field text, value text) RETURNS jsonb
+  LANGUAGE sql IMMUTABLE STRICT
+  AS $$ SELECT jsonb_build_object('term', jsonb_build_object('field', field, 'value', value)) $$;
+CREATE FUNCTION public.canary_to_jsonb(a jsonb[]) RETURNS jsonb
+  LANGUAGE sql IMMUTABLE STRICT
+  AS $$ SELECT to_jsonb(coalesce(a, '{}')) $$;
+-- A third canary, for the boost shadow specifically (#148 SQL-01). Its OUTER call
+-- is qualified and its INNER one is not, so it witnesses that the
+-- (text,numeric,text,jsonb) shadow above is eligible -- which is the thing that
+-- silently stopped being true when the body's second argument moved from float8 to
+-- numeric. Without it, "bm25_boost is not hijacked" would be satisfied by a shadow
+-- that simply no longer matches anything.
+CREATE FUNCTION public.canary_boost(weight float8, query jsonb) RETURNS jsonb
+  LANGUAGE sql IMMUTABLE STRICT
+  AS $$ SELECT pg_catalog.jsonb_build_object('boost', jsonb_build_object('weight', weight::pg_catalog.numeric, 'query', query)) $$;
+
+SET search_path = shadow, public, pg_catalog;
+
+-- Canaries first: if either of these comes back NOT hijacked, the shadows are
+-- not eligible and every assertion below is vacuous. Expect t.
+SELECT canary_build_object('body','tort') = '{"HIJACKED":"outer"}'::jsonb AS canary_build_object_is_hijacked;
+SELECT canary_to_jsonb(ARRAY['{"a":1}'::jsonb])  = '{"HIJACKED":"to_jsonb"}'::jsonb AS canary_to_jsonb_is_hijacked;
+SELECT canary_boost(2.0, '{"a":1}'::jsonb) = '{"boost":{"HIJACKED":"boost"}}'::jsonb AS canary_boost_is_hijacked;
+
+-- The builders, byte-for-byte as Part 1. Expect t on every row.
+SELECT bm25_match_terms('body','tort battery') = '{"match":{"field":"body","terms":"tort battery"}}'::jsonb AS m;
+SELECT bm25_term('body','tort')      = '{"term":{"field":"body","value":"tort"}}'::jsonb AS t;
+SELECT bm25_wildcard('body','judg*') = '{"wildcard":{"field":"body","pattern":"judg*"}}'::jsonb AS w;
+SELECT bm25_phrase('body','res ipsa',1,false)
+       = '{"phrase":{"field":"body","phrase":"res ipsa","slop":1,"ordered":false}}'::jsonb AS p;
+SELECT bm25_boost(2.0, bm25_term('title','tort'))
+       = '{"boost":{"weight":2.0,"query":{"term":{"field":"title","value":"tort"}}}}'::jsonb AS b;
+SELECT bm25_boolean(must => ARRAY[bm25_term('body','tort')])
+       = '{"boolean":{"must":[{"term":{"field":"body","value":"tort"}}],"should":[],"must_not":[]}}'::jsonb AS bl;
+
+-- Nesting: a hijacked inner node would surface as a sub-tree, not just a root.
+SELECT bm25_boost(1.5, bm25_boolean(
+         must     => ARRAY[bm25_term('body','tort')],
+         must_not => ARRAY[bm25_wildcard('body','judg*')]))
+       = '{"boost":{"weight":1.5,"query":{"boolean":{"must":[{"term":{"field":"body","value":"tort"}}],"should":[],"must_not":[{"wildcard":{"field":"body","pattern":"judg*"}}]}}}}'::jsonb
+       AS nested;
+
+-- ---------------------------------------------------------------- Part 4
+-- Shadow LAST on the path. Same expectation -- see the Part 3 header: schema
+-- order is not what decides this, so a green Part 3 with a red Part 4 would
+-- mean the fix depends on ordering luck.
+SET search_path = public, shadow, pg_catalog;
+SELECT canary_build_object('body','tort') = '{"HIJACKED":"outer"}'::jsonb AS canary_still_hijacked_shadow_last;
+SELECT bm25_term('body','tort') = '{"term":{"field":"body","value":"tort"}}'::jsonb AS t_shadow_last;
+
+RESET search_path;
+DROP FUNCTION public.canary_build_object(text,text);
+DROP FUNCTION public.canary_to_jsonb(jsonb[]);
+DROP FUNCTION public.canary_boost(float8,jsonb);
+-- The CASCADE notice lists the six shadows in pg_depend scan order. That order
+-- is deterministic, but it is the only line in this suite's output that is not
+-- a behavioural assertion, and this repo has been bitten before by pinning
+-- output that varies across server majors (CI gates PG17 AND PG18, local dev is
+-- PG18-only). Silence it rather than gamble a red CI on a cosmetic line.
+SET client_min_messages = warning;
+DROP SCHEMA shadow CASCADE;
+RESET client_min_messages;
+-- Every other suite drops the extension it created. pg_regress shares ONE
+-- database across suites, so a suite that leaves it installed makes whichever
+-- suite is appended after it fail on CREATE EXTENSION. 85 happening to be last
+-- in REGRESS today is not a reason to skip this.
+DROP EXTENSION bm25_native;

@@ -1,0 +1,159 @@
+-- 150_error_sites -- user-reachable error sites no other suite executes, and the
+-- merge policy's segment-count cap (#309 CI-04, bounded target).
+--
+-- Selection. A gcov build of the extension, run over every other SQL suite,
+-- listed the ERROR ereports that never execute. Of those, this suite takes the
+-- ones a user reaches from SQL that are not corruption checks: argument and
+-- query-tree validation, DDL validation, and limits. Sites already executed
+-- elsewhere are not repeated here, and two sites with the same message are not
+-- interchangeable: the leaf-count and wildcard messages, for instance, also come
+-- from earlier sites that other suites do execute, which is why a message match
+-- in expected output is not evidence a site runs. Left out on purpose: the debug
+-- SRFs' own argument checks (test levers, REVOKEd from PUBLIC), corruption
+-- checks (the per-site levers of the trust-boundary suites), and sites no
+-- single-session suite here can drive: backstops behind an earlier check with
+-- the same bound, limits too large to reach in a test (MaxAllocSize-sized
+-- arrays, a ~170-segment bm25_upgrade), checks that need a non-C default
+-- collation, and concurrent-recycle retries.
+--
+-- Each case reports 'ok' or the error's SQLSTATE and message through e150_try,
+-- so one row carries one site's assertion. A case that took a different route
+-- (a Seq Scan, an earlier check) would print a different message, which is what
+-- makes the rows self-checking. Where a cap has an exact bound, a row just
+-- inside it is included, so an off-by-one in either direction shows as a diff.
+CREATE EXTENSION bm25_native;
+
+CREATE TABLE e150 (id int, body text, f float8);
+INSERT INTO e150 SELECT g, 'alpha beta gamma ' || g, g FROM generate_series(1, 20) g;
+CREATE INDEX e150_bm ON e150 USING bm25_native (body);
+SET enable_seqscan = off;
+
+CREATE FUNCTION e150_try(q text) RETURNS text LANGUAGE plpgsql AS
+$$
+BEGIN
+    EXECUTE q;
+    RETURN 'ok';
+EXCEPTION WHEN OTHERS THEN
+    RETURN format('ERROR %s: %s', SQLSTATE, SQLERRM);
+END
+$$;
+
+-- n distinct non-stopword words, so a phrase of them analyzes to exactly n terms.
+CREATE FUNCTION e150_words(n int) RETURNS text LANGUAGE sql IMMUTABLE AS
+$$ SELECT string_agg('w' || g, ' ' ORDER BY g) FROM generate_series(1, n) g $$;
+
+-- A jsonb query nested n boost nodes deep around one term leaf. The root parses
+-- at depth 0, so n boosts put the leaf at depth n.
+CREATE FUNCTION e150_nest(n int) RETURNS text LANGUAGE sql IMMUTABLE AS
+$$ SELECT repeat('{"boost": {"weight": 1, "query": ', n)
+          || '{"term": {"field": "body", "value": "alpha"}}'
+          || repeat('}}', n) $$;
+
+-- The query-tree parser (bm25_query.c). Every case goes through the index's
+-- @@@ scan, which parses the tree at rescan.
+SELECT label, e150_try(q) AS outcome FROM (VALUES
+  -- parse_node: the depth cap (BM25_QUERY_MAX_DEPTH = 32).
+  ('depth_32_accepted',
+   format($q$SELECT count(*) FROM e150 WHERE body @@@ %L::jsonb$q$, e150_nest(32))),
+  ('depth_33_rejected',
+   format($q$SELECT count(*) FROM e150 WHERE body @@@ %L::jsonb$q$, e150_nest(33))),
+  -- parse_node: an object with no key at all.
+  ('empty_node',
+   $q$SELECT count(*) FROM e150 WHERE body @@@ '{}'::jsonb$q$),
+  -- get_optional_int: a non-numeric slop.
+  ('slop_not_number',
+   $q$SELECT count(*) FROM e150 WHERE body @@@
+      '{"phrase": {"field": "body", "phrase": "alpha beta", "slop": "x"}}'::jsonb$q$),
+  -- get_optional_bool: a non-boolean ordered.
+  ('ordered_not_boolean',
+   $q$SELECT count(*) FROM e150 WHERE body @@@
+      '{"phrase": {"field": "body", "phrase": "alpha beta", "ordered": "x"}}'::jsonb$q$),
+  -- parse_node_array: a boolean clause list that is not an array.
+  ('must_not_array',
+   $q$SELECT count(*) FROM e150 WHERE body @@@ '{"boolean": {"must": 5}}'::jsonb$q$),
+  -- parse_boost: a non-numeric weight, and a query that is not an object.
+  ('boost_weight_not_number',
+   $q$SELECT count(*) FROM e150 WHERE body @@@
+      '{"boost": {"weight": "x", "query": {"term": {"field": "body", "value": "alpha"}}}}'::jsonb$q$),
+  ('boost_query_not_object',
+   $q$SELECT count(*) FROM e150 WHERE body @@@
+      '{"boost": {"weight": 2, "query": 5}}'::jsonb$q$)
+) v(label, q);
+
+-- The phrase-length cap (BM25_PHRASE_MAX_TERMS = 64), which bounds the phrase
+-- matcher's arrays. It has two sites: the flat text query's analysis
+-- (bm25_scan_rank.c, the "phrase && nq > 0" check) and the jsonb tree's
+-- per-leaf analysis. Neither is reached from parse time, which accepts any
+-- length. The literal is inlined so the planner sees a constant and keeps the
+-- index path.
+SELECT label, e150_try(q) AS outcome FROM (VALUES
+  ('text_phrase_64_accepted',
+   format($q$SELECT count(*) FROM e150 WHERE body @@@ %L$q$, '"' || e150_words(64) || '"')),
+  ('text_phrase_65_rejected',
+   format($q$SELECT count(*) FROM e150 WHERE body @@@ %L$q$, '"' || e150_words(65) || '"')),
+  ('jsonb_phrase_64_accepted',
+   format($q$SELECT count(*) FROM e150 WHERE body @@@ bm25_phrase('body', %L)$q$, e150_words(64))),
+  ('jsonb_phrase_65_rejected',
+   format($q$SELECT count(*) FROM e150 WHERE body @@@ bm25_phrase('body', %L)$q$, e150_words(65)))
+) v(label, q);
+
+-- DDL validation (bm25_build.c): key_field names an INCLUDE'd column whose type
+-- has no key encoding (int4/int8/uuid/text only). The "not an indexed column"
+-- sibling is covered by sql/29.
+SELECT e150_try($q$CREATE INDEX e150_kf ON e150 USING bm25_native (body)
+                   INCLUDE (f) WITH (key_field = 'f')$q$) AS key_field_float8;
+
+-- ---------------------------------------------------------------------------
+-- Merge rule (c): the target_segment_count cap (bm25_merge_select).
+--
+-- Rules (a) and (b) pick tombstoned segments and any size layer holding at least
+-- BM25_MERGE_LAYER_FANOUT (4) segments. Rule (c) is what bounds segment count when
+-- neither fires: over BM25_TARGET_SEGMENT_COUNT (8) live segments, merge the two
+-- with the fewest documents. Nine segments, at most three per layer (layer =
+-- floor(log4(ndocs)); sizes kept off the powers of 4 so no rounding decides one)
+-- and no deletes, so only (c) can choose anything. The two smallest sit in the
+-- middle of the catalog, not first, so "the first two" is not mistaken for
+-- "the two smallest"; and the 2-document segment comes after the 1-document one,
+-- so the runner-up is found by the branch that replaces only the second-smallest
+-- (a scan that tracked just the minimum would pair 1 with 5).
+CREATE TABLE e150m (id int, body text);
+INSERT INTO e150m SELECT g, 'merge rule c ' || g FROM generate_series(1, 20) g;
+CREATE INDEX e150m_bm ON e150m USING bm25_native (body);    -- 20 docs, layer 2
+CREATE FUNCTION e150m_seal(sizes int[]) RETURNS void LANGUAGE plpgsql AS
+$$
+DECLARE
+    sz  int;
+    nxt int;
+BEGIN
+    FOREACH sz IN ARRAY sizes LOOP
+        SELECT max(id) + 1 INTO nxt FROM e150m;
+        INSERT INTO e150m SELECT g, 'merge rule c ' || g
+          FROM generate_series(nxt, nxt + sz - 1) g;
+        PERFORM bm25_seal('e150m_bm');
+    END LOOP;
+END
+$$;
+SELECT e150m_seal(ARRAY[5, 1, 21, 2, 6, 22, 3]);
+
+-- Eight segments: at the cap, not over it, so nothing is chosen.
+SELECT count(*) AS nsegs, count(*) FILTER (WHERE chosen) AS chosen_at_cap
+  FROM bm25_debug_merge_plan('e150m_bm');
+
+SELECT e150m_seal(ARRAY[7]);
+-- Nine: rule (c) chooses exactly the 1- and 2-document segments.
+SELECT ndocs, layer, chosen FROM bm25_debug_merge_plan('e150m_bm') ORDER BY gen;
+
+SELECT bm25_merge('e150m_bm');
+-- One merge: eight segments, the two smallest replaced by one of three documents,
+-- and nothing chosen any more.
+SELECT count(*) AS nsegs, count(*) FILTER (WHERE chosen) AS chosen_after,
+       array_agg(ndocs ORDER BY ndocs) AS ndocs
+  FROM bm25_debug_merge_plan('e150m_bm');
+SELECT (SELECT count(*) FROM e150m WHERE body @@@ 'merge') =
+       (SELECT count(*) FROM e150m) AS every_doc_found;
+
+-- pg_regress shares one database across suites; leave nothing behind.
+RESET enable_seqscan;
+DROP FUNCTION e150_try(text), e150_words(int), e150_nest(int), e150m_seal(int[]);
+DROP TABLE e150, e150m;
+DROP EXTENSION bm25_native CASCADE;

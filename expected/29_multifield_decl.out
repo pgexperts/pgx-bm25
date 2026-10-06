@@ -1,0 +1,70 @@
+-- 29_multifield_decl: M5 field-config machinery (C-FIELDCFG) — single-column
+-- config/resolver/key_field/per-field-knob VALIDATION. Since C-BUILD (C2) landed
+-- the field-aware ingest loop AND flipped amcanmulticol=true, a multicolumn CREATE
+-- INDEX now SUCCEEDS (the per-field posting round-trip is asserted in
+-- 30_field_postings; this suite keeps its single-column config-resolution focus).
+CREATE EXTENSION bm25_native;
+CREATE TABLE docs (id int primary key, title text, summary text, body text);
+-- Multicolumn now SUCCEEDS (amcanmulticol=true after C2's field-aware ingest loop).
+CREATE INDEX docs_mc ON docs USING bm25_native (title, body);
+SELECT field_count FROM bm25_stats('docs_mc');
+ field_count 
+-------------
+           2
+(1 row)
+
+DROP INDEX docs_mc;
+-- Single-column config: field_count 1, field_name == attname (M5 uses the column
+-- name; M3 wrote ""), k1/b default to the metapage, boost defaults to 1.0.
+CREATE INDEX docs_one ON docs USING bm25_native (body);
+SELECT field_count FROM bm25_stats('docs_one');
+ field_count 
+-------------
+           1
+(1 row)
+
+SELECT field_id, field_name, k1, b, boost FROM bm25_debug_fieldcfg('docs_one');
+ field_id | field_name | k1  |  b   | boost 
+----------+------------+-----+------+-------
+        0 | body       | 1.2 | 0.75 |     1
+(1 row)
+
+DROP INDEX docs_one;
+-- Per-field knobs resolve against the attname and land on the field's config
+-- (single field here, but the same code path C-BUILD uses for N fields).
+CREATE INDEX docs_knob ON docs USING bm25_native (body)
+  WITH (boost_body = '2.5', k1_body = '1.5', b_body = '0.4');
+SELECT field_name, k1, b, boost FROM bm25_debug_fieldcfg('docs_knob');
+ field_name | k1  |  b  | boost 
+------------+-----+-----+-------
+ body       | 1.5 | 0.4 |   2.5
+(1 row)
+
+DROP INDEX docs_knob;
+-- Per-field knob values are validated at CREATE INDEX (they bypass the reloption
+-- validator, so bm25_resolve_fields is the trust boundary): non-numeric, b out of
+-- [0,1], and negative k1 each ERROR rather than silently misparsing to 0/garbage.
+\set VERBOSITY terse
+CREATE INDEX docs_bad1 ON docs USING bm25_native (body) WITH (boost_body = 'notanumber'); -- ERROR
+ERROR:  bm25: boost_body value "notanumber" is not a valid number
+CREATE INDEX docs_bad2 ON docs USING bm25_native (body) WITH (b_body = '2.0');            -- ERROR
+ERROR:  bm25: b_body must be in [0, 1] (got 2)
+CREATE INDEX docs_bad3 ON docs USING bm25_native (body) WITH (k1_body = '-5');            -- ERROR
+ERROR:  bm25: k1_body must be >= 0 (got -5)
+\set VERBOSITY default
+-- key_field reloption: parses, resolves the key column type (int4 here), builds.
+-- The key column is carried as an INCLUDE column (its type needs no bm25_native opclass);
+-- the resolver matches key_field against the index attributes (key + included).
+CREATE INDEX docs_k ON docs USING bm25_native (body) INCLUDE (id) WITH (key_field = 'id');
+DROP INDEX docs_k;
+-- A key_field column that is neither indexed nor INCLUDE'd ERRORs at build (its
+-- value could not reach the build callback to populate the keymap).
+\set VERBOSITY terse
+CREATE INDEX docs_knotincl ON docs USING bm25_native (body) WITH (key_field = 'id');       -- ERROR
+ERROR:  bm25: key_field "id" is not an indexed or INCLUDE'd column of the index
+-- Unknown key_field column ERRORs at build (no such index attribute).
+CREATE INDEX docs_kbad ON docs USING bm25_native (body) WITH (key_field = 'nope');        -- ERROR
+ERROR:  bm25: key_field "nope" is not an indexed or INCLUDE'd column of the index
+\set VERBOSITY default
+DROP TABLE docs;
+DROP EXTENSION bm25_native;

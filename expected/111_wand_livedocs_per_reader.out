@@ -1,0 +1,299 @@
+-- 111_wand_livedocs_per_reader -- a WAND build checks a tombstone-free segment's LIVEDOCS
+-- bitmap once up front instead of once per lookup, and still reads it per lookup
+-- for a segment that has a tombstone (issue #229, ADR 0100).
+--
+-- What was slow. Every liveness test on the ranked path -- once per posting of a query
+-- term's whole run in bm25_term_idf's multi-field df pass, once per scored posting in
+-- bm25_wand_cursor_score_doc, once per candidate in the driver -- was a LIVEDOCS
+-- buffer access, mostly against segments with no tombstone at all. Measured on a
+-- 100k-document corpus, those reads were 50-65% of a frequent term's WAND buffer
+-- traffic and up to 92% for a mixed rare/frequent query.
+--
+-- WHY THE ASSERTIONS ARE RATIOS. Buffer counts are deterministic (hit + read is the
+-- number of ReadBuffer calls, whatever is cached), but pinning a literal would move
+-- with every unrelated change to page layout. What the fix guarantees is a
+-- relationship: with no pruning (k above the corpus size), a tombstone-free build
+-- costs about two accesses per scored pair (the NORMS cell and the candidate's DOCMAP
+-- cell) where it used to cost four (one field) or five (two fields). The bound of 2.5
+-- sits between the two, and below what a build costs if even one of the three
+-- segments falls back to per-lookup reads -- which is how the odd-sized segment below
+-- witnesses the tail-byte mask. After one tombstone the build must cost at least one more
+-- access per document of THAT segment (its bitmap is read again) and less than the
+-- whole index's worth (the other two segments stay trusted).
+CREATE EXTENSION bm25_native;
+-- Three sealed segments of 400, 400 and 401 documents: under BM25_MERGE_LAYER_FANOUT
+-- (4), so the VACUUM below cannot merge them away, and one tombstone is far under the
+-- 15% that makes a segment a merge candidate. 'common' is in every body and in no
+-- title, so each document is exactly one scored (term, document) pair with one NORMS
+-- cell. The third segment's 401 documents end one bit into a byte: a check that
+-- compared that partial tail byte against 0xFF instead of masking it would find the
+-- builder's zeroed padding, call a tombstone-free segment tombstoned, and lose the
+-- saving there -- enough to break the per-pair bound below.
+CREATE TABLE lv2 (id int PRIMARY KEY, title text, body text) WITH (autovacuum_enabled = off);
+CREATE INDEX lv2_bm ON lv2 USING bm25_native (title, body) WITH (boost_title = '2.0');
+CREATE TABLE lv1 (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+CREATE INDEX lv1_bm ON lv1 USING bm25_native (body);
+INSERT INTO lv2 SELECT g, 'heading' || (g % 11), 'common x' || (g % 7) || repeat(' pad', g % 5)
+  FROM generate_series(1, 400) g;
+INSERT INTO lv1 SELECT id, body FROM lv2 WHERE id BETWEEN 1 AND 400;
+SELECT bm25_seal('lv2_bm'), bm25_seal('lv1_bm');
+ bm25_seal | bm25_seal 
+-----------+-----------
+           | 
+(1 row)
+
+INSERT INTO lv2 SELECT g, 'heading' || (g % 11), 'common x' || (g % 7) || repeat(' pad', g % 5)
+  FROM generate_series(401, 800) g;
+INSERT INTO lv1 SELECT id, body FROM lv2 WHERE id BETWEEN 401 AND 800;
+SELECT bm25_seal('lv2_bm'), bm25_seal('lv1_bm');
+ bm25_seal | bm25_seal 
+-----------+-----------
+           | 
+(1 row)
+
+INSERT INTO lv2 SELECT g, 'heading' || (g % 11), 'common x' || (g % 7) || repeat(' pad', g % 5)
+  FROM generate_series(801, 1201) g;
+INSERT INTO lv1 SELECT id, body FROM lv2 WHERE id BETWEEN 801 AND 1201;
+SELECT bm25_seal('lv2_bm'), bm25_seal('lv1_bm');
+ bm25_seal | bm25_seal 
+-----------+-----------
+           | 
+(1 row)
+
+SELECT c::text AS idx, count(*) AS segs, sum(ndocs) AS ndocs,
+       count(*) FILTER (WHERE live_ndocs < ndocs) AS tombstoned_segs
+  FROM unnest(ARRAY['lv1_bm', 'lv2_bm']::regclass[]) c, bm25_debug_segcat(c)
+ GROUP BY c ORDER BY 1;
+  idx   | segs | ndocs | tombstoned_segs 
+--------+------+-------+-----------------
+ lv1_bm |    3 |  1201 |               0
+ lv2_bm |    3 |  1201 |               0
+(2 rows)
+
+-- Buffer accesses of one WAND build, from the Function Scan node: bm25_wand_stats runs
+-- the real bm25_wand_build_ranking (prologue, df pass, every segment) and touches no
+-- heap page. FORMAT JSON keeps the parse independent of the text layout, which differs
+-- between server versions.
+CREATE FUNCTION pg_temp.wand_build_buffers(idx regclass, q text, k int) RETURNS bigint AS $$
+DECLARE
+  plan json;
+BEGIN
+  EXECUTE format('EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF, FORMAT JSON) '
+                 'SELECT * FROM bm25_wand_stats(%L, %L, %s)', idx, q, k) INTO plan;
+  RETURN (plan -> 0 -> 'Plan' ->> 'Shared Hit Blocks')::bigint
+       + (plan -> 0 -> 'Plan' ->> 'Shared Read Blocks')::bigint;
+END
+$$ LANGUAGE plpgsql;
+-- Warm the relcache and catalog so the measured calls count index pages only.
+SELECT pg_temp.wand_build_buffers('lv1_bm', 'common', 2000) > 0 AS warmed,
+       pg_temp.wand_build_buffers('lv2_bm', 'common', 2000) > 0 AS warmed;
+ warmed | warmed 
+--------+--------
+ t      | t
+(1 row)
+
+-- Regime witness: k above the corpus, so the heap never fills, nothing is pruned, and
+-- every document is scored -- the ratio below is per pair, not per surviving pair.
+SELECT i::text AS idx, s.docs_scored = 1201 AS every_doc_scored,
+       s.blocks_skipped = 0 AND s.deep_check_skips = 0 AS nothing_pruned
+  FROM unnest(ARRAY['lv1_bm', 'lv2_bm']::regclass[]) i,
+       LATERAL bm25_wand_stats(i, 'common', 2000) s
+ ORDER BY 1;
+  idx   | every_doc_scored | nothing_pruned 
+--------+------------------+----------------
+ lv1_bm | t                | t
+ lv2_bm | t                | t
+(2 rows)
+
+CREATE TEMP TABLE before_tomb AS
+SELECT i AS idx, pg_temp.wand_build_buffers(i, 'common', 2000) AS bufs,
+       (SELECT docs_scored FROM bm25_wand_stats(i, 'common', 2000)) AS pairs
+  FROM unnest(ARRAY['lv1_bm', 'lv2_bm']::regclass[]) i;
+-- The fix: under 2.5 accesses per scored pair on both shapes. Before it, the
+-- one-field index cost four and the two-field index five.
+SELECT idx::text, pairs, bufs < 2.5 * pairs AS under_two_and_a_half_per_pair
+  FROM before_tomb ORDER BY 1;
+  idx   | pairs | under_two_and_a_half_per_pair 
+--------+-------+-------------------------------
+ lv1_bm |  1201 | t
+ lv2_bm |  1201 | t
+(2 rows)
+
+-- ------------------------------------------------------------ one tombstone
+-- Doc 5 lives in the first segment of each index. Keep its TID: after VACUUM the heap
+-- no longer has it, and the probes below read the index without consulting the heap,
+-- so a dead TID in their output can only come from the index treating it as live.
+SELECT ctid AS dead2 FROM lv2 WHERE id = 5 \gset
+SELECT ctid AS dead1 FROM lv1 WHERE id = 5 \gset
+DELETE FROM lv2 WHERE id = 5;
+DELETE FROM lv1 WHERE id = 5;
+-- VACUUM hands the AM only REMOVABLE tuples; see 17_delete for why this wait is needed
+-- and sufficient.
+CREATE FUNCTION pg_temp.wait_for_xmin_horizon() RETURNS void AS $$
+DECLARE
+  deadline timestamptz := clock_timestamp() + interval '30 seconds';
+BEGIN
+  LOOP
+    PERFORM pg_stat_clear_snapshot();
+    EXIT WHEN NOT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND backend_xmin IS NOT NULL);
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION
+        'xmin horizon still held by another backend after 30s; VACUUM cannot reclaim';
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+SELECT pg_temp.wait_for_xmin_horizon();
+ wait_for_xmin_horizon 
+-----------------------
+ 
+(1 row)
+
+VACUUM lv2;
+VACUUM lv1;
+-- Exactly one segment of each index now carries a tombstone, and none was merged.
+SELECT c::text AS idx, count(*) AS segs, sum(ndocs) AS ndocs,
+       count(*) FILTER (WHERE live_ndocs < ndocs) AS tombstoned_segs
+  FROM unnest(ARRAY['lv1_bm', 'lv2_bm']::regclass[]) c, bm25_debug_segcat(c)
+ GROUP BY c ORDER BY 1;
+  idx   | segs | ndocs | tombstoned_segs 
+--------+------+-------+-----------------
+ lv1_bm |    3 |  1201 |               1
+ lv2_bm |    3 |  1201 |               1
+(2 rows)
+
+-- The tombstoned segment reads its bitmap again: at least one more access per document
+-- of it (400), and less than the whole index would add (1,201 documents at up to three
+-- liveness reads each on the two-field shape) -- so the other two segments are still
+-- answered from the snapshot.
+SELECT b.idx::text,
+       pg_temp.wand_build_buffers(b.idx, 'common', 2000) - b.bufs >= 400 AS tombstoned_segment_reads_bitmap,
+       pg_temp.wand_build_buffers(b.idx, 'common', 2000) - b.bufs < 1600 AS other_segments_still_trusted
+  FROM before_tomb b ORDER BY 1;
+  idx   | tombstoned_segment_reads_bitmap | other_segments_still_trusted 
+--------+---------------------------------+------------------------------
+ lv1_bm | t                               | t
+ lv2_bm | t                               | t
+(2 rows)
+
+-- Correctness on the fallback: the dead document is not ranked, the rest are, and WAND
+-- agrees with the exhaustive probe row for row (TID and score, so idf and the df pass
+-- behind it agree too).
+SELECT count(*) AS ranked, bool_and(tid <> :'dead2'::tid) AS dead_doc_absent
+  FROM bm25_debug_wand_rank('lv2_bm', 'common', 2000);
+ ranked | dead_doc_absent 
+--------+-----------------
+   1200 | t
+(1 row)
+
+SELECT count(*) AS ranked, bool_and(tid <> :'dead1'::tid) AS dead_doc_absent
+  FROM bm25_debug_wand_rank('lv1_bm', 'common', 2000);
+ ranked | dead_doc_absent 
+--------+-----------------
+   1200 | t
+(1 row)
+
+SELECT i::text AS idx, q,
+       (SELECT count(*) FROM (SELECT tid, score FROM bm25_debug_wand_rank(i, q, 2000)
+                              EXCEPT
+                              SELECT tid, score FROM bm25_debug_rank(i, q)) d) AS wand_minus_exhaustive,
+       (SELECT count(*) FROM (SELECT tid, score FROM bm25_debug_rank(i, q)
+                              EXCEPT
+                              SELECT tid, score FROM bm25_debug_wand_rank(i, q, 2000)) d) AS exhaustive_minus_wand
+  FROM unnest(ARRAY['lv1_bm', 'lv2_bm']::regclass[]) i, unnest(ARRAY['common', 'x3', 'x3 pad']) q
+ ORDER BY 1, q;
+  idx   |   q    | wand_minus_exhaustive | exhaustive_minus_wand 
+--------+--------+-----------------------+-----------------------
+ lv1_bm | common |                     0 |                     0
+ lv1_bm | x3     |                     0 |                     0
+ lv1_bm | x3 pad |                     0 |                     0
+ lv2_bm | common |                     0 |                     0
+ lv2_bm | x3     |                     0 |                     0
+ lv2_bm | x3 pad |                     0 |                     0
+(6 rows)
+
+-- ------------------------------------------------------------ the bitmap's tail byte
+-- The init check compares whole bytes below ndocs / 8 against 0xFF and masks the final
+-- partial byte. A 13-document segment ends mid-byte (bits 0-4 of byte 1); tombstoning
+-- its LAST document leaves the only clear bit in that masked tail. A check that
+-- skipped or mis-masked the tail would call the segment all-live, and WAND would rank
+-- the dead TID. The catalog count is not consulted, so this reaches the check itself.
+CREATE TABLE lv3 (id int PRIMARY KEY, title text, body text) WITH (autovacuum_enabled = off);
+CREATE INDEX lv3_bm ON lv3 USING bm25_native (title, body);
+INSERT INTO lv3 SELECT g, 'heading', 'common x' || g FROM generate_series(1, 13) g;
+SELECT bm25_seal('lv3_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT ctid AS dead3 FROM lv3 WHERE id = 13 \gset
+DELETE FROM lv3 WHERE id = 13;
+SELECT pg_temp.wait_for_xmin_horizon();
+ wait_for_xmin_horizon 
+-----------------------
+ 
+(1 row)
+
+VACUUM lv3;
+-- One segment, and the one dead document is its last docid.
+SELECT count(DISTINCT gen) AS segs, count(*) AS ndocs,
+       array_agg(local_docid) FILTER (WHERE NOT live) AS dead_docids
+  FROM bm25_debug_tombstone('lv3_bm');
+ segs | ndocs | dead_docids 
+------+-------+-------------
+    1 |    13 | {12}
+(1 row)
+
+SELECT count(*) AS ranked, bool_and(tid <> :'dead3'::tid) AS dead_doc_absent
+  FROM bm25_debug_wand_rank('lv3_bm', 'common', 100);
+ ranked | dead_doc_absent 
+--------+-----------------
+     12 | t
+(1 row)
+
+-- ------------------------------------------------------------ a multi-page bitmap
+-- One LIVEDOCS page holds ~65k documents' bits, so a 140,000-document segment has a
+-- three-page bitmap. The one dead document (docid 139,989) is on the LAST page. A
+-- check that stopped after the first page would call the segment all-live and rank
+-- the dead TID. Built in one
+-- CREATE INDEX with a large maintenance_work_mem so it is a single segment; the
+-- dead document is 1/140,000 of it, far under the merge trigger.
+SET maintenance_work_mem = '1GB';
+CREATE TABLE mp (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO mp SELECT g, 'common x' || (g % 7) FROM generate_series(1, 140000) g;
+CREATE INDEX mp_bm ON mp USING bm25_native (body);
+RESET maintenance_work_mem;
+SELECT ctid AS deadmp FROM mp WHERE id = 139990 \gset
+DELETE FROM mp WHERE id = 139990;
+SELECT pg_temp.wait_for_xmin_horizon();
+ wait_for_xmin_horizon 
+-----------------------
+ 
+(1 row)
+
+-- INDEX_CLEANUP ON: one dead tuple in 140,000 rows is under the 2%-of-pages
+-- threshold at which VACUUM would otherwise skip index vacuuming altogether.
+VACUUM (INDEX_CLEANUP ON) mp;
+SELECT count(DISTINCT gen) AS segs, count(*) AS ndocs,
+       array_agg(local_docid) FILTER (WHERE NOT live) AS dead_docids
+  FROM bm25_debug_tombstone('mp_bm');
+ segs | ndocs  | dead_docids 
+------+--------+-------------
+    1 | 140000 | {139989}
+(1 row)
+
+SELECT count(*) AS ranked, bool_and(tid <> :'deadmp'::tid) AS dead_doc_absent
+  FROM bm25_debug_wand_rank('mp_bm', 'common', 200000);
+ ranked | dead_doc_absent 
+--------+-----------------
+ 139999 | t
+(1 row)
+
+DROP TABLE lv1, lv2, lv3, mp;
+DROP EXTENSION bm25_native;

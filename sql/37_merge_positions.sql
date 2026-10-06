@@ -1,0 +1,295 @@
+-- 37_merge_positions.sql — the M4 position stream survives a tiered MERGE and its
+-- POS pages are reclaimed (C-POS-MERGE).
+--
+-- C-POS-BUILD wrote + read positions on a single sealed segment; the merge then
+-- DISABLED them (a merged segment came out position-less, has_positions=false). This
+-- suite proves the replay + reclaim path:
+--   * positions survive a merge IDENTICALLY (replayed old_docid->new_docid, not
+--     dropped or fabricated) — the discriminating check is that the SAME term's
+--     position multiset is byte-for-byte what it was before the merge;
+--   * has_positions=true on the merged segment (before C-POS-MERGE this was false —
+--     a direct witness that the merge now rebuilds the POS chain, not just that a
+--     reader happened to return rows);
+--   * a repeated term keeps its monotone (ascending) positions across the merge;
+--   * a store_positions=false field still writes NO frames post-merge (the merge
+--     honors the per-field gate exactly as seal does);
+--   * the POS pages of the merged-away segments are RECLAIMED, not leaked — relation
+--     growth stays bounded across MANY merge+reclaim cycles (Part 3). This is the
+--     pos_root reclaim mirror: if pos_root is dropped from reclaim_one_range's freed
+--     roots the pages leak and accumulate (size grows past the 1.5x anchor), if wrongly
+--     freed while live the read-back would corrupt;
+--   * an index-wide store_positions=false multi-segment merge runs clean and stays
+--     position-less (Part 4) — the FIND-1 write-side guard: the merge accumulator's
+--     all-off gate emits no frames, so nothing can desync the POST stream.
+--
+-- Distinct NATO-word tokens throughout: no stems collide, no score ties (the M5/CI
+-- portability lesson), and every position is hand-predictable.
+CREATE EXTENSION bm25_native;
+
+-- Waits until no other backend in this database holds a snapshot -- needed before
+-- an XID burn (Part 3 below), since a held snapshot pins the horizon regardless of
+-- how many xids get burned. See docs/adr/0031-vacuum-tests-wait-for-xmin-horizon.md
+-- for the full rationale (and 20_merge_reclaim for why wait precedes burn).
+CREATE FUNCTION pg_temp.wait_for_xmin_horizon() RETURNS void AS $$
+DECLARE
+  deadline timestamptz := clock_timestamp() + interval '30 seconds';
+BEGIN
+  LOOP
+    PERFORM pg_stat_clear_snapshot();
+    EXIT WHEN NOT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND backend_xmin IS NOT NULL);
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION
+        'xmin horizon still held by another backend after 30s; VACUUM cannot reclaim';
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+SET enable_seqscan = off;
+
+-- ============================================================================
+-- Part 1 — positions survive a merge, single-field, multiple segments
+-- ============================================================================
+-- Four segments, each a DISTINCT high-idf NATO term at a KNOWN position on top of a
+-- shared low-idf 'signal' term. Build (seg 0) then seal three more so a same-layer
+-- merge is proposed. Every doc body = '<nato> signal <nato>' so the distinct term
+-- sits at positions 0 and 2 (tf=2, monotone) and 'signal' at position 1.
+CREATE TABLE corp (id int primary key, body text) WITH (autovacuum_enabled = off);
+INSERT INTO corp SELECT g, 'alpha signal alpha'   FROM generate_series(1,20)  g;
+CREATE INDEX corp_bm25 ON corp USING bm25_native (body);          -- segment 0 (build)
+INSERT INTO corp SELECT g, 'bravo signal bravo'   FROM generate_series(21,40) g;
+SELECT bm25_seal('corp_bm25');                             -- segment 1
+INSERT INTO corp SELECT g, 'charlie signal charlie' FROM generate_series(41,60) g;
+SELECT bm25_seal('corp_bm25');                             -- segment 2
+INSERT INTO corp SELECT g, 'delta signal delta'   FROM generate_series(61,80) g;
+SELECT bm25_seal('corp_bm25');                             -- segment 3
+
+-- BEFORE merge: capture 'alpha' positions (one posting per alpha doc, each at 0,2).
+-- DISTINCT collapses the 20 identical docs to the position multiset {0,2}.
+SELECT DISTINCT pos AS alpha_pos_before
+FROM bm25_debug_seg_positions('corp_bm25', 'alpha') ORDER BY pos;   -- 0, 2
+-- Segment count before: four same-layer segments still distinct.
+SELECT nsegs AS nsegs_before FROM bm25_stats('corp_bm25');
+
+-- Force the consolidating merge explicitly (deterministic, no VACUUM-cadence timing).
+SELECT bm25_merge('corp_bm25');
+SELECT nsegs AS nsegs_after FROM bm25_stats('corp_bm25');
+
+-- AFTER merge: the SAME positions come back. This is the load-bearing survival check
+-- — a merge that dropped positions returns zero rows, one that fabricated them
+-- returns the wrong multiset. Local docids were remapped, so compare the multiset.
+SELECT DISTINCT pos AS alpha_pos_after
+FROM bm25_debug_seg_positions('corp_bm25', 'alpha') ORDER BY pos;   -- 0, 2
+-- Every merged-away term survived, not just the first. 'signal' is the shared term
+-- (position 1 in every doc); 'delta' the last-sealed segment's distinct term.
+SELECT DISTINCT pos AS signal_pos_after
+FROM bm25_debug_seg_positions('corp_bm25', 'signal') ORDER BY pos;  -- 1
+SELECT DISTINCT pos AS delta_pos_after
+FROM bm25_debug_seg_positions('corp_bm25', 'delta') ORDER BY pos;   -- 0, 2
+
+-- WRITER OBSERVABILITY: the merged segment actually BUILT a POS chain. Before
+-- C-POS-MERGE this was false for every merged segment (the interim disable). A merge
+-- may leave >1 segment if the policy didn't pick all four; assert EVERY live segment
+-- that carries docs reports has_positions=true (bool_and is the strong form).
+SELECT bool_and(has_positions) AS all_merged_have_positions
+FROM bm25_debug_segcat('corp_bm25');
+
+-- Bag-of-words decode still correct on the merged, position-bearing segment.
+SELECT count(*) AS alpha_docs FROM corp WHERE body @@@ 'alpha';    -- 20
+DROP TABLE corp;
+
+-- ============================================================================
+-- Part 2 — merge honors the per-field store_positions gate
+-- ============================================================================
+-- title positions ON (default), body positions OFF. Across two segments the same
+-- term 'echo' appears in title (framed) and 'foxtrot' in body (never framed). After
+-- the merge the ON field's positions survive and the OFF field's stay empty — the
+-- merge replays through the same per-field gate the seal/drain uses.
+CREATE TABLE gated (id int primary key, title text, body text)
+  WITH (autovacuum_enabled = off);
+INSERT INTO gated SELECT g, 'echo golf', 'foxtrot hotel' FROM generate_series(1,20) g;
+CREATE INDEX gated_bm25 ON gated USING bm25_native (title, body)
+  WITH (store_positions_body = false);                     -- segment 0
+INSERT INTO gated SELECT g, 'echo golf', 'foxtrot hotel' FROM generate_series(21,40) g;
+SELECT bm25_seal('gated_bm25');                            -- segment 1
+INSERT INTO gated SELECT g, 'echo golf', 'foxtrot hotel' FROM generate_series(41,60) g;
+SELECT bm25_seal('gated_bm25');                            -- segment 2
+
+SELECT bm25_merge('gated_bm25');
+
+-- ON field (title): 'echo' at position 0 survives the merge (field 0).
+SELECT DISTINCT field_id, pos AS echo_after
+FROM bm25_debug_seg_positions('gated_bm25', 'echo') ORDER BY field_id, pos;  -- 0|0
+-- OFF field (body): 'foxtrot' has NO position rows post-merge — the gate held. A
+-- merge that ignored the gate would frame body and this returns a spurious row.
+SELECT count(*) AS foxtrot_positions
+FROM bm25_debug_seg_positions('gated_bm25', 'foxtrot');    -- 0
+-- The merged segment still built a POS chain overall (title is on).
+SELECT bool_and(has_positions) AS gated_has_positions
+FROM bm25_debug_segcat('gated_bm25');
+DROP TABLE gated;
+
+-- ============================================================================
+-- Part 3 — POS pages are reclaimed across MANY merge+reclaim cycles (no leak)
+-- ============================================================================
+-- The pos_root leak this guards: reclaim_one_range (bm25_fsm.c) walks the retired
+-- segment's chain roots and frees each; pos_root is roots[7], reached only when the
+-- loop bound is 8. Drop the bound to 7 and every merged-away segment's POS chain
+-- leaks — a handful of pages per merge. A single-cycle 2x-slack size bound (the old
+-- form) cannot see that: one cycle's leak fits inside FSM reuse slack, and any later
+-- VACUUM's ORPHAN sweep (bm25_reclaim_orphans, which runs LAST in vacuumcleanup and
+-- runs after any merge, whose swap leaves it evidence -- issue #300) recovers the now-unreferenced POS pages one cycle late — self-healing the leak out
+-- of view. So a per-merge leak is only detectable if it ACCUMULATES.
+--
+-- This drives many merge cycles with NO VACUUM between them, which is the load-bearing
+-- design choice: bm25_merge itself calls bm25_reclaim_retired at the end (bm25_merge.c),
+-- so each cycle's merge frees (bound 8) or leaks (bound 7) the prior merged segment's
+-- POS pages WITHOUT ever invoking the orphan sweep — the leak cannot self-heal and
+-- grows monotonically. High-tf docs (term repeated 150x => tf=150) make each POS chain
+-- several pages, so the accumulated leak is tens of pages by cycle 10. The XID burn
+-- before each merge advances the horizon past the PRIOR cycle's retire_xid so that
+-- cycle's retired segment is reclaimable now.
+--
+-- DISCRIMINATION: the corpus and merge count are byte-identical whether pos_root is
+-- freed or leaked, so relation growth up to the mid-run anchor (cyc4, captured after
+-- the corpus is mostly built) is identical on both. The final size measures ONLY the
+-- divergence: the reclaimed-and-reused path stays within 1.5x of the anchor (~1.33x
+-- observed); the leaked path blows past it (~1.66x observed, the leaked POS pages
+-- forcing every later merge to EXTEND instead of reuse). The 1.5x bound is anchored to
+-- an in-run baseline so page-packing differences across PG majors scale both sides
+-- together. Parts 1-2 caught the premature-FREE side (positions read back correctly
+-- after a merge); this catches the LEAK side.
+CREATE TABLE rc (id int primary key, body text) WITH (autovacuum_enabled = off);
+INSERT INTO rc SELECT g, repeat('india ',150)||'signal' FROM generate_series(1,500) g;
+CREATE INDEX rc_bm25 ON rc USING bm25_native (body);
+-- Cycle 0: seal a second segment (distinct high-idf term) + merge. No VACUUM anywhere
+-- in this part — the merge's own reclaim_retired is the only reclaim path exercised.
+INSERT INTO rc SELECT g, repeat('juliet ',150)||'signal' FROM generate_series(501,1000) g;
+SELECT bm25_seal('rc_bm25');
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT bm25_merge('rc_bm25');
+-- Cycles 1-3 build the corpus toward the anchor. Each: fresh distinct-term segment,
+-- burn the horizon past the prior retire_xid, merge (reclaims the prior cycle now).
+INSERT INTO rc SELECT g, repeat('kilo ',150)||'signal' FROM generate_series(1001,1500) g;
+SELECT bm25_seal('rc_bm25');
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT bm25_merge('rc_bm25');
+INSERT INTO rc SELECT g, repeat('mike ',150)||'signal' FROM generate_series(1501,2000) g;
+SELECT bm25_seal('rc_bm25');
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT bm25_merge('rc_bm25');
+INSERT INTO rc SELECT g, repeat('november ',150)||'signal' FROM generate_series(2001,2500) g;
+SELECT bm25_seal('rc_bm25');
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT bm25_merge('rc_bm25');
+-- ANCHOR (cyc4): the corpus is now mostly built. This baseline is identical whether
+-- pos_root is freed or leaked (the leak has not yet accumulated enough to diverge).
+SELECT pg_relation_size('rc_bm25') AS size_anchor \gset
+-- Cycles 5-9: five more merge cycles. On the freed path the prior POS pages are reused
+-- so growth is bounded; on the leaked path they accumulate and force extension.
+--
+-- Each cycle's reclaim (inside bm25_merge -- no VACUUM anywhere in this part, see the
+-- header note) must succeed BEFORE the NEXT cycle's INSERT+seal, not just by the end
+-- of the run: pages freed by a merge's reclaim are only available for THAT NEXT
+-- seal's allocator to reuse, and pg_relation_size never shrinks mid-file just because
+-- a later reclaim eventually drains the backlog. So a wait on only the last cycle is
+-- NOT sufficient -- an earlier cycle whose reclaim missed the horizon has already
+-- forced its next seal to extend the relation, and that growth is permanent by the
+-- time size_stable is checked. Every post-anchor cycle therefore gets its own
+-- wait-before-burn (see 20_merge_reclaim for why wait precedes burn).
+SELECT pg_temp.wait_for_xmin_horizon();
+INSERT INTO rc SELECT g, repeat('oscar ',150)||'signal' FROM generate_series(2501,3000) g;
+SELECT bm25_seal('rc_bm25');
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT bm25_merge('rc_bm25');
+SELECT pg_temp.wait_for_xmin_horizon();
+INSERT INTO rc SELECT g, repeat('papa ',150)||'signal' FROM generate_series(3001,3500) g;
+SELECT bm25_seal('rc_bm25');
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT bm25_merge('rc_bm25');
+SELECT pg_temp.wait_for_xmin_horizon();
+INSERT INTO rc SELECT g, repeat('quebec ',150)||'signal' FROM generate_series(3501,4000) g;
+SELECT bm25_seal('rc_bm25');
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT bm25_merge('rc_bm25');
+SELECT pg_temp.wait_for_xmin_horizon();
+INSERT INTO rc SELECT g, repeat('romeo ',150)||'signal' FROM generate_series(4001,4500) g;
+SELECT bm25_seal('rc_bm25');
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT bm25_merge('rc_bm25');
+SELECT pg_temp.wait_for_xmin_horizon();
+INSERT INTO rc SELECT g, repeat('sierra ',150)||'signal' FROM generate_series(4501,5000) g;
+SELECT bm25_seal('rc_bm25');
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT bm25_merge('rc_bm25');
+-- POS LEAK GATE: with pos_root freed+reused, the five post-anchor merge cycles stay
+-- within 1.5x of the anchor. A pos_root leak (reclaim loop bound 8->7) pushes past it.
+-- Anchored to the in-run baseline so cross-major page-packing scales both sides.
+SELECT pg_relation_size('rc_bm25') <= :size_anchor * 1.5 AS size_stable;
+-- The merged segment still carries live positions (reclaim never freed a live POS
+-- chain across all ten cycles — the premature-free guard, complementing the leak gate).
+-- tf=150 => positions 0..149; assert the shape (count/min/max) not the 150-row dump.
+SELECT count(DISTINCT pos) AS sierra_npos, min(pos) AS sierra_min, max(pos) AS sierra_max
+FROM bm25_debug_seg_positions('rc_bm25', 'sierra');   -- 150 | 0 | 149
+DROP TABLE rc;
+
+-- ============================================================================
+-- Part 4 — index-wide store_positions=false: multi-segment merge runs clean
+-- ============================================================================
+-- FIND-1 guard (single-binary reachable slice). With every field's store_positions
+-- OFF the D12 flag array is PRESENT-and-all-zero, so bm25_fieldcfg_read hands the
+-- merge an explicit all-0 gate: any_positions stays false, the builder writes NO POS
+-- frames, and the merged segment is position-less (pos_root Invalid). The assertion is
+-- that a multi-segment merge over a positions-off index completes WITHOUT error and the
+-- merged segment reports has_positions=false — i.e. the merge writes no frames when
+-- positions are off, so there is nothing to desync against the POST stream.
+--
+-- NOTE: the exact FIND-1 trigger is an ABSENT flag array (a legacy M5-built page read
+-- by an M4 binary with no REINDEX), which pre-init store_pos all-0 + the UNCONDITIONAL
+-- bm25_accum_set_store_positions in bm25_merge.c / bm25_pending.c now treat as OFF. That
+-- absent-flag path needs a cross-version M5->M4 build CI cannot produce, so it is
+-- reasoning-verified in code (see those call sites); this case exercises the adjacent
+-- present-but-all-zero gate through the same merge machinery.
+CREATE TABLE noposmerge (id int primary key, body text) WITH (autovacuum_enabled = off);
+INSERT INTO noposmerge SELECT g, 'tango signal tango' FROM generate_series(1,20) g;
+CREATE INDEX npm_bm25 ON noposmerge USING bm25_native (body)
+  WITH (store_positions = false);                          -- index-wide OFF, flag array all-0
+INSERT INTO noposmerge SELECT g, 'uniform signal uniform' FROM generate_series(21,40) g;
+SELECT bm25_seal('npm_bm25');
+INSERT INTO noposmerge SELECT g, 'victor signal victor' FROM generate_series(41,60) g;
+SELECT bm25_seal('npm_bm25');
+-- The merge must run clean (no tf-count/POST desync ERROR) even though the accumulator
+-- gate is all-off — no frames are emitted for a position-less source.
+SELECT bm25_merge('npm_bm25');
+-- The merged segment is position-less: positions were off, so no POS chain was built.
+SELECT bool_or(has_positions) AS any_positions_after_merge
+FROM bm25_debug_segcat('npm_bm25');                        -- f
+-- Bag-of-words decode is unaffected by the positions-off merge.
+SELECT count(*) AS tango_docs FROM noposmerge WHERE body @@@ 'tango';   -- 20
+DROP TABLE noposmerge;
+
+RESET enable_seqscan;
+DROP EXTENSION bm25_native;

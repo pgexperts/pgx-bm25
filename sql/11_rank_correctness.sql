@@ -1,0 +1,74 @@
+-- Ranking correctness: BM25 order on a richer corpus, ordered-stream past
+-- deletes, and top-k prefix ordering.  This test validates Task 11 (ranked
+-- retrieval) with three properties:
+--   (a) The index returns documents in strictly descending BM25 score order
+--       for a corpus where tf and document length differ, so the ranking is
+--       non-trivial.
+--   (b) Deleting the current top hit causes the executor's heap visibility
+--       recheck to drop the dead TID; the previously-second document surfaces
+--       as new first, and the deleted id never appears.
+--   (c) ORDER BY ... LIMIT k (k < number of matching docs) returns exactly the
+--       correct top-k prefix, not an arbitrary subset.
+
+CREATE EXTENSION bm25_native;
+
+-- ----------------------------------------------------------------
+-- Part A & B: richer corpus for 'database' ranking + delete recheck
+-- N=4, avgdl=3.25, df_database=3
+-- Expected BM25 descending order: 1 (tf3,dl4) > 4 (tf1,dl1) > 2 (tf1,dl4)
+-- ----------------------------------------------------------------
+CREATE TABLE docs (id int primary key, body text) WITH (autovacuum_enabled=off);
+INSERT INTO docs VALUES
+  (1, 'database database database systems'),
+  (2, 'database systems and storage'),
+  (3, 'storage engines and indexes'),
+  (4, 'database');
+CREATE INDEX docs_bm25 ON docs USING bm25_native (body);
+
+SET enable_seqscan = off;
+
+-- Part A: full ranking order for 'database' (doc3 has no match, absent)
+SELECT id FROM docs WHERE body @@@ 'database'
+ORDER BY body &@@ 'database';
+
+-- Part B: delete the top hit, re-issue; dead TID must not appear,
+-- next-best (id=4) becomes first
+DELETE FROM docs WHERE id = (
+  SELECT id FROM docs WHERE body @@@ 'database' ORDER BY body &@@ 'database' LIMIT 1
+);
+SELECT id FROM docs WHERE body @@@ 'database'
+ORDER BY body &@@ 'database';
+
+RESET enable_seqscan;
+DROP TABLE docs;
+
+-- ----------------------------------------------------------------
+-- Part C: top-k prefix (LIMIT k < number of matching docs)
+-- 6 docs all containing 'index', with varying tf/doclen so a clear
+-- BM25 ordering exists.  Run full ranking, then LIMIT 3; assert the
+-- LIMIT 3 result is exactly the first 3 rows of the full ranking.
+-- ----------------------------------------------------------------
+CREATE TABLE kdocs (id int primary key, body text) WITH (autovacuum_enabled=off);
+INSERT INTO kdocs VALUES
+  (1, 'index index index index index'),
+  (2, 'index index index'),
+  (3, 'index index index index'),
+  (4, 'index'),
+  (5, 'index index'),
+  (6, 'index index index index index index');
+CREATE INDEX kdocs_bm25 ON kdocs USING bm25_native (body);
+
+SET enable_seqscan = off;
+
+-- full order (6 rows), used to derive expected prefix
+SELECT id FROM kdocs WHERE body @@@ 'index'
+ORDER BY body &@@ 'index';
+
+-- top-3 prefix; must exactly match first 3 rows of above
+SELECT id FROM kdocs WHERE body @@@ 'index'
+ORDER BY body &@@ 'index' LIMIT 3;
+
+RESET enable_seqscan;
+DROP TABLE kdocs;
+
+DROP EXTENSION bm25_native;

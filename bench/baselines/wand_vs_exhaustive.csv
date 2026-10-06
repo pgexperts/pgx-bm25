@@ -1,0 +1,26 @@
+# ndocs=100000 reps=3 pg_version=18.3
+mode,wand_top_k,limit,terms,query,ms
+wand,100,10,1,"liability",197.202
+wand,100,10,2,"negligence liability",59.241
+wand,100,10,3,"negligence liability damages",74.964
+wand,100,10,4,"negligence liability damages contract",132.780
+wand,100,100,1,"liability",197.153
+wand,100,100,2,"negligence liability",59.581
+wand,100,100,3,"negligence liability damages",73.971
+wand,100,100,4,"negligence liability damages contract",129.812
+wand,100,1000,1,"liability",468.589
+wand,100,1000,2,"negligence liability",402.432
+wand,100,1000,3,"negligence liability damages",695.752
+wand,100,1000,4,"negligence liability damages contract",905.382
+exhaustive,0,10,1,"liability",266.059
+exhaustive,0,10,2,"negligence liability",341.528
+exhaustive,0,10,3,"negligence liability damages",622.748
+exhaustive,0,10,4,"negligence liability damages contract",771.273
+exhaustive,0,100,1,"liability",270.131
+exhaustive,0,100,2,"negligence liability",337.155
+exhaustive,0,100,3,"negligence liability damages",625.771
+exhaustive,0,100,4,"negligence liability damages contract",766.459
+exhaustive,0,1000,1,"liability",272.246
+exhaustive,0,1000,2,"negligence liability",347.719
+exhaustive,0,1000,3,"negligence liability damages",624.356
+exhaustive,0,1000,4,"negligence liability damages contract",770.426

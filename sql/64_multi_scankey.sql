@@ -1,0 +1,70 @@
+-- Several WHERE qualifiers on one index scan are all applied: the scan returns the
+-- intersection of their sets (#290; review ref C8 before it).
+--
+-- bm25_gettuple sets xs_recheck = false -- the index match is declared
+-- authoritative -- and the planner removes an index clause from qpqual, so a key
+-- the scan does not apply is applied by nothing.  Originally keys 1..n-1 were
+-- ignored (a silent wrong answer: {1,2} for the query below, whose true answer is
+-- {1}); then they were refused with an ERROR (ADR 0021); now each one is parsed and
+-- its set computed, under one snapshot, and the result is their intersection.
+--
+-- The column (sk_attno) is not consulted, as for a single key: a bare RHS searches
+-- every field of the index.  So `title @@@ 'alpha' AND body @@@ 'beta'` is the AND
+-- of an all-fields 'alpha' and an all-fields 'beta'.  On this fixture that is the
+-- same {1} a per-column evaluation gives, which the seqscan ground truth checks.
+--
+-- xs_recheck = true would not be a way to apply the extra keys: the recheck defers
+-- to bm25_match, which has no index Relation and re-tokenizes with the english
+-- DEFAULT analyzer, so on a non-english index it drops correct matches.
+
+CREATE EXTENSION bm25_native;
+
+CREATE TABLE mc (id int primary key, title text, body text);
+INSERT INTO mc VALUES
+  (1, 'alpha one',   'beta two'),
+  (2, 'alpha three', 'gamma four'),
+  (3, 'delta five',  'beta six');
+CREATE INDEX mc_bm25 ON mc USING bm25_native (title, body);
+SELECT bm25_seal('mc_bm25');
+
+SET enable_seqscan = off;
+
+-- Both quals are index clauses (nkeys = 2) on one bm25 index scan.
+EXPLAIN (COSTS OFF)
+SELECT id FROM mc WHERE title @@@ 'alpha' AND body @@@ 'beta';
+
+-- Their intersection, {1}.
+SELECT id FROM mc WHERE title @@@ 'alpha' AND body @@@ 'beta' ORDER BY id;
+
+-- Three is no different.
+SELECT id FROM mc WHERE title @@@ 'alpha' AND body @@@ 'beta' AND title @@@ 'one'
+ ORDER BY id;
+
+-- A key byte-identical to another adds nothing and changes nothing.
+SELECT id FROM mc WHERE title @@@ 'alpha' AND body @@@ 'alpha' ORDER BY id;
+
+-- An empty intersection is empty.
+SELECT id FROM mc WHERE title @@@ 'alpha' AND body @@@ 'six' ORDER BY id;
+
+-- A single qual on a multicolumn index is untouched.
+SELECT id FROM mc WHERE title @@@ 'alpha' ORDER BY id;
+
+-- ...and so is the ranked single-qual form.
+SELECT id FROM mc WHERE title @@@ 'beta' ORDER BY title &@@ 'beta';
+
+-- The same conditions as one query, an M6 boolean tree: also {1}.
+SELECT id FROM mc
+ WHERE title @@@ bm25_boolean(must => ARRAY[bm25_match_terms('title', 'alpha'),
+                                            bm25_match_terms('body',  'beta')])
+ ORDER BY id;
+
+-- Ground truth: the same two quals on a seqscan (default analyzer, which this
+-- index also uses).
+SET enable_indexscan = off;
+SET enable_seqscan = on;
+SELECT id FROM mc WHERE title @@@ 'alpha' AND body @@@ 'beta' ORDER BY id;
+RESET enable_indexscan;
+
+RESET enable_seqscan;
+DROP TABLE mc;
+DROP EXTENSION bm25_native;

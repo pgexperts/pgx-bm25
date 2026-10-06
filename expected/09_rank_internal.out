@@ -1,0 +1,20 @@
+CREATE EXTENSION bm25_native;
+CREATE TABLE docs (id int primary key, body text) WITH (autovacuum_enabled=off);
+INSERT INTO docs VALUES
+  (1, 'quick brown fox'),
+  (2, 'quick quick quick'),
+  (3, 'lazy brown dog');
+CREATE INDEX docs_bm25 ON docs USING bm25_native (body);
+-- query 'quick': doc2 (tf=3) should outrank doc1 (tf=1); doc3 absent
+SELECT id, round(score::numeric, 6) AS score
+FROM bm25_debug_rank('docs_bm25', 'quick') r
+JOIN docs d ON d.ctid = r.tid
+ORDER BY score DESC, id;
+ id |  score   
+----+----------
+  2 | 0.738577
+  1 | 0.470004
+(2 rows)
+
+DROP TABLE docs;
+DROP EXTENSION bm25_native;

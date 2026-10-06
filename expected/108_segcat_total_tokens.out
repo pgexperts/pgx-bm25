@@ -1,0 +1,503 @@
+-- 108_segcat_total_tokens: the segment catalog's per-segment TOKEN count (ADR 0088).
+--
+-- Since analyzer revision 5 (ADR 0087) a segment's total_len counts source word RUNS,
+-- while the quantities the merge budget estimator charges for scale with TOKENS: a
+-- posting per (term, doc, field), and four bytes per stored position.  For a
+-- compound-splitting dictionary those are different numbers by the dictionary's
+-- lexemes-per-run ratio, so the estimator under-charged by about 5x on an ispell index.
+-- The catalog entry now carries the token count so the estimator can charge from it.
+--
+-- THIS SUITE COVERS THE ON-DISK FIELD ONLY.  It is deliberately silent about est_bytes:
+-- the field lands first and inert, so that "no estimate moved" is provable before the
+-- estimator changes.  The estimator's own assertions arrive with that change.
+--
+-- WHY ispell AND NOT ENGLISH.  Snowball English emits one lexeme per source run, so
+-- total_tokens and total_len are the SAME NUMBER for every English corpus in this tree
+-- and an English fixture cannot tell a correct counter from one that simply copied
+-- total_len.  ispell_sample ships with core PostgreSQL, needs no fixture, and is pure
+-- ASCII so it is safe on the C-locale CI legs.  'footballklubber' is the discriminating
+-- word: one run, five distinct lexemes after revision 5's within-run dedup.  Every part
+-- below carries an English control for exactly this reason -- the control pins that the
+-- two quantities coincide there, which is what makes the ispell divergence meaningful.
+--
+-- WHERE THE FIELD LIVES.  It occupies the 4-byte hole BM25SegCatEntry already had
+-- between header_blkno and its 8-aligned ndocs, so sizeof stays 40 and the catalog's
+-- fixed-stride packing is untouched -- ADR 0009's ADDITIVE shape (iii).  sql/96 asserts
+-- the byte-level consequence; this suite asserts the value.
+CREATE EXTENSION bm25_native;
+CREATE TEXT SEARCH DICTIONARY pg_catalog.isp108_stem (
+    TEMPLATE = ispell, DictFile = ispell_sample, AffFile = ispell_sample);
+SET enable_seqscan = off;
+-- ------------------------------------------------------------------ PART ONE
+-- The build path, and the smallest possible statement of the defect.
+--
+-- One document whose entire body is one compound word: one source run, five lexemes.
+-- So total_len must be 1 and total_tokens 5.  These are exact integers determined by
+-- the corpus and the dictionary, not by platform, struct padding or page geometry --
+-- which is why this part asserts values where the estimator's own suite may not.
+CREATE TABLE tk1 (id int, body text);
+CREATE INDEX tk1_bm ON tk1 USING bm25_native (body)
+  WITH (language = 'isp108', stopwords = 'none');
+INSERT INTO tk1 VALUES (1, 'footballklubber');
+SELECT bm25_seal('tk1_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT ndocs, total_len, total_tokens FROM bm25_debug_segcat('tk1_bm');
+ ndocs | total_len | total_tokens 
+-------+-----------+--------------
+     1 |         1 |            5
+(1 row)
+
+-- A wider compound corpus: the relation, not just the one pair.  total_tokens strictly
+-- exceeds total_len exactly because some source word split.
+CREATE TABLE tk2 (id int, body text);
+CREATE INDEX tk2_bm ON tk2 USING bm25_native (body)
+  WITH (language = 'isp108', stopwords = 'none');
+INSERT INTO tk2 VALUES (1, 'they saw the footballklubber yesterday'),
+                       (2, 'football klubber as separate words'),
+                       (3, 'footballklubber x football');
+SELECT bm25_seal('tk2_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT total_len, total_tokens, total_tokens > total_len AS compound_splits
+  FROM bm25_debug_segcat('tk2_bm');
+ total_len | total_tokens | compound_splits 
+-----------+--------------+-----------------
+        13 |           25 | t
+(1 row)
+
+-- ENGLISH CONTROL.  One lexeme per run, so the two coincide.  This is the assertion
+-- that would catch a counter wired to the wrong quantity: a total_tokens that merely
+-- aliased total_len would satisfy every ispell assertion above only by accident, and
+-- would satisfy this one too -- but a counter that double-counted, or counted runs
+-- twice, breaks here while leaving the ispell numbers plausible.
+CREATE TABLE tk3 (id int, body text);
+CREATE INDEX tk3_bm ON tk3 USING bm25_native (body);
+INSERT INTO tk3 VALUES (1, 'alpha bravo charlie delta'), (2, 'echo foxtrot');
+SELECT bm25_seal('tk3_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT total_len, total_tokens, total_tokens = total_len AS english_coincides
+  FROM bm25_debug_segcat('tk3_bm');
+ total_len | total_tokens | english_coincides 
+-----------+--------------+-------------------
+         6 |            6 | t
+(1 row)
+
+-- ------------------------------------------------------------------ PART TWO
+-- The other two write paths.  There are three, and they feed the counter through TWO
+-- different accumulator entry points, so a fix wired into only one ships half broken:
+--
+--   build / seal / drain  -> bm25_accum_add_field_tokens, which adds ntok
+--   merge replay          -> bm25_accum_add_posting, which adds tf
+--
+-- PART ONE exercised the first.  Below: a post-build INSERT drained by an explicit
+-- seal (still the first entry point, but through bm25_drain_flush_chunk rather than
+-- the builder), then a merge, which is the only route to the second.
+CREATE TABLE tk4 (id int primary key, body text);
+CREATE INDEX tk4_bm ON tk4 USING bm25_native (body)
+  WITH (language = 'isp108', stopwords = 'none');
+DO $$
+DECLARE i int;
+BEGIN
+  FOR i IN 0..5 LOOP
+    INSERT INTO tk4 SELECT g, 'footballklubber' FROM generate_series(i*10+1, i*10+10) g;
+    PERFORM bm25_seal('tk4_bm');
+  END LOOP;
+END $$;
+-- Six segments, ten single-compound documents each: 10 runs and 50 tokens per segment.
+SELECT count(*) AS nsegs, sum(total_len) AS runs, sum(total_tokens) AS tokens
+  FROM bm25_debug_segcat('tk4_bm');
+ nsegs | runs | tokens 
+-------+------+--------
+     6 |   60 |    300
+(1 row)
+
+-- The merge re-accumulates every live document through the posting path and writes a
+-- fresh count.  Preserved exactly, because no document was tombstoned: a merge that
+-- dropped the counter would report 0 here, and one that summed the inputs' decayed
+-- copies instead of recounting would drift the moment tombstones existed (PART THREE).
+SELECT bm25_merge('tk4_bm');
+ bm25_merge 
+------------
+ 
+(1 row)
+
+SELECT count(*) AS merged_nsegs, sum(total_len) AS runs, sum(total_tokens) AS tokens
+  FROM bm25_debug_segcat('tk4_bm');
+ merged_nsegs | runs | tokens 
+--------------+------+--------
+            1 |   60 |    300
+(1 row)
+
+-- ---------------------------------------------------------------- PART THREE
+-- Tombstone decay, which must be SYMMETRIC with total_len's.
+--
+-- The catalog entry's total_len is decayed in place per tombstone by the segment's
+-- average doclen; the token count gets the identical treatment from the same immutable
+-- segment-header copy.  Without it the two stop being comparable, and the estimator's
+-- Max(stored, total_len) guard quietly changes meaning as a segment ages.
+--
+-- Uniform corpus on purpose: every document is the same one compound word, so the
+-- per-document averages (1 run, 5 tokens) divide exactly and the arithmetic below is
+-- exact rather than approximate.  Ten documents, four deleted.
+CREATE TABLE tk5 (id int primary key, body text);
+CREATE INDEX tk5_bm ON tk5 USING bm25_native (body)
+  WITH (language = 'isp108', stopwords = 'none');
+INSERT INTO tk5 SELECT g, 'footballklubber' FROM generate_series(1, 10) g;
+SELECT bm25_seal('tk5_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT ndocs, live_ndocs, total_len, total_tokens FROM bm25_debug_segcat('tk5_bm');
+ ndocs | live_ndocs | total_len | total_tokens 
+-------+------------+-----------+--------------
+    10 |         10 |        10 |           50
+(1 row)
+
+DELETE FROM tk5 WHERE id > 6;
+-- VACUUM hands bulkdelete only REMOVABLE tuples. Another backend in this database
+-- holding an older snapshot (in installcheck, an autovacuum worker's ANALYZE) leaves
+-- the four deletes "recently dead", and the assertion below then reads 10 / 10 / 50.
+-- Wait until no other backend here holds an xmin; sql/17_delete documents the
+-- mechanism and why this wait is sufficient, not just a narrower race.
+CREATE FUNCTION pg_temp.wait_for_xmin_horizon() RETURNS void AS $$
+DECLARE
+  deadline timestamptz := clock_timestamp() + interval '30 seconds';
+BEGIN
+  LOOP
+    PERFORM pg_stat_clear_snapshot();   -- else pg_stat_activity is cached per xact
+    EXIT WHEN NOT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND backend_xmin IS NOT NULL);
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION
+        'xmin horizon still held by another backend after 30s; VACUUM cannot reclaim';
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+SELECT pg_temp.wait_for_xmin_horizon();
+ wait_for_xmin_horizon 
+-----------------------
+ 
+(1 row)
+
+VACUUM tk5;
+-- 10 runs -> 6 and 50 tokens -> 30: four documents' worth off each, in lockstep.
+SELECT ndocs, live_ndocs, total_len, total_tokens FROM bm25_debug_segcat('tk5_bm');
+ ndocs | live_ndocs | total_len | total_tokens 
+-------+------------+-----------+--------------
+    10 |          6 |         6 |           30
+(1 row)
+
+SELECT total_tokens = total_len * 5 AS decay_stayed_proportional
+  FROM bm25_debug_segcat('tk5_bm');
+ decay_stayed_proportional 
+---------------------------
+ t
+(1 row)
+
+-- ----------------------------------------------------------------- PART FOUR
+-- The trust flag's lifecycle, which is the whole reason the field is safe to read.
+--
+-- BM25_FEAT_SEGCAT_TOKENS (bit 3) does not describe index CONTENT the way the other
+-- feature bits do -- it is a promise about the WRITER: that no catalog entry here
+-- carries pre-ADR-0074 stack residue in the bytes total_tokens now occupies.  Before
+-- that fix the merge path copied an entry built on the stack, so those bytes could hold
+-- garbage, and garbage read as a token count is a wrong estimate rather than a missing
+-- one.  Only a fresh build can honestly make that promise, so:
+--
+--   ambuild / REINDEX  stamps it
+--   bm25_upgrade       must NOT confer it, because its transform registry is empty and
+--                      its accepted-gap path is an in-place restamp with no segment
+--                      rewrite -- it would be blessing bytes it never wrote
+--   derive             must never produce it; content cannot prove a writer's identity
+--
+-- A fresh build carries it.
+SELECT (feature_flags & 8) = 8 AS build_stamps_trust_bit FROM bm25_stats('tk5_bm');
+ build_stamps_trust_bit 
+------------------------
+ t
+(1 row)
+
+-- Simulate exactly that: an index written by an older binary.  Stamp it back to v6 --
+-- older than this build, still inside the readable range -- with the trust bit cleared,
+-- which is the on-disk state of every index that predates this change.
+--
+-- The version must be moved back too, not just the flag.  bm25_upgrade short-circuits
+-- on an index already at the current version ("already current"), so a flag-only poke
+-- would leave the interesting path -- the accepted-gap RESTAMP, which rewrites the
+-- metapage and re-derives feature_flags -- completely unexercised, and the assertion
+-- below would pass without ever having been tested.
+SELECT bm25_debug_stamp_version('tk5_bm', 6, 5,
+         (SELECT (feature_flags & ~8)::bigint FROM bm25_stats('tk5_bm')));
+ bm25_debug_stamp_version 
+--------------------------
+ 
+(1 row)
+
+SELECT format_version, (feature_flags & 8) = 8 AS trust_bit_after_clear
+  FROM bm25_stats('tk5_bm');
+ format_version | trust_bit_after_clear 
+----------------+-----------------------
+              6 | f
+(1 row)
+
+-- The upgrade restamps the version and re-derives the flags.  The trust bit must NOT
+-- come back: its registry is empty, so this path rewrote no segment, and conferring the
+-- bit would bless bytes it never wrote.  This is the assertion that fails if the flag is
+-- ever folded into bm25_derive_feature_flags for tidiness.
+SELECT bm25_upgrade('tk5_bm');
+         bm25_upgrade          
+-------------------------------
+ upgraded 0 segments: v6 -> v8
+(1 row)
+
+SELECT format_version AS version_did_move,
+       (feature_flags & 8) = 8 AS upgrade_confers_trust_bit
+  FROM bm25_stats('tk5_bm');
+ version_did_move | upgrade_confers_trust_bit 
+------------------+---------------------------
+                8 | f
+(1 row)
+
+-- AND THE DERIVE PATH, which the stanza above does NOT reach and which is where the
+-- tidying mistake would actually be made.  bm25_upgrade only calls
+-- bm25_derive_feature_flags when the stored flags read as LEGACY ZERO; the poke above
+-- left them at (old & ~8), which is nonzero, so the upgrade carried them forward
+-- verbatim and derive never ran.  An earlier version of this suite claimed that
+-- assertion would catch bit 3 being folded into derive.  It would not have: measured,
+-- derive is unreachable from that state.
+--
+-- Stamping flags to 0 is what drives it -- the same legacy shape sql/55 uses.  The 6
+-- and 5 here ARE literal on purpose: this stanza is simulating a specific older index,
+-- unlike the flag-only toggles in PART FIVE, which read the stored values back so they
+-- perturb nothing but the bit under test.  If bit 3
+-- were ever derived, this is the assertion that fails, and the failure it prevents is
+-- the whole design: every bm25_upgrade of a legacy index would bless pre-ADR-0074
+-- residue as a token count.
+SELECT bm25_debug_stamp_version('tk5_bm', 6, 5, 0);
+ bm25_debug_stamp_version 
+--------------------------
+ 
+(1 row)
+
+SELECT (feature_flags & 8) = 8 AS trust_bit_before_derive FROM bm25_stats('tk5_bm');
+ trust_bit_before_derive 
+-------------------------
+ f
+(1 row)
+
+SELECT bm25_upgrade('tk5_bm');
+         bm25_upgrade          
+-------------------------------
+ upgraded 0 segments: v6 -> v8
+(1 row)
+
+SELECT feature_flags > 0 AS derive_ran,
+       (feature_flags & 8) = 8 AS derive_produces_trust_bit
+  FROM bm25_stats('tk5_bm');
+ derive_ran | derive_produces_trust_bit 
+------------+---------------------------
+ t          | f
+(1 row)
+
+-- The flag gates nothing on the read path -- it is consulted only by the merge
+-- estimator -- so queries answer identically with it clear.
+SELECT count(*) AS rows_with_flag_clear FROM tk5 WHERE body @@@ 'footballklubber';
+ rows_with_flag_clear 
+----------------------
+                    6
+(1 row)
+
+-- And the stored counter is reported by the probe regardless of the flag: a probe that
+-- silently zeroed an untrusted value could not distinguish "absent" from "present but
+-- not trusted", which is the distinction this whole part exists to make.
+SELECT total_tokens > 0 AS counter_still_reported FROM bm25_debug_segcat('tk5_bm');
+ counter_still_reported 
+------------------------
+ t
+(1 row)
+
+-- ----------------------------------------------------------------- PART FIVE
+-- The estimator consuming the field.
+--
+-- NO est_bytes VALUE IS EVER PRINTED HERE.  It is a sum of sizeof()s, so its value is
+-- platform-dependent -- bm25_debug_merge_budget_plan's own header says to assert
+-- relationships over it and never a number.  Everything below is a comparison of the
+-- SAME index against ITSELF with only the trust bit toggled, which is exactly the
+-- shape that survives a different struct layout.
+--
+-- Toggling the bit rather than rebuilding is what makes this a clean A/B: the corpus,
+-- the segments, nterms, ndocs and every other input are byte-for-byte identical across
+-- the two captures, so the only thing that can move the estimate is whether the
+-- estimator believed total_tokens.
+CREATE TABLE tk6 (id int primary key, body text);
+CREATE INDEX tk6_bm ON tk6 USING bm25_native (body)
+  WITH (language = 'isp108', stopwords = 'none');
+DO $$
+DECLARE i int;
+BEGIN
+  FOR i IN 0..5 LOOP
+    INSERT INTO tk6 SELECT g, repeat('footballklubber ', 12)
+      FROM generate_series(i*10+1, i*10+10) g;
+    PERFORM bm25_seal('tk6_bm');
+  END LOOP;
+END $$;
+-- Six segments, 720 runs, 3600 tokens: exactly 5x, because every source word is the
+-- same five-lexeme compound.  Dense on purpose -- the per-term and per-doc charges are
+-- untouched by this change and dilute the ratio, so a corpus of one-word documents
+-- moves the total by only ~1.7x where this one moves it ~3.3x.
+SELECT count(*) AS nsegs, sum(total_len) AS runs, sum(total_tokens) AS tokens
+  FROM bm25_debug_segcat('tk6_bm');
+ nsegs | runs | tokens 
+-------+------+--------
+     6 |  720 |   3600
+(1 row)
+
+CREATE TEMP TABLE est_flagged AS
+  SELECT gen, est_bytes FROM bm25_debug_merge_budget_plan('tk6_bm');
+SELECT bm25_debug_stamp_version('tk6_bm',
+         (SELECT format_version FROM bm25_stats('tk6_bm')),
+         (SELECT min_read_version FROM bm25_stats('tk6_bm')),
+         (SELECT (feature_flags & ~8)::bigint FROM bm25_stats('tk6_bm')));
+ bm25_debug_stamp_version 
+--------------------------
+ 
+(1 row)
+
+CREATE TEMP TABLE est_unflagged AS
+  SELECT gen, est_bytes FROM bm25_debug_merge_budget_plan('tk6_bm');
+SELECT bm25_debug_stamp_version('tk6_bm',
+         (SELECT format_version FROM bm25_stats('tk6_bm')),
+         (SELECT min_read_version FROM bm25_stats('tk6_bm')),
+         (SELECT (feature_flags | 8)::bigint FROM bm25_stats('tk6_bm')));
+ bm25_debug_stamp_version 
+--------------------------
+ 
+(1 row)
+
+-- Every segment's estimate rises once the count is believed.  Pre-change this is an
+-- equality on every row, so the A/B tooth is the strict inequality.
+SELECT bool_and(f.est_bytes > u.est_bytes) AS every_estimate_rose
+  FROM est_flagged f JOIN est_unflagged u USING (gen);
+ every_estimate_rose 
+---------------------
+ t
+(1 row)
+
+-- ENGLISH CONTROL, and it is the sharpest assertion in this suite: EXACT equality.
+-- English emits one lexeme per run, so total_tokens equals total_len and Max() picks
+-- the same number either way -- the estimate must not move by a single byte.  This is
+-- what pins "no English index sees any change", which is the compatibility promise the
+-- whole design rests on, and it holds without printing a platform-dependent value.
+CREATE TABLE tk7 (id int primary key, body text);
+CREATE INDEX tk7_bm ON tk7 USING bm25_native (body);
+INSERT INTO tk7 SELECT g, repeat('alpha bravo charlie ', 4) FROM generate_series(1, 60) g;
+SELECT bm25_seal('tk7_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+CREATE TEMP TABLE en_flagged AS
+  SELECT gen, est_bytes FROM bm25_debug_merge_budget_plan('tk7_bm');
+SELECT bm25_debug_stamp_version('tk7_bm',
+         (SELECT format_version FROM bm25_stats('tk7_bm')),
+         (SELECT min_read_version FROM bm25_stats('tk7_bm')),
+         (SELECT (feature_flags & ~8)::bigint FROM bm25_stats('tk7_bm')));
+ bm25_debug_stamp_version 
+--------------------------
+ 
+(1 row)
+
+SELECT bool_and(f.est_bytes = u.est_bytes) AS english_estimate_unmoved
+  FROM en_flagged f
+  JOIN (SELECT gen, est_bytes FROM bm25_debug_merge_budget_plan('tk7_bm')) u USING (gen);
+ english_estimate_unmoved 
+--------------------------
+ t
+(1 row)
+
+-- ------------------------------------------------------------------ PART SIX
+-- The consequence the whole change exists for: the trim's arithmetic actually moves.
+--
+-- predicted_chunks is what the chunker is expected to emit for the kept set, and it is
+-- the sensitive quantity -- `kept` does not move here because the set stays feasible in
+-- chunks either way, so asserting on `kept` would be vacuous.  Under-estimating is what
+-- made a compound index at the budget floor rewrite itself for nothing on every
+-- autovacuum: the trim predicted fewer chunks than the merge would really need,
+-- declared an infeasible set feasible, and the whole index was read, rewritten and
+-- retired before the progress check noticed it had gained nothing.
+--
+-- CHOOSING THE BUDGET.  Measured on this corpus: 49320 bytes per segment believed and
+-- 14760 unbelieved, so 295920 against 88560 across the six -- a 3.3x spread.  160 kB
+-- (163840) sits near the geometric mean, 1.81x below the believed total and 1.85x above
+-- the unbelieved one.
+--
+-- Those totals are NOT the margin that matters, and it is worth being exact about which
+-- is.  The chunker packs greedily, so what a platform difference would have to move is
+-- the per-segment estimate far enough to change the PACKING: believed 2 chunks survives
+-- a 1.51x shrink and a 1.66x growth, unbelieved 1 chunk survives a 2.22x growth.  The
+-- narrowest of those is 1.51x, which needs the 36-byte per-token charge
+-- (sizeof(AccumPosting) + 4) to fall to 24 or rise past 60 -- far outside anything
+-- struct padding does across the platforms this builds on.  Deliberately not tuned to
+-- land on a particular chunk count; the numbers are recorded here rather than asserted,
+-- exactly as sql/105 does.
+SET bm25_native.debug_budget = '160kB';
+SELECT max(predicted_chunks) AS chunks_believed FROM bm25_debug_merge_budget_plan('tk6_bm');
+ chunks_believed 
+-----------------
+               2
+(1 row)
+
+SELECT bm25_debug_stamp_version('tk6_bm',
+         (SELECT format_version FROM bm25_stats('tk6_bm')),
+         (SELECT min_read_version FROM bm25_stats('tk6_bm')),
+         (SELECT (feature_flags & ~8)::bigint FROM bm25_stats('tk6_bm')));
+ bm25_debug_stamp_version 
+--------------------------
+ 
+(1 row)
+
+SELECT max(predicted_chunks) AS chunks_unbelieved FROM bm25_debug_merge_budget_plan('tk6_bm');
+ chunks_unbelieved 
+-------------------
+                 1
+(1 row)
+
+SELECT bm25_debug_stamp_version('tk6_bm',
+         (SELECT format_version FROM bm25_stats('tk6_bm')),
+         (SELECT min_read_version FROM bm25_stats('tk6_bm')),
+         (SELECT (feature_flags | 8)::bigint FROM bm25_stats('tk6_bm')));
+ bm25_debug_stamp_version 
+--------------------------
+ 
+(1 row)
+
+RESET bm25_native.debug_budget;
+RESET enable_seqscan;
+DROP TABLE tk1;
+DROP TABLE tk2;
+DROP TABLE tk3;
+DROP TABLE tk4;
+DROP TABLE tk5;
+DROP TABLE tk6;
+DROP TABLE tk7;
+DROP TEXT SEARCH DICTIONARY pg_catalog.isp108_stem;
+DROP EXTENSION bm25_native;

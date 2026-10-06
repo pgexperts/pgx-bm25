@@ -1,0 +1,179 @@
+-- 115_orderby_jsonb_validate -- a jsonb &@@ query that no scored scan ranks is
+-- still validated (#245).
+--
+-- `ORDER BY col &@@ <jsonb>` with no `WHERE col @@@ ...` is not an index path
+-- (amoptionalkey = false): it plans as Seq Scan + Sort even with enable_seqscan
+-- off, and every row's distance is +infinity. That degradation is deliberate
+-- (TEXT-01 / #151; sql/50 and sql/87 pin it) and is unchanged here. What changed:
+-- on that fall-through nothing used to parse the jsonb, so a structurally invalid
+-- tree -- one the index path rejects at rescan -- was silently accepted. The
+-- projection now parses it with no field config (bm25_query_validate) and raises
+-- the parser's error. Field names are NOT resolved off the index, so an unknown
+-- field is still accepted there; that asymmetry is pinned below as a decision.
+--
+-- Outcomes are reported by a helper as 'ok: n rows, all inf' or
+-- 'ERROR <sqlstate>: <message>', so no Infinity row order (arbitrary under a
+-- Sort of equal keys) reaches the expected output.
+CREATE EXTENSION bm25_native;
+
+CREATE TABLE ov (id int, body text);
+INSERT INTO ov SELECT g, 'alpha beta ' || g FROM generate_series(1, 20) g;
+CREATE INDEX ov_bm ON ov USING bm25_native (body);
+ANALYZE ov;
+
+SET enable_seqscan = off;
+
+-- EXPLAIN lines for a query, for the plan guards below.
+CREATE FUNCTION ov_plan(q text) RETURNS SETOF text LANGUAGE plpgsql AS
+$$ BEGIN RETURN QUERY EXECUTE 'EXPLAIN (COSTS OFF) ' || q; END $$;
+
+-- Run a ranked query with jsonb RHS $1, either ORDER BY-only (on_index false: no
+-- scored scan exists) or anchored by the matching @@@ (on_index true: the bm25
+-- index scan parses the tree at rescan). Reports the outcome as text.
+CREATE FUNCTION ov_try(q jsonb, on_index bool) RETURNS text LANGUAGE plpgsql AS
+$$
+DECLARE
+    n     bigint;
+    allinf bool;
+BEGIN
+    IF on_index THEN
+        EXECUTE 'SELECT count(*), bool_and(d = ''Infinity''::float8) FROM '
+                '(SELECT body &@@ $1 AS d FROM ov WHERE body @@@ $1 '
+                'ORDER BY body &@@ $1 LIMIT 3) s'
+            INTO n, allinf USING q;
+    ELSE
+        EXECUTE 'SELECT count(*), bool_and(d = ''Infinity''::float8) FROM '
+                '(SELECT body &@@ $1 AS d FROM ov ORDER BY body &@@ $1 LIMIT 3) s'
+            INTO n, allinf USING q;
+    END IF;
+    RETURN format('ok: %s rows, all inf %s', n, allinf);
+EXCEPTION WHEN OTHERS THEN
+    RETURN format('ERROR %s: %s', SQLSTATE, SQLERRM);
+END
+$$;
+
+-- Plan guard: the ORDER BY-only form has no bm25 index scan, so the projection
+-- really is on the no-scan fall-through (a regression here would make the
+-- off-index cases below test the index path instead).
+SELECT count(*) FILTER (WHERE p LIKE '%Index Scan%') AS index_scans,
+       count(*) FILTER (WHERE p LIKE '%Seq Scan on ov%') AS seq_scans
+FROM ov_plan($$SELECT id FROM ov ORDER BY body &@@ '{"nonsense": 1}'::jsonb LIMIT 3$$) p;
+
+-- The issue's reproduction, verbatim shape: this used to return three Infinity
+-- rows. It is not a query tree at all.
+\set VERBOSITY terse
+SELECT id, body &@@ '{"nonsense": 1}'::jsonb FROM ov ORDER BY 2 LIMIT 3;
+\set VERBOSITY default
+
+-- The trees the index path rejects. Each must now raise off the index too, with
+-- the SAME sqlstate and message as on the index (same_as_index).
+CREATE TABLE ov_bad (label text, q jsonb);
+INSERT INTO ov_bad VALUES
+  ('not_a_node',        '{"nonsense": 1}'),
+  ('top_level_array',   '[1, 2]'),
+  ('two_keys',          '{"match": {"terms": "alpha"}, "term": {"value": "alpha"}}'),
+  ('missing_terms',     '{"match": {"field": "body"}}'),
+  ('field_not_string',  '{"match": {"field": 5, "terms": "alpha"}}'),
+  ('must_not_only',     '{"boolean": {"must_not": [{"term": {"value": "alpha"}}]}}'),
+  ('wildcard_no_star',  '{"wildcard": {"pattern": "alpha"}}'),
+  ('boost_fold_inf',    '{"boost": {"weight": 1e200, "query": {"boost": {"weight": 1e200,
+                          "query": {"match": {"terms": "alpha"}}}}}}'),
+  ('over_leaf_cap_65',
+   jsonb_build_object('boolean', jsonb_build_object('should',
+     (SELECT jsonb_agg(jsonb_build_object('match',
+               jsonb_build_object('field', 'body', 'terms', 'alpha')))
+        FROM generate_series(1, 65)))));
+
+SELECT label, ov_try(q, false) AS off_index,
+       ov_try(q, false) = ov_try(q, true) AS same_as_index
+FROM ov_bad ORDER BY label;
+
+-- Boundary: exactly at the leaf cap is valid, and still degrades to +inf.
+SELECT ov_try(jsonb_build_object('boolean', jsonb_build_object('should',
+         (SELECT jsonb_agg(jsonb_build_object('match',
+                   jsonb_build_object('field', 'body', 'terms', 'alpha')))
+            FROM generate_series(1, 64)))), false) AS at_leaf_cap_64;
+
+-- Valid trees are unchanged: +inf, no error.
+SELECT ov_try(bm25_term('body', 'alpha'), false) AS valid_term,
+       ov_try('{"match": {"terms": "alpha beta"}}', false) AS valid_match_all_fields;
+
+-- DECISION, pinned: an unknown field is a property of an index, not of the tree,
+-- so off the index it is accepted (+inf) while the index path rejects it.
+SELECT ov_try('{"match": {"field": "nosuch", "terms": "alpha"}}', false) AS unknown_field_off_index,
+       ov_try('{"match": {"field": "nosuch", "terms": "alpha"}}', true) AS unknown_field_on_index;
+
+-- The other fall-through: scans exist, but none ranks the projected query (the
+-- sql/87 shape, with a jsonb projection). It is the same resolver return, so it
+-- validates too: an invalid tree errors, a valid one is +inf as before.
+\set VERBOSITY terse
+SELECT id, body &@@ '{"nonsense": 1}'::jsonb FROM ov
+ WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha' LIMIT 3;
+\set VERBOSITY default
+SELECT bool_and(d = 'Infinity'::float8) AS unowned_valid_is_inf, count(*)
+FROM (SELECT body &@@ bm25_term('body', 'beta') AS d FROM ov
+       WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha' LIMIT 3) s;
+
+-- An owned projection is not re-validated and is unaffected: the index scan's
+-- own distance, finite.
+SELECT bool_and(d < 0) AS owned_is_finite, count(*)
+FROM (SELECT body &@@ bm25_term('body', 'alpha') AS d FROM ov
+       WHERE body @@@ bm25_term('body', 'alpha')
+       ORDER BY body &@@ bm25_term('body', 'alpha') LIMIT 3) s;
+
+-- An RHS that varies row to row: the per-call-site cache holds the last valid
+-- tree by value, so a CHANGED value is parsed again rather than waved through.
+CREATE TABLE ov_q (qid int, q jsonb);
+INSERT INTO ov_q VALUES (1, bm25_term('body', 'alpha')), (2, bm25_term('body', 'beta'));
+SELECT bool_and(d = 'Infinity'::float8) AS varying_valid_all_inf, count(*)
+FROM (SELECT ov.body &@@ ov_q.q AS d FROM ov CROSS JOIN ov_q ORDER BY ov.body &@@ ov_q.q) s;
+INSERT INTO ov_q VALUES (3, '{"match": {"field": "body"}}');
+\set VERBOSITY terse
+SELECT count(*) FROM (SELECT ov.body &@@ ov_q.q AS d FROM ov CROSS JOIN ov_q
+                       ORDER BY ov.body &@@ ov_q.q) s;
+\set VERBOSITY default
+
+-- #272: validity also depends on three PGC_SUSET wildcard guardrails
+-- (min_prefix, max_pattern_length, max_stars), so the per-call-site cache keys on
+-- them as well as on the bytes. Shape: ONE statement over two rows, so both rows
+-- evaluate the SAME &@@ call site (one FmgrInfo, one fn_extra). Each row's
+-- set_config fires earlier in the target list than its &@@ (projection evaluates
+-- in tlist order): row 1 loosens the GUC so the constant tree is valid and gets
+-- cached, row 2 restores a value that rejects it. Row 2 must raise. With the
+-- bytes-only key it returned a second Infinity row. One case per GUC, so dropping
+-- any one of the three from the key fails here.
+\set VERBOSITY terse
+-- min_prefix: prefix "ab" (2) is valid at 1, rejected at 3.
+SELECT id, set_config('bm25_native.wildcard_min_prefix',
+                      CASE id WHEN 1 THEN '1' ELSE '3' END, true) AS guc,
+       body &@@ '{"wildcard": {"pattern": "ab*"}}'::jsonb AS d
+FROM ov WHERE id <= 2;
+-- max_pattern_length: "abcdef*" (7 bytes) is valid at 256, rejected at 5.
+SELECT id, set_config('bm25_native.wildcard_max_pattern_length',
+                      CASE id WHEN 1 THEN '256' ELSE '5' END, true) AS guc,
+       body &@@ '{"wildcard": {"pattern": "abcdef*"}}'::jsonb AS d
+FROM ov WHERE id <= 2;
+-- max_stars: "abc*d*e*" (3 stars) is valid at 8, rejected at 2.
+SELECT id, set_config('bm25_native.wildcard_max_stars',
+                      CASE id WHEN 1 THEN '8' ELSE '2' END, true) AS guc,
+       body &@@ '{"wildcard": {"pattern": "abc*d*e*"}}'::jsonb AS d
+FROM ov WHERE id <= 2;
+\set VERBOSITY default
+-- Control: the same shape with the GUC held fixed at a value that accepts the
+-- tree yields two Infinity rows (the cache hit is still a pass, not an error),
+-- and set_config(..., true) left nothing behind (each statement is its own
+-- transaction).
+SELECT id, set_config('bm25_native.wildcard_min_prefix', '1', true) AS guc,
+       body &@@ '{"wildcard": {"pattern": "ab*"}}'::jsonb AS d
+FROM ov WHERE id <= 2;
+SHOW bm25_native.wildcard_min_prefix;
+
+-- Text &@@ is out of scope and unchanged: +inf off the index, no error.
+SELECT DISTINCT (body &@@ 'alpha') = 'Infinity'::float8 AS text_inf_off_index FROM ov;
+
+DROP TABLE ov_q, ov_bad;
+DROP FUNCTION ov_try(jsonb, bool);
+DROP FUNCTION ov_plan(text);
+RESET enable_seqscan;
+DROP TABLE ov;
+DROP EXTENSION bm25_native;

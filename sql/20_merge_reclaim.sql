@@ -1,0 +1,151 @@
+-- 20_merge_reclaim — XID-horizon retired-segment reclamation + stamp-and-gate page
+-- reuse. Builds several segments, tombstones half the corpus, merges (which retires
+-- the merged-away segments behind a retire_xid horizon), then drives the cluster XID
+-- horizon PAST that retire_xid and VACUUMs so bm25_reclaim_retired actually frees the
+-- retired pages back to the FSM. A later seal then REUSES those freed pages via the
+-- gated allocator, keeping the relation from growing unboundedly.
+--
+-- Why the explicit XID burn (this is the load-bearing subtlety): retire_xid is
+-- ReadNextFullTransactionId() captured at merge time — a FUTURE xid. It only becomes
+-- removable once the cluster's oldest snapshot advances PAST it, which needs real
+-- transactions to be assigned and commit. Idle VACUUMs assign no xids, so without the
+-- burn the horizon never moves and reclaim frees NOTHING (correct, conservative — but
+-- it means a plain merge+VACUUM cannot exercise the reclaim path). The burn forces the
+-- horizon forward so the drain is deterministic, which is what makes retired_after_
+-- reclaim = 0 a real gate on bm25_reclaim_retired (a no-op reclaim leaves it non-zero).
+--
+-- Load-bearing asserts: segments_collapsed (a merge actually ran -- the durable,
+-- horizon-insensitive form), retired_after_merge (its entries are still pending
+-- reclaim), retired_after_reclaim = 0 (horizon-gated reclaim drained them),
+-- size_stable (freed pages were reused, not re-extended), no_tombstones_after_merge,
+-- even_ids_present = 0.
+CREATE EXTENSION bm25_native;
+
+-- Waits until no other backend in this database holds a snapshot -- necessary
+-- alongside (not instead of) the XID burn below, since a held snapshot pins the
+-- horizon no matter how many xids get burned. See
+-- docs/adr/0031-vacuum-tests-wait-for-xmin-horizon.md for the full rationale.
+CREATE FUNCTION pg_temp.wait_for_xmin_horizon() RETURNS void AS $$
+DECLARE
+  deadline timestamptz := clock_timestamp() + interval '30 seconds';
+BEGIN
+  LOOP
+    PERFORM pg_stat_clear_snapshot();
+    EXIT WHEN NOT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND backend_xmin IS NOT NULL);
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION
+        'xmin horizon still held by another backend after 30s; VACUUM cannot reclaim';
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+-- autovacuum OFF on the test table (2026-08-16). This suite's assertions read
+-- AM-internal state whose evolution is driven by VACUUM: bm25_vacuumcleanup runs
+-- seal -> reclaim_retired -> merge_maybe -> reclaim_orphans, so an autovacuum
+-- worker landing anywhere in this file performs a cadence merge and a reclaim the
+-- suite did not ask for and cannot see. The DELETE below leaves ~400 dead tuples
+-- in an 800-row table -- far past the default trigger -- so a worker always WANTS
+-- to run here; only where the cluster happens to sit in autovacuum_naptime decides
+-- whether it lands inside this file's ~30ms window. That is a cluster-phase
+-- dependency, i.e. exactly the kind of thing that differs between a first and a
+-- back-to-back second installcheck run.
+--
+-- Turning it off makes every VACUUM in this file an explicit one. It is not known
+-- to be the cause of any observed failure (see the note on the merge below); it is
+-- removed because a suite that gates on VACUUM-driven state should own its VACUUM
+-- cadence outright rather than share it with a background worker.
+--
+-- SCOPE of the reloption, precisely: it does NOT cover anti-wraparound (forced)
+-- autovacuum, and it does NOT propagate to the table's TOAST relation, which keeps
+-- cluster defaults. Harmless here -- the body values are ~30 bytes and never toast,
+-- so that relation stays empty and idle -- but the guarantee is narrower than
+-- "autovacuum is off for this table".
+CREATE TABLE docs (id int primary key, body text)
+  WITH (autovacuum_enabled = false);
+SET enable_seqscan = off;
+INSERT INTO docs SELECT g, 'common database storage term'||(g%4) FROM generate_series(1,400) g;
+CREATE INDEX docs_bm25 ON docs USING bm25_native (body);
+INSERT INTO docs SELECT g, 'common database storage' FROM generate_series(401,600) g;
+SELECT bm25_seal('docs_bm25');
+INSERT INTO docs SELECT g, 'common database storage' FROM generate_series(601,800) g;
+SELECT bm25_seal('docs_bm25');
+-- Tombstone a large fraction, then merge: the merge drops the tombstoned segments and
+-- records one retired RANGE entry per dropped segment behind a retire_xid horizon.
+--
+-- WHERE THE MERGE ACTUALLY HAPPENS (measured 2026-08-16, and NOT what this file
+-- used to say). It is the VACUUM below, not the bm25_merge() after it. Instrumented,
+-- with autovacuum off so nothing else can interfere:
+--
+--     after DELETE, before VACUUM   nsegs 3   retired 0
+--     after VACUUM                  nsegs 1   retired 3     <-- merge + retire happen HERE
+--     after bm25_merge()            nsegs 1   retired 3     <-- no-op
+--
+-- The VACUUM's amvacuumcleanup runs bm25_merge_maybe, and its ambulkdelete pass is
+-- what first decrements live_ndocs -- which is what arms the trigger. So the
+-- explicit bm25_merge() below finds nothing left to merge, and
+-- `retired_after_merge` is really asserting "the VACUUM's entries have not been
+-- reclaimed yet", not "the merge retired something".
+--
+-- This also corrects the rationale c745344 used to leave this VACUUM unprotected:
+-- it claimed bm25_merge_select "triggers on size and count, not tombstone
+-- fraction". The opposite is true, and it is load-bearing here. Clause (a) of
+-- bm25_merge_select (src/bm25_merge.c) is a per-segment tombstone-fraction trigger
+-- (BM25_MERGE_TOMBSTONE_FRAC = 0.15, and this DELETE tombstones ~50%); the
+-- size-layer ladder cannot fire at all, because it needs BM25_MERGE_LAYER_FANOUT
+-- (4) segments in one layer and there are only 3. So this VACUUM is the
+-- horizon-sensitive step, and the wait belongs between the DELETE and this VACUUM as
+-- well as before the burn.
+DELETE FROM docs WHERE id % 2 = 0;
+SELECT pg_temp.wait_for_xmin_horizon();
+VACUUM docs;                       -- the real merge + retire
+SELECT bm25_merge('docs_bm25');    -- no-op today; kept as the explicit-path gate
+SELECT bm25_debug_retired_count('docs_bm25') > 0 AS retired_after_merge;
+-- Durable companion to the assertion above: the segments really did collapse.
+-- Unlike a retired COUNT -- which any reclaim pass may legitimately drive to 0,
+-- including the one bm25_merge(force) runs itself -- the segment count is not
+-- horizon-sensitive, so this gates "a merge happened" without depending on timing.
+SELECT count(*) = 1 AS segments_collapsed FROM bm25_debug_merge_plan('docs_bm25');
+-- Wait BEFORE burning, not after: the burn only advances nextXid, it does nothing
+-- about a snapshot another backend already holds, and the horizon is the MINIMUM
+-- across all backends -- a stale held snapshot pins it regardless of how many xids
+-- get burned afterward. Waiting first means the burn's xids are the newest thing
+-- any backend could observe, so they are what actually pushes the horizon past
+-- retire_xid.
+SELECT pg_temp.wait_for_xmin_horizon();
+-- Drive the cluster horizon past the merge's (future) retire_xid: each txid_current()
+-- in autocommit is its own transaction and consumes one xid. \gset suppresses output
+-- so the (non-deterministic) xid values never reach the expected file.
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+SELECT txid_current() AS burn \gset
+VACUUM docs;                       -- horizon now past retire_xid → reclaim drains the list
+-- GATE on bm25_reclaim_retired: with the horizon cleared, every retired RANGE entry is
+-- reclaimed and the list is empty. A no-op / broken reclaim leaves this non-zero.
+SELECT bm25_debug_retired_count('docs_bm25') AS retired_after_reclaim;
+-- Reuse without unbounded growth: a follow-up insert+seal reuses the reclaimed pages
+-- (the gated allocator accepts the now-horizon-cleared stamped DELETED pages) rather
+-- than extending the relation. Tolerant 2x bound: FSM reuse is best-effort and a small
+-- extend is fine; the leak this guards against is growth proportional to merge count.
+SELECT pg_relation_size('docs_bm25') AS size_before \gset
+INSERT INTO docs SELECT g, 'common database storage' FROM generate_series(801,1000) g;
+SELECT bm25_seal('docs_bm25');
+SELECT pg_relation_size('docs_bm25') <= :size_before * 2 AS size_stable;
+-- Merge dropped the tombstones: the surviving merged segment(s) report all-live.
+SELECT bool_and(ndocs = live_ndocs) AS no_tombstones_after_merge
+  FROM bm25_debug_merge_plan('docs_bm25');
+-- Deleted docs must not reappear after merge/reclaim recycled their pages. Scope to the
+-- originally-deleted range (ids 1..800 — the only rows the DELETE touched; the 801..1000
+-- batch legitimately re-adds even ids), so 0 means "no tombstoned doc leaked back in via
+-- a reused page".
+SELECT count(*) AS even_ids_present FROM docs WHERE id % 2 = 0 AND id <= 800;
+RESET enable_seqscan;
+DROP TABLE docs;
+DROP EXTENSION bm25_native;

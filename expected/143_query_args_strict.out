@@ -1,0 +1,432 @@
+-- 143_query_args_strict -- the jsonb query tree is validated as written, not as
+-- the parser happened to read it (#304 QUERY-02/05/01/09, #305 QUERY-03).
+--
+-- What each section returned before its fix (every one a silent answer, no error):
+--   QUERY-02  an unknown key was ignored: "mustnot" dropped the exclusion and
+--             returned every row; "fild" searched all fields; "slop" on a term
+--             and "field" on a boolean were accepted and meant nothing.
+--   QUERY-05  a fractional slop was ROUNDED: 1.7 ran as 2 ({1,2,3}) and -0.4 as 0.
+--   QUERY-01  a folded boost outside [1e-6, 1e6] was accepted if finite and > 0:
+--             5e-324 on a low-idf term underflowed boost*idf to 0 and the
+--             matching rows vanished; elsewhere it was accepted and meaningless.
+--   QUERY-03  any number of leafless {"boolean":{}} nodes parsed (the 64-leaf
+--             cap counts leaves only), each one evaluated per candidate.
+--   QUERY-09  a NULL builder result inside an array was reported as "must be a
+--             query node object".
+-- Outcomes go through qa_try, which reports the matching ids or the error's
+-- SQLSTATE and message, so one line per case carries the whole assertion.
+CREATE EXTENSION bm25_native;
+-- slop 0 / 1 / 2 / 3 select {1} / {1,2} / {1,2,3} / {1,2,3,4} for "red car", which
+-- is what lets a rounded fractional slop show up as a different row set.
+CREATE TABLE qa (id int PRIMARY KEY, body text, title text);
+INSERT INTO qa VALUES
+  (1, 'red car',         'alpha'),
+  (2, 'red x car',       'beta'),
+  (3, 'red x y car',     'gamma'),
+  (4, 'red x y z car',   'delta'),
+  (5, 'red bike',        'epsilon');
+CREATE INDEX qa_bm ON qa USING bm25_native (body, title);
+SET enable_seqscan = off;
+-- Filter path (@@@) outcome for a raw tree.
+CREATE FUNCTION qa_try(q jsonb) RETURNS text LANGUAGE plpgsql AS
+$$
+DECLARE ids int[];
+BEGIN
+    SELECT array_agg(id ORDER BY id) INTO ids FROM qa WHERE body @@@ q;
+    RETURN coalesce(ids::text, '{}');
+EXCEPTION WHEN OTHERS THEN
+    RETURN format('ERROR %s: %s', SQLSTATE, SQLERRM);
+END
+$$;
+-- Ranked path (&@@ under its @@@), membership only: a single-key ORDER BY, then
+-- the ids sorted, so no score tie order reaches the output.
+CREATE FUNCTION qa_try_ranked(q jsonb) RETURNS text LANGUAGE plpgsql AS
+$$
+DECLARE ids int[];
+BEGIN
+    SELECT array_agg(id ORDER BY id) INTO ids FROM
+      (SELECT id FROM qa WHERE body @@@ q ORDER BY body &@@ q LIMIT 10) s;
+    RETURN coalesce(ids::text, '{}');
+EXCEPTION WHEN OTHERS THEN
+    RETURN format('ERROR %s: %s', SQLSTATE, SQLERRM);
+END
+$$;
+-- Off-index path: ORDER BY &@@ with no @@@ has no scored scan, so the projection
+-- validates the tree with bm25_query_validate (#245, sql/115).
+CREATE FUNCTION qa_try_offindex(q jsonb) RETURNS text LANGUAGE plpgsql AS
+$$
+DECLARE n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM (SELECT body &@@ q FROM qa ORDER BY 1 LIMIT 3) s;
+    RETURN format('ok: %s rows', n);
+EXCEPTION WHEN OTHERS THEN
+    RETURN format('ERROR %s: %s', SQLSTATE, SQLERRM);
+END
+$$;
+-- The HINT of the error a filter query raises, or 'no error'.
+CREATE FUNCTION qa_hint(q jsonb) RETURNS text LANGUAGE plpgsql AS
+$$
+DECLARE h text;
+BEGIN
+    PERFORM count(*) FROM qa WHERE body @@@ q;
+    RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS h = PG_EXCEPTION_HINT;
+    RETURN coalesce(nullif(h, ''), '(no hint)');
+END
+$$;
+-- Do the ranked and off-index paths give the filter path's outcome? Ranked must
+-- return the same ids or the same error; off-index (which returns no ids) must
+-- raise the same error, or succeed where the filter succeeds.
+CREATE FUNCTION qa_paths_agree(q jsonb) RETURNS bool LANGUAGE sql AS
+$$ SELECT qa_try_ranked(q) = qa_try(q)
+      AND CASE WHEN qa_try(q) LIKE 'ERROR%' THEN qa_try_offindex(q) = qa_try(q)
+               ELSE qa_try_offindex(q) LIKE 'ok:%' END $$;
+-- ================================================================ QUERY-02
+-- Every builder still parses: the builders must never emit a key the closed sets
+-- reject. First the keys each one emits (the closed sets, from the builder side)...
+SELECT b, array_agg(k ORDER BY k) AS keys FROM (
+  SELECT 'match' AS b, jsonb_object_keys(bm25_match_terms('body', 'red') -> 'match') AS k
+  UNION ALL SELECT 'term', jsonb_object_keys(bm25_term('body', 'red') -> 'term')
+  UNION ALL SELECT 'phrase', jsonb_object_keys(bm25_phrase('body', 'red car') -> 'phrase')
+  UNION ALL SELECT 'wildcard', jsonb_object_keys(bm25_wildcard('body', 're*') -> 'wildcard')
+  UNION ALL SELECT 'boolean', jsonb_object_keys(bm25_boolean() -> 'boolean')
+  UNION ALL SELECT 'boost', jsonb_object_keys(bm25_boost(2.0, bm25_term('body', 'red')) -> 'boost')
+) s GROUP BY b ORDER BY b;
+    b     |            keys             
+----------+-----------------------------
+ boolean  | {must,must_not,should}
+ boost    | {query,weight}
+ match    | {field,terms}
+ phrase   | {field,ordered,phrase,slop}
+ term     | {field,value}
+ wildcard | {field,pattern}
+(6 rows)
+
+-- ...then every builder, with defaults and with every argument, through all three
+-- paths. A rejected key would show as an ERROR line here.
+CREATE TABLE qa_builders (label text, q jsonb);
+INSERT INTO qa_builders VALUES
+  ('match_terms',     bm25_match_terms('body', 'red bike')),
+  ('term',            bm25_term('body', 'bike')),
+  ('phrase_default',  bm25_phrase('body', 'red car')),
+  ('phrase_all_args', bm25_phrase('body', 'car red', 3, false)),
+  ('wildcard',        bm25_wildcard('body', 'bik*')),
+  ('boolean_default', bm25_boolean()),
+  ('boolean_all',     bm25_boolean(must     => ARRAY[bm25_term('body', 'red')],
+                                   should   => ARRAY[bm25_term('body', 'car')],
+                                   must_not => ARRAY[bm25_term('body', 'bike')])),
+  ('boost',           bm25_boost(2.0, bm25_term('body', 'bike'))),
+  ('nested',          bm25_boost(3.0, bm25_boolean(should => ARRAY[
+                        bm25_boost(2.0, bm25_phrase('body', 'red car', 1)),
+                        bm25_wildcard('title', 'alph*')])));
+SELECT label, qa_try(q) AS filter, qa_paths_agree(q) AS paths_agree
+  FROM qa_builders ORDER BY label;
+      label      |   filter    | paths_agree 
+-----------------+-------------+-------------
+ boolean_all     | {1,2,3,4}   | t
+ boolean_default | {}          | t
+ boost           | {5}         | t
+ match_terms     | {1,2,3,4,5} | t
+ nested          | {1,2}       | t
+ phrase_all_args | {1,2,3,4}   | t
+ phrase_default  | {1}         | t
+ term            | {5}         | t
+ wildcard        | {5}         | t
+(9 rows)
+
+SELECT label, bm25_debug_query_parse('qa_bm', q) AS parsed
+  FROM qa_builders WHERE label IN ('phrase_all_args', 'nested') ORDER BY label;
+      label      |                                                      parsed                                                      
+-----------------+------------------------------------------------------------------------------------------------------------------
+ nested          | BOOST(weight=3,BOOLEAN(should=[BOOST(weight=2,PHRASE(f0,"red car",slop=1,ordered=true)), WILDCARD(f1,"alph*")]))
+ phrase_all_args | PHRASE(f0,"car red",slop=3,ordered=false)
+(2 rows)
+
+-- The issue's typo: the correct spelling excludes the "car" rows...
+SELECT qa_try('{"boolean": {"must": [{"term": {"value": "red"}}],
+                            "must_not": [{"term": {"value": "car"}}]}}') AS must_not_spelled_right;
+ must_not_spelled_right 
+------------------------
+ {5}
+(1 row)
+
+-- ...and the misspellings used to return all five rows. Each now errors.
+-- The HINT offers the key a near-spelling meant; an unrelated key gets none.
+SELECT k, qa_try(q) AS outcome, qa_hint(q) AS hint
+  FROM (SELECT k, jsonb_build_object('boolean', jsonb_build_object(
+                    'must', '[{"term": {"value": "red"}}]'::jsonb,
+                    k,      '[{"term": {"value": "car"}}]'::jsonb)) AS q
+          FROM unnest(ARRAY['mustnot', 'mustNot', 'must-not', 'MUST_NOT', 'Must Not', 'not']) k) s;
+    k     |                               outcome                               |           hint           
+----------+---------------------------------------------------------------------+--------------------------
+ mustnot  | ERROR 22023: bm25: unknown key "mustnot" in a "boolean" query node  | Did you mean "must_not"?
+ mustNot  | ERROR 22023: bm25: unknown key "mustNot" in a "boolean" query node  | Did you mean "must_not"?
+ must-not | ERROR 22023: bm25: unknown key "must-not" in a "boolean" query node | Did you mean "must_not"?
+ MUST_NOT | ERROR 22023: bm25: unknown key "MUST_NOT" in a "boolean" query node | Did you mean "must_not"?
+ Must Not | ERROR 22023: bm25: unknown key "Must Not" in a "boolean" query node | Did you mean "must_not"?
+ not      | ERROR 22023: bm25: unknown key "not" in a "boolean" query node      | (no hint)
+(6 rows)
+
+-- A stray key on every node kind, including "field" where it is not inherited.
+CREATE TABLE qa_stray (label text, q jsonb);
+INSERT INTO qa_stray VALUES
+  ('term_fild',        '{"term": {"value": "red", "fild": "title"}}'),
+  ('term_slop',        '{"term": {"value": "red", "slop": 5}}'),
+  ('match_value',      '{"match": {"field": "body", "terms": "red", "value": "x"}}'),
+  ('phrase_Slop',      '{"phrase": {"phrase": "red car", "Slop": 2}}'),
+  ('wildcard_ordered', '{"wildcard": {"pattern": "bik*", "ordered": true}}'),
+  ('boolean_field',    '{"boolean": {"should": [{"term": {"value": "red"}}], "field": "title"}}'),
+  ('boost_field',      '{"boost": {"weight": 2, "query": {"term": {"value": "red"}}, "field": "body"}}'),
+  ('nested_stray',     '{"boolean": {"should": [{"boost": {"weight": 2,
+                         "query": {"term": {"value": "red", "x": null}}}}]}}');
+SELECT label, qa_try(q) AS filter, qa_paths_agree(q) AS paths_agree, qa_hint(q) AS hint
+  FROM qa_stray ORDER BY label;
+      label       |                               filter                                | paths_agree |         hint         
+------------------+---------------------------------------------------------------------+-------------+----------------------
+ boolean_field    | ERROR 22023: bm25: unknown key "field" in a "boolean" query node    | t           | (no hint)
+ boost_field      | ERROR 22023: bm25: unknown key "field" in a "boost" query node      | t           | (no hint)
+ match_value      | ERROR 22023: bm25: unknown key "value" in a "match" query node      | t           | (no hint)
+ nested_stray     | ERROR 22023: bm25: unknown key "x" in a "term" query node           | t           | (no hint)
+ phrase_Slop      | ERROR 22023: bm25: unknown key "Slop" in a "phrase" query node      | t           | Did you mean "slop"?
+ term_fild        | ERROR 22023: bm25: unknown key "fild" in a "term" query node        | t           | (no hint)
+ term_slop        | ERROR 22023: bm25: unknown key "slop" in a "term" query node        | t           | (no hint)
+ wildcard_ordered | ERROR 22023: bm25: unknown key "ordered" in a "wildcard" query node | t           | (no hint)
+(8 rows)
+
+-- The DETAIL lists the node's keys.
+SELECT count(*) FROM qa WHERE body @@@ '{"boolean": {"should": [{"term": {"value": "red"}}],
+                                                     "must-not": []}}'::jsonb;
+ERROR:  bm25: unknown key "must-not" in a "boolean" query node
+DETAIL:  A "boolean" node accepts only the keys "must", "should", "must_not".
+HINT:  Did you mean "must_not"?
+SELECT count(*) FROM qa WHERE body @@@ '{"term": {"value": "red", "fild": "body"}}'::jsonb;
+ERROR:  bm25: unknown key "fild" in a "term" query node
+DETAIL:  A "term" node accepts only the keys "field", "value".
+-- ================================================================ QUERY-05
+-- Integral values are accepted however they are spelled: 2.0 has display scale 1
+-- and 1e0 an exponent, and both are whole numbers.
+SELECT s, qa_try(jsonb_build_object('phrase', jsonb_build_object(
+            'field', 'body', 'phrase', 'red car', 'slop', s::numeric))) AS outcome
+  FROM unnest(ARRAY['0', '1', '1e0', '2', '2.0', '3.000']) s;
+   s   |  outcome  
+-------+-----------
+ 0     | {1}
+ 1     | {1,2}
+ 1e0   | {1,2}
+ 2     | {1,2,3}
+ 2.0   | {1,2,3}
+ 3.000 | {1,2,3,4}
+(6 rows)
+
+-- Fractions error. Before: 1.4 -> {1,2}, 1.7 -> {1,2,3}, -0.4 -> {1}.
+SELECT s, qa_try(jsonb_build_object('phrase', jsonb_build_object(
+            'field', 'body', 'phrase', 'red car', 'slop', s::numeric))) AS outcome
+  FROM unnest(ARRAY['1.4', '1.5', '1.7', '-0.4', '0.0001', '2e-1']) s;
+   s    |                   outcome                    
+--------+----------------------------------------------
+ 1.4    | ERROR 22023: bm25: "slop" must be an integer
+ 1.5    | ERROR 22023: bm25: "slop" must be an integer
+ 1.7    | ERROR 22023: bm25: "slop" must be an integer
+ -0.4   | ERROR 22023: bm25: "slop" must be an integer
+ 0.0001 | ERROR 22023: bm25: "slop" must be an integer
+ 2e-1   | ERROR 22023: bm25: "slop" must be an integer
+(6 rows)
+
+-- Integral but beyond int32 keeps its existing error (the int4 cast's own).
+SELECT qa_try('{"phrase": {"phrase": "red car", "slop": 1e20}}') AS beyond_int32;
+           beyond_int32            
+-----------------------------------
+ ERROR 22003: integer out of range
+(1 row)
+
+-- The builder takes an int, so it cannot produce a fraction at all.
+SELECT qa_try(bm25_phrase('body', 'red car', 1)) AS builder_slop_1;
+ builder_slop_1 
+----------------
+ {1,2}
+(1 row)
+
+-- ================================================================ QUERY-01
+-- One weight, all three paths: the range is closed and inclusive at both ends.
+CREATE TABLE qa_w (w text);
+INSERT INTO qa_w VALUES ('5e-324'), ('1e-300'), ('1e-7'), ('0.000001'), ('1'),
+                        ('1000000'), ('1000001'), ('1e308');
+SELECT w, qa_try(q) AS filter, qa_paths_agree(q) AS paths_agree
+  FROM (SELECT w, jsonb_build_object('boost', jsonb_build_object('weight', w::numeric,
+               'query', '{"term": {"field": "body", "value": "bike"}}'::jsonb)) AS q
+          FROM qa_w) s
+ ORDER BY w::numeric;
+    w     |                                                             filter                                                             | paths_agree 
+----------+--------------------------------------------------------------------------------------------------------------------------------+-------------
+ 5e-324   | ERROR 22023: bm25: "boost.weight" folds to 4.94065645841247e-324 on a scoring leaf, outside the supported range [1e-06, 1e+06] | t
+ 1e-300   | ERROR 22023: bm25: "boost.weight" folds to 1e-300 on a scoring leaf, outside the supported range [1e-06, 1e+06]                | t
+ 1e-7     | ERROR 22023: bm25: "boost.weight" folds to 1e-07 on a scoring leaf, outside the supported range [1e-06, 1e+06]                 | t
+ 0.000001 | {5}                                                                                                                            | t
+ 1        | {5}                                                                                                                            | t
+ 1000000  | {5}                                                                                                                            | t
+ 1000001  | ERROR 22023: bm25: "boost.weight" folds to 1000001 on a scoring leaf, outside the supported range [1e-06, 1e+06]               | t
+ 1e308    | ERROR 22023: bm25: "boost.weight" folds to 1e+308 on a scoring leaf, outside the supported range [1e-06, 1e+06]                | t
+(8 rows)
+
+-- Where the underflow was real: "red" is in every row, so its idf is small and
+-- 5e-324 * idf rounded to exactly 0. Before the fix this returned {} -- all five
+-- matching rows silently gone.
+SELECT qa_try('{"boost": {"weight": 5e-324, "query": {"term": {"field": "body", "value": "red"}}}}')
+       AS denormal_on_common_term;
+                                                    denormal_on_common_term                                                     
+--------------------------------------------------------------------------------------------------------------------------------
+ ERROR 22023: bm25: "boost.weight" folds to 4.94065645841247e-324 on a scoring leaf, outside the supported range [1e-06, 1e+06]
+(1 row)
+
+-- The same weights inside bm25_boolean(must => ...), built by the builders.
+SELECT w, qa_try(bm25_boolean(must => ARRAY[bm25_boost(w::float8, bm25_term('body', 'bike'))])) AS outcome
+  FROM qa_w ORDER BY w::numeric;
+    w     |                                                            outcome                                                             
+----------+--------------------------------------------------------------------------------------------------------------------------------
+ 5e-324   | ERROR 22023: bm25: "boost.weight" folds to 4.94065645841247e-324 on a scoring leaf, outside the supported range [1e-06, 1e+06]
+ 1e-300   | ERROR 22023: bm25: "boost.weight" folds to 1e-300 on a scoring leaf, outside the supported range [1e-06, 1e+06]
+ 1e-7     | ERROR 22023: bm25: "boost.weight" folds to 1e-07 on a scoring leaf, outside the supported range [1e-06, 1e+06]
+ 0.000001 | {5}
+ 1        | {5}
+ 1000000  | {5}
+ 1000001  | ERROR 22023: bm25: "boost.weight" folds to 1000001 on a scoring leaf, outside the supported range [1e-06, 1e+06]
+ 1e308    | ERROR 22023: bm25: "boost.weight" folds to 1e+308 on a scoring leaf, outside the supported range [1e-06, 1e+06]
+(8 rows)
+
+-- It is the PRODUCT that is checked: two in-range weights whose product leaves the
+-- range error, and two out-of-range weights whose product is 1 do not.
+SELECT qa_try(bm25_boost(1000, bm25_boost(1000, bm25_term('body', 'bike')))) AS product_1e6;
+ product_1e6 
+-------------
+ {5}
+(1 row)
+
+SELECT qa_try(bm25_boost(1000, bm25_boost(1001, bm25_term('body', 'bike')))) AS product_over;
+                                                   product_over                                                   
+------------------------------------------------------------------------------------------------------------------
+ ERROR 22023: bm25: "boost.weight" folds to 1001000 on a scoring leaf, outside the supported range [1e-06, 1e+06]
+(1 row)
+
+SELECT qa_try(bm25_boost(0.001, bm25_boost(0.0009, bm25_term('body', 'bike')))) AS product_under;
+                                                 product_under                                                  
+----------------------------------------------------------------------------------------------------------------
+ ERROR 22023: bm25: "boost.weight" folds to 9e-07 on a scoring leaf, outside the supported range [1e-06, 1e+06]
+(1 row)
+
+SELECT qa_try(bm25_boost(1e7, bm25_boost(1e-7, bm25_term('body', 'bike')))) AS product_back_in_range;
+ product_back_in_range 
+-----------------------
+ {5}
+(1 row)
+
+-- A boost over a whole boolean reaches every scoring leaf beneath it.
+SELECT qa_try(bm25_boost(1e7, bm25_boolean(should => ARRAY[bm25_term('body', 'bike')]))) AS over_boolean;
+                                                   over_boolean                                                    
+-------------------------------------------------------------------------------------------------------------------
+ ERROR 22023: bm25: "boost.weight" folds to 10000000 on a scoring leaf, outside the supported range [1e-06, 1e+06]
+(1 row)
+
+-- must_not leaves are exempt (their boost is never read): an out-of-range weight
+-- there is accepted and the exclusion still applies.
+SELECT qa_try(bm25_boolean(must     => ARRAY[bm25_term('body', 'red')],
+                           must_not => ARRAY[bm25_boost(1e7, bm25_term('body', 'car'))])) AS must_not_exempt;
+ must_not_exempt 
+-----------------
+ {5}
+(1 row)
+
+-- ...but the exemption is per leaf: a boost spanning both a must and a must_not
+-- leaf still errors for the must one.
+SELECT qa_try(bm25_boost(1e7, bm25_boolean(must     => ARRAY[bm25_term('body', 'red')],
+                                           must_not => ARRAY[bm25_term('body', 'car')]))) AS spans_both;
+                                                    spans_both                                                     
+-------------------------------------------------------------------------------------------------------------------
+ ERROR 22023: bm25: "boost.weight" folds to 10000000 on a scoring leaf, outside the supported range [1e-06, 1e+06]
+(1 row)
+
+-- The DETAIL says what is folded and why must_not is exempt.
+SELECT count(*) FROM qa WHERE body @@@ bm25_boost(1e7, bm25_term('body', 'bike'));
+ERROR:  bm25: "boost.weight" folds to 10000000 on a scoring leaf, outside the supported range [1e-06, 1e+06]
+DETAIL:  A leaf's weight is the product of every enclosing "boost.weight". Leaves under must_not are exempt, because they contribute no score.
+-- ================================================================ QUERY-03
+-- should = n leafless {"boolean":{}} padders plus one real leaf, under a root
+-- boolean: n + 2 nodes in all. 1022 padders is exactly 1024 nodes.
+CREATE FUNCTION qa_padded(n int) RETURNS jsonb LANGUAGE sql AS
+$$ SELECT jsonb_build_object('boolean', jsonb_build_object('should',
+            (SELECT jsonb_agg(x) FROM (SELECT '{"boolean": {}}'::jsonb AS x
+                                         FROM generate_series(1, n)
+                                       UNION ALL SELECT bm25_term('body', 'bike')) s))) $$;
+SELECT n, qa_try(qa_padded(n)) AS filter, qa_paths_agree(qa_padded(n)) AS paths_agree
+  FROM unnest(ARRAY[1022, 1023, 100000]) n ORDER BY n;
+   n    |                                           filter                                           | paths_agree 
+--------+--------------------------------------------------------------------------------------------+-------------
+   1022 | {5}                                                                                        | t
+   1023 | ERROR 22023: bm25: query has more than 1024 nodes (leaf, boolean and boost nodes combined) | t
+ 100000 | ERROR 22023: bm25: query has more than 1024 nodes (leaf, boolean and boost nodes combined) | t
+(3 rows)
+
+-- bm25_debug_query_parse never flattens, so it had neither cap on interior nodes
+-- before; the node cap is in the parser and binds it too.
+SELECT length(bm25_debug_query_parse('qa_bm', qa_padded(1022))) > 0 AS debug_at_cap;
+ debug_at_cap 
+--------------
+ t
+(1 row)
+
+\set VERBOSITY terse
+SELECT bm25_debug_query_parse('qa_bm', qa_padded(1023));
+ERROR:  bm25: query has more than 1024 nodes (leaf, boolean and boost nodes combined)
+\set VERBOSITY default
+-- Leaves count as nodes too; 64 real leaves (the leaf cap) are 65 nodes, far
+-- inside the node cap, and still parse and match.
+SELECT qa_try(jsonb_build_object('boolean', jsonb_build_object('should',
+         (SELECT jsonb_agg(bm25_term('body', CASE WHEN g = 64 THEN 'bike' ELSE 'w' || g END))
+            FROM generate_series(1, 64) g)))) AS leaf_cap_64;
+ leaf_cap_64 
+-------------
+ {5}
+(1 row)
+
+-- ================================================================ QUERY-09
+-- The builders stay STRICT: a NULL argument makes the builder NULL, and
+-- col @@@ NULL matches nothing (ADR 0015) -- unchanged, pinned as a decision.
+SELECT count(*) AS strict_null_field FROM qa WHERE body @@@ bm25_term(NULL, 'red');
+ strict_null_field 
+-------------------
+                 0
+(1 row)
+
+-- Inside an array that NULL is now named for what it is, with its position.
+SELECT qa_try(bm25_boolean(should => ARRAY[bm25_term('body', 'bike'), bm25_term(NULL, 'red')])) AS null_elem;
+                      null_elem                      
+-----------------------------------------------------
+ ERROR 22023: bm25: "should" array element 2 is NULL
+(1 row)
+
+SELECT count(*) FROM qa WHERE body @@@
+  bm25_boolean(must => ARRAY[bm25_term(NULL, 'red'), bm25_term('body', 'bike')]);
+ERROR:  bm25: "must" array element 1 is NULL
+HINT:  A query builder such as bm25_term returns NULL when any argument is NULL. For a leaf over all fields, omit "field" in a raw jsonb node, e.g. '{"term": {"value": "red"}}'::jsonb.
+-- A non-NULL non-object element keeps the generic message.
+SELECT qa_try('{"boolean": {"should": [1]}}') AS scalar_elem;
+                              scalar_elem                              
+-----------------------------------------------------------------------
+ ERROR 22023: bm25: "should" array element must be a query node object
+(1 row)
+
+-- The all-fields leaf the builders cannot produce, in raw jsonb: omit "field" (or
+-- give it as null). "red" is in every body, "alpha" only in row 1's title.
+SELECT qa_try('{"term": {"value": "alpha"}}') AS all_fields_omitted,
+       qa_try('{"term": {"field": null, "value": "alpha"}}') AS all_fields_null,
+       qa_try(bm25_term('body', 'alpha')) AS body_only;
+ all_fields_omitted | all_fields_null | body_only 
+--------------------+-----------------+-----------
+ {1}                | {1}             | {}
+(1 row)
+
+-- pg_regress shares ONE database across suites; leave no extension behind.
+DROP FUNCTION qa_try(jsonb), qa_try_ranked(jsonb), qa_try_offindex(jsonb), qa_hint(jsonb),
+  qa_paths_agree(jsonb), qa_padded(int);
+DROP TABLE qa, qa_builders, qa_stray, qa_w;
+DROP EXTENSION bm25_native;

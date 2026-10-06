@@ -1,0 +1,86 @@
+-- 54_score_key_keytype — bm25_score_key must decode its argument by the ARGUMENT's
+-- own SQL type, not the active scan's key_field type. Before the fix a bm25_score_key
+-- call whose arg type differed from the registry-head scan's key type decoded across
+-- types: an int Datum read as a uuid pointer -> DatumGetUUIDP deref -> SIGSEGV. This
+-- suite pins two contracts: (A) a cross-type call is a clean NULL (never a crash), and
+-- (B) under two concurrent scored scans on DIFFERENT key types, each bm25_score_key
+-- still resolves to its own-type scan's score.
+CREATE EXTENSION IF NOT EXISTS bm25_native;
+
+CREATE TABLE sk_int(id int PRIMARY KEY, body text);
+INSERT INTO sk_int(id, body) VALUES
+  (10, 'foo foo foo alpha'),
+  (20, 'foo bar beta gamma'),
+  (30, 'foo foo delta epsilon zeta'),
+  (40, 'foo eta theta');
+CREATE INDEX sk_int_bm25 ON sk_int USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id', language = 'english');
+SELECT bm25_seal('sk_int_bm25');
+
+CREATE TABLE sk_uuid(uid uuid PRIMARY KEY, body text);
+INSERT INTO sk_uuid(uid, body) VALUES
+  ('aaaaaaaa-0000-0000-0000-000000000001', 'foo one'),
+  ('aaaaaaaa-0000-0000-0000-000000000002', 'foo two three'),
+  ('aaaaaaaa-0000-0000-0000-000000000003', 'foo four five six');
+CREATE INDEX sk_uuid_bm25 ON sk_uuid USING bm25_native (body) INCLUDE (uid)
+  WITH (key_field = 'uid', language = 'english');
+SELECT bm25_seal('sk_uuid_bm25');
+
+SET enable_seqscan = off;
+SET enable_sort = off;
+
+-- (A) CRASH-FIX / SAFETY: a uuid-keyed scored scan is the registry head; project
+-- bm25_score_key(<int>). Pre-fix the int Datum was decoded as a uuid pointer and
+-- dereferenced -> backend crash. Post-fix the int arg decodes as int, matches no
+-- uuid-typed scan -> NULL (clean).
+SELECT bm25_score_key(20) IS NULL AS int_arg_uuid_head_is_null
+FROM sk_uuid WHERE body @@@ 'foo' ORDER BY body &@@ 'foo' LIMIT 1;
+
+-- reverse: an int-keyed scored scan is head; bm25_score_key(<uuid>) -> NULL (no match).
+SELECT bm25_score_key('aaaaaaaa-0000-0000-0000-000000000002'::uuid) IS NULL
+         AS uuid_arg_int_head_is_null
+FROM sk_int WHERE body @@@ 'foo' ORDER BY body &@@ 'foo' LIMIT 1;
+
+-- (B) CORRECTNESS under two concurrent different-key-type scored scans. Materialize
+-- each result in its own statement (temp tables) so the final comparison runs with no
+-- live scan -- plan-stable, and each build has exactly the intended scans live.
+-- ref: the true int scores from a single int scan (count()==1 hot path).
+CREATE TEMP TABLE sk_ref AS
+  SELECT id, round(bm25_score_key(id)::numeric, 6) AS s
+  FROM sk_int WHERE body @@@ 'foo' ORDER BY body &@@ 'foo';
+-- under: int outer scores while a correlated uuid inner scan is registry head. Pre-fix
+-- this CREATE crashed (int o.id decoded as the uuid head's type); post-fix o.id decodes
+-- as int and resolves to the INT scan behind the uuid head.
+CREATE TEMP TABLE sk_under AS
+  SELECT o.id, round(bm25_score_key(o.id)::numeric, 6) AS s
+  FROM sk_int o
+  WHERE o.body @@@ 'foo'
+    AND (SELECT u.uid FROM sk_uuid u
+          WHERE u.body @@@ 'foo' AND u.body <> (o.body || 'x')
+          ORDER BY u.body &@@ 'foo' LIMIT 1) IS NOT NULL
+  ORDER BY o.body &@@ 'foo';
+-- every int score under the uuid inner equals the clean int score, and is positive.
+SELECT bool_and(u.s IS NOT DISTINCT FROM r.s) AS int_correct_under_uuid_inner,
+       bool_and(u.s > 0)                       AS int_scores_positive
+FROM sk_ref r JOIN sk_under u USING (id);
+
+-- (C) int8 key coverage: bm25_score_key(<bigint>) decodes as int8 (INT8OID) and
+-- resolves against the bigint-keyed scan. Locks in the int8 argument path.
+CREATE TABLE sk_big(id bigint PRIMARY KEY, body text);
+INSERT INTO sk_big(id, body) VALUES
+  (100, 'foo foo qux'),
+  (200, 'foo quux corge grault');
+CREATE INDEX sk_big_bm25 ON sk_big USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id', language = 'english');
+SELECT bm25_seal('sk_big_bm25');
+SELECT bool_and(s > 0) AS bigint_key_resolves FROM (
+  SELECT bm25_score_key(id) AS s
+  FROM sk_big WHERE body @@@ 'foo' ORDER BY body &@@ 'foo'
+) q;
+
+RESET enable_sort;
+RESET enable_seqscan;
+DROP TABLE sk_int;
+DROP TABLE sk_uuid;
+DROP TABLE sk_big;
+DROP EXTENSION bm25_native;

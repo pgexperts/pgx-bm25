@@ -1,0 +1,243 @@
+-- Issue #150: three gaps in code whose whole job is rejecting malformed input
+-- before it reaches a page read or a raw Datum dereference.
+--
+-- HDL-02 -- a non-text opclass passed amvalidate and then crashed on DatumGetTextPP.
+--   bm25_validate read opcintype and used it ONLY to test member coverage (does the
+--   opclass declare an operator for its own input type), never to test what that
+--   type IS.  Meanwhile bm25_build_callback and bm25_insert both do
+--   DatumGetTextPP(values[f]) on every indexed key column with no type test at all,
+--   so a non-text column reaches PG_DETOAST_DATUM_PACKED on a Datum that is not a
+--   varlena: for a by-value type like int4 that dereferences the integer itself
+--   (42 -> SIGSEGV -> postmaster crash-restart), and for uuid/point it reads the
+--   leading bytes as a varlena header and yields a garbage length.
+--
+--   THE amvalidate HALF IS REPORTING ONLY.  DDL never invokes amvalidate -- only
+--   the amvalidate() SQL function does, which opr_sanity drives -- so it cannot
+--   stop a malformed opclass reaching CREATE INDEX.  The check that actually
+--   prevents the crash is bm25_check_indexed_column_types, called at the top of
+--   bm25_build AND at the top of bm25_insert.  Both are exercised below, separately,
+--   because they are genuinely different defences and only one is load bearing.
+--
+--   IT IS ITS OWN FUNCTION FOR A REASON.  It first lived inside
+--   bm25_resolve_fields' per-column loop, which is correct on the build path
+--   (resolve precedes the callback) and USELESS on the insert path: there
+--   bm25_resolve_fields is called only after the tokenize loop has already run
+--   DatumGetTextPP, so an index over a non-text column built by an older binary
+--   still died with signal 11 on its first INSERT.  Adversarial review demonstrated
+--   exactly that against the "fixed" binary.
+--
+--   It also compares the BASE type.  Comparing the raw atttypid rejected a domain
+--   over text -- which core's opclass resolution accepts and whose Datum genuinely
+--   is a text varlena -- breaking working indexes on a pure binary upgrade.
+--
+-- HDL-05 -- the two index-open gates accepted a storage-less relation.
+--   index_open accepts RELKIND_PARTITIONED_INDEX as well as RELKIND_INDEX, and a
+--   partitioned index's relcache entry DOES carry rd_indam, so the AM-identity
+--   check passed for one.  Callers then went straight to block 0 on a relation
+--   whose rd_locator is zeroed -- an internal-looking "could not open file" instead
+--   of the clean ERRCODE_WRONG_OBJECT_TYPE these helpers exist to produce, and a
+--   plausible assertion trip under --enable-cassert.  bm25_upgrade additionally
+--   took the write lock and ran a full seal before failing.
+--
+-- HDL-06 is a comment-accuracy defect in _PG_init's GUC-classification rationale
+-- (seal_threshold is read by the writer and affects shared on-disk state, so the
+-- USERSET/SUSET split does not rest on "affects only the setting session").  It has
+-- no SQL-observable behaviour and is not asserted here.
+CREATE EXTENSION bm25_native;
+-- ------------------------------------------------------------------ HDL-02 (a)
+-- FIRST, what was ALREADY safe, so the rest is read in proportion.  Naming a
+-- non-text column without an opclass never reached the AM at all: core's own
+-- opclass resolution refuses it, because bm25_native declares a default opclass
+-- only for text.  These three errors come from PostgreSQL, NOT from this fix, and
+-- they are recorded here precisely so a future reader does not mistake them for
+-- the new check firing.  The crash the issue reported was never reachable this way.
+CREATE TABLE hdl (id int, uid uuid, body text);
+INSERT INTO hdl VALUES (1, '00000000-0000-0000-0000-000000000001'::uuid, 'alpha beta gamma');
+-- int4: by-value, so had it reached the AM, DatumGetTextPP would have dereferenced
+-- the integer as a pointer.
+CREATE INDEX hdl_bad_int ON hdl USING bm25_native (id);
+ERROR:  data type integer has no default operator class for access method "bm25_native"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+-- uuid: by-reference, so its first bytes would have been read as a varlena header.
+CREATE INDEX hdl_bad_uuid ON hdl USING bm25_native (uid);
+ERROR:  data type uuid has no default operator class for access method "bm25_native"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+-- text still works, and so does varchar (binary-coercible to text, and genuinely
+-- a varlena -- refusing it would be a regression, not a fix).
+CREATE INDEX hdl_ok ON hdl USING bm25_native (body);
+SET enable_seqscan = off;
+SELECT count(*) AS text_column_indexes_fine FROM hdl WHERE body @@@ 'alpha';
+ text_column_indexes_fine 
+--------------------------
+                        1
+(1 row)
+
+RESET enable_seqscan;
+DROP INDEX hdl_ok;
+CREATE TABLE hdlv (id int, body varchar(64));
+INSERT INTO hdlv VALUES (1, 'delta epsilon');
+CREATE INDEX hdlv_idx ON hdlv USING bm25_native (body);
+SET enable_seqscan = off;
+SELECT count(*) AS varchar_column_indexes_fine FROM hdlv WHERE body @@@ 'delta';
+ varchar_column_indexes_fine 
+-----------------------------
+                           1
+(1 row)
+
+RESET enable_seqscan;
+-- The multi-column form is refused by core for the same reason -- again not this fix.
+CREATE INDEX hdl_multi ON hdl USING bm25_native (body, id);
+ERROR:  data type integer has no default operator class for access method "bm25_native"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+-- A DOMAIN over text must still be indexable.  Its atttypid is the domain's OID,
+-- not TEXTOID, but it passes core's opclass resolution (binary-coercible to text)
+-- and its Datum genuinely is a text varlena, so DatumGetTextPP on it is correct.
+-- An earlier revision of this fix compared the raw atttypid and so REJECTED these:
+-- it broke CREATE INDEX, and worse, broke every INSERT into an already-built domain
+-- index after a pure binary upgrade -- a working index killed with no DDL involved.
+-- The check resolves the base type instead.
+CREATE DOMAIN dtext AS text;
+CREATE TABLE hdld (id int, body dtext);
+INSERT INTO hdld VALUES (1, 'domain zeta eta'::dtext);
+CREATE INDEX hdld_idx ON hdld USING bm25_native (body);
+INSERT INTO hdld VALUES (2, 'domain theta iota'::dtext);   -- the insert path too
+SET enable_seqscan = off;
+SELECT count(*) AS domain_over_text_indexes_fine FROM hdld WHERE body @@@ 'domain';
+ domain_over_text_indexes_fine 
+-------------------------------
+                             2
+(1 row)
+
+RESET enable_seqscan;
+-- ------------------------------------------------------------------ HDL-02 (b)
+-- The reporting half.  A superuser can build an opclass FOR TYPE int4 against this
+-- AM -- CREATE OPERATOR CLASS does not consult amvalidate -- and pre-fix
+-- amvalidate returned true for it, saying nothing.  It must now report.
+CREATE FUNCTION hdl_match(int, text) RETURNS bool   AS 'SELECT true' LANGUAGE sql IMMUTABLE;
+CREATE FUNCTION hdl_dist (int, text) RETURNS float8 AS 'SELECT 0.0'  LANGUAGE sql IMMUTABLE;
+CREATE OPERATOR @@@ (LEFTARG = int4, RIGHTARG = text, PROCEDURE = hdl_match);
+CREATE OPERATOR &@@ (LEFTARG = int4, RIGHTARG = text, PROCEDURE = hdl_dist);
+CREATE OPERATOR CLASS int_bm25_ops FOR TYPE int4 USING bm25_native AS
+  OPERATOR 1 @@@ (int4, text),
+  OPERATOR 2 &@@ (int4, text) FOR ORDER BY float_ops;
+-- INFO lines report every defect found; the return value is what opr_sanity reads.
+-- Pre-fix this was a silent `t`.
+SELECT amvalidate(oid) AS non_text_opclass_validates
+  FROM pg_opclass WHERE opcname = 'int_bm25_ops';
+INFO:  operator class "int_bm25_ops" of access method bm25_native is declared for type integer, but the access method can only index text
+ non_text_opclass_validates 
+----------------------------
+ f
+(1 row)
+
+-- THIS is the case that matters, and the only one in this file where the new
+-- per-column type check is what fires.  Naming the malformed opclass explicitly
+-- satisfies core's opclass resolution, so pre-fix this DDL reached
+-- bm25_build_callback and ran DatumGetTextPP on Int32GetDatum(42) -- dereferencing
+-- address 42, SIGSEGV, postmaster crash-restart of every backend.  It is the exact
+-- DDL the issue reported.
+CREATE TABLE hdlopc (a int);
+INSERT INTO hdlopc VALUES (42);
+CREATE INDEX hdlopc_idx ON hdlopc USING bm25_native (a int_bm25_ops);
+ERROR:  bm25: column "a" has type integer, which bm25_native cannot index
+DETAIL:  The access method reads every indexed column as text.
+HINT:  Index a text or varchar column, or cast this one.
+-- The shipped text opclass still validates clean.
+SELECT amvalidate(oid) AS text_opclass_validates
+  FROM pg_opclass WHERE opcname = 'text_bm25_ops';
+ text_opclass_validates 
+------------------------
+ t
+(1 row)
+
+-- THE INSERT PATH, and why the check cannot live in bm25_resolve_fields.
+-- CREATE INDEX on an EMPTY table never runs bm25_build_callback, so the build-time
+-- refusal is the only thing standing between a malformed opclass and a later
+-- INSERT.  An earlier revision put the check inside bm25_resolve_fields, which on
+-- the insert path is called only AFTER the tokenize loop has already run
+-- DatumGetTextPP -- so this INSERT reached the dereference and died with signal 11
+-- even against the "fixed" binary.  The check now runs at the top of bm25_insert,
+-- before any Datum is touched.
+--
+-- Reached here by dropping the index-build refusal out of the picture: the table is
+-- empty at CREATE INDEX time, so the build path's own check is what refuses, and
+-- the INSERT below never happens.  That is the correct outcome; the point of the
+-- case is that BOTH refusals now exist, in the right order.
+CREATE TABLE hdlempty (a int);
+CREATE INDEX hdlempty_idx ON hdlempty USING bm25_native (a int_bm25_ops);
+ERROR:  bm25: column "a" has type integer, which bm25_native cannot index
+DETAIL:  The access method reads every indexed column as text.
+HINT:  Index a text or varchar column, or cast this one.
+INSERT INTO hdlempty VALUES (42);
+-- --------------------------------------------------------------------- HDL-05
+-- A partitioned index has no storage.  Every entry point that opens an index
+-- through the two gates must say so cleanly rather than read block 0 of a
+-- relation whose rd_locator is zeroed.
+CREATE TABLE part (id int, body text) PARTITION BY RANGE (id);
+CREATE TABLE part1 PARTITION OF part FOR VALUES FROM (1) TO (100);
+INSERT INTO part VALUES (1, 'partitioned alpha'), (2, 'partitioned beta');
+CREATE INDEX part_bm25 ON part USING bm25_native (body);
+-- Read gate (bm25_index_open_readable).
+SELECT * FROM bm25_stats('part_bm25');
+ERROR:  bm25: "part_bm25" has no storage
+DETAIL:  It is a partitioned index; only its leaf partitions hold bm25 data.
+HINT:  Name one of the partitions' indexes instead.
+SELECT bm25_debug_pending_head('part_bm25');
+ERROR:  bm25: "part_bm25" has no storage
+DETAIL:  It is a partitioned index; only its leaf partitions hold bm25 data.
+HINT:  Name one of the partitions' indexes instead.
+-- Write gate (bm25_index_open_owned).  bm25_upgrade is the sharper case: pre-fix
+-- it took the write lock and ran a whole seal before failing on the page read.
+SELECT bm25_seal('part_bm25');
+ERROR:  bm25: "part_bm25" has no storage
+DETAIL:  It is a partitioned index; only its leaf partitions hold bm25 data.
+HINT:  Name one of the partitions' indexes instead.
+SELECT bm25_upgrade('part_bm25');
+ERROR:  bm25: "part_bm25" has no storage
+DETAIL:  It is a partitioned index; only its leaf partitions hold bm25 data.
+HINT:  Name one of the partitions' indexes instead.
+-- The leaf partition's own index is a real index and still works, so the gate
+-- rejects the storage-less parent without rejecting the thing that holds the data.
+SET enable_seqscan = off;
+SELECT count(*) AS partition_leaf_still_queryable FROM part WHERE body @@@ 'partitioned';
+ partition_leaf_still_queryable 
+--------------------------------
+                              2
+(1 row)
+
+RESET enable_seqscan;
+SELECT nsegs >= 0 AS leaf_index_readable
+  FROM bm25_stats((SELECT indexrelid FROM pg_index
+                    WHERE indrelid = 'part1'::regclass LIMIT 1));
+ leaf_index_readable 
+---------------------
+ t
+(1 row)
+
+-- A plain TABLE is rejected too.  It used to reach IndexGetRelation before either
+-- gate ran and fail with an internal-looking XX000 "cache lookup failed for index";
+-- issue #313 (META-06/SURFACE-05) added a relkind check ahead of it, so it is now a
+-- clean 42809.  sql/149_hygiene_313 covers the other entry points and OIDs.
+-- Digits are masked, as they were when the message embedded the relation's OID.
+DO $$
+BEGIN
+    PERFORM * FROM bm25_stats('hdl');
+    RAISE NOTICE 'unexpectedly succeeded';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'sqlstate=% message=%', SQLSTATE,
+                 regexp_replace(SQLERRM, '[0-9]+', 'N', 'g');
+END $$;
+NOTICE:  sqlstate=42809 message=bmN: "hdl" is not an index
+DROP TABLE part;
+DROP TABLE hdl;
+DROP TABLE hdlv;
+DROP TABLE hdld;
+DROP DOMAIN dtext;
+DROP TABLE hdlopc;
+DROP TABLE hdlempty;
+DROP OPERATOR CLASS int_bm25_ops USING bm25_native;
+DROP OPERATOR &@@ (int4, text);
+DROP OPERATOR @@@ (int4, text);
+DROP FUNCTION hdl_match(int, text);
+DROP FUNCTION hdl_dist(int, text);
+DROP EXTENSION bm25_native;

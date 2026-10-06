@@ -1,0 +1,79 @@
+-- 52_jsonb_filter_index_only — the (text,jsonb) @@@ match operator is answerable
+-- ONLY by a bm25_native index scan. Its procedure bm25_match_jsonb has no index handle /
+-- segments / analyzer and cannot match a field-scoped jsonb query from a single heap
+-- column VALUE, so any plan that applies `col @@@ jsonb` as a filter / recheck /
+-- seqscan qual (a competing ORDER BY steals another index, a cheaper alternative
+-- index, a cost/stats flip) would SILENTLY return zero rows. This suite pins the
+-- FAIL-LOUD contract: such a plan ERRORs (never a 0-row lie), while the correct bm25_native
+-- Index Scan path returns the right set. (The (text,text) @@@ operator is a separate
+-- case: bm25_match does a real default-english match on the seqscan fallback, so it
+-- is not silently-zero and is intentionally left unchanged.)
+--
+-- The correct index path never reaches bm25_match_jsonb: the AM sets xs_recheck=false
+-- for its own matches and exposes no amgetbitmap / amcanreturn, so the operator's
+-- procedure fires ONLY when the planner demoted @@@ off the bm25_native index.
+CREATE EXTENSION bm25_native;
+
+-- Fixture WITH a primary key (a competing index the planner can steal for ORDER BY).
+CREATE TABLE jf (id int PRIMARY KEY, title text, summary text, body_plain text);
+INSERT INTO jf VALUES
+  (1, 'tort claim',    'docket entry', 'plaintiff alleges tort here'),
+  (3, 'tort battery',  'case file',    'court reviews tort and battery'),
+  (5, 'contract note', 'filing stub',  'tort claim involving theft');
+CREATE INDEX jf_bm25 ON jf USING bm25_native (title, summary, body_plain)
+  INCLUDE (id) WITH (key_field = 'id', language = 'english',
+                     boost_title = 5, boost_summary = 3, boost_body_plain = 1);
+SELECT bm25_seal('jf_bm25');
+
+-- ===========================================================================
+-- (A) FAIL-LOUD. A plan that evaluates `col @@@ jsonb` as a NON-index qual must
+-- ERROR, never silently return 0 rows.
+-- ===========================================================================
+-- A1: force a seqscan (disable index + bitmap scans) -> @@@ is a heap Filter ->
+-- bm25_match_jsonb -> ERROR.
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT id FROM jf WHERE title @@@ bm25_term('body_plain', 'tort');   -- expect ERROR
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+
+-- A2: force the primary key to serve `ORDER BY id` (enable_sort=off + enable_seqscan=off
+-- -> the only ordered plan with no disabled node is jf_pkey + Filter(@@@)) -> ERROR,
+-- not a silent 0-row set.
+SET enable_seqscan = off;
+SET enable_sort = off;
+SELECT id FROM jf WHERE title @@@ bm25_term('body_plain', 'tort') ORDER BY id;   -- expect ERROR
+RESET enable_sort;
+
+-- A3: the operator's procedure called off any scan (no index at all) also ERRORs --
+-- it cannot match a jsonb query from a bare text value.
+SELECT 'anything'::text @@@ bm25_term('body_plain', 'tort');   -- expect ERROR
+
+-- ===========================================================================
+-- (B) CORRECT PATH. When the bm25_native index answers the @@@ (Index Cond), the D12 filter
+-- path returns the right set -- exercised on a table with NO competing index so the
+-- planner deterministically uses the bm25_native index, and as the FIRST bm25_native query here
+-- (no preceding scored &@@ scan), which is exactly the case F1 was reported for.
+-- ===========================================================================
+CREATE TABLE jf2 (id int, title text, summary text, body_plain text);   -- no PK / no other index
+INSERT INTO jf2 SELECT * FROM jf;
+CREATE INDEX jf2_bm25 ON jf2 USING bm25_native (title, summary, body_plain)
+  INCLUDE (id) WITH (key_field = 'id', language = 'english',
+                     boost_title = 5, boost_summary = 3, boost_body_plain = 1);
+SELECT bm25_seal('jf2_bm25');
+
+SET enable_seqscan = off;
+-- Bare @@@ filter, first bm25_native query in the session: the filter path returns the true
+-- match set {1,3,5} (the bm25_native index is the only way to answer @@@ here).
+SELECT array_agg(id ORDER BY id) = ARRAY[1,3,5] AS bare_filter_index_ok
+FROM jf2 WHERE title @@@ bm25_term('body_plain', 'tort');
+
+-- The ranked &@@ form is unaffected (bm25_native index forced by the order-by operator).
+SELECT array_agg(id ORDER BY id) = ARRAY[1,3,5] AS ranked_ok
+FROM ( SELECT id FROM jf2 WHERE title @@@ bm25_term('body_plain', 'tort')
+        ORDER BY title &@@ bm25_term('body_plain', 'tort') ) s;
+
+RESET enable_seqscan;
+DROP TABLE jf;
+DROP TABLE jf2;
+DROP EXTENSION bm25_native;

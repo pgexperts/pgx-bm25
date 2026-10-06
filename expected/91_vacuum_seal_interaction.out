@@ -1,0 +1,276 @@
+-- Issue #147: three ways a maintenance operation and a concurrent writer interfere.
+--
+-- PEND-06 -- VACUUM's pending sweep took no seal singleton.
+--   bm25_pending_mark_dead walked the pending chain under per-page buffer locks
+--   only, while bm25_pending_drain takes its per-page SHARE locks under the seal's
+--   LockPage(ExclusiveLock).  Both walk head-to-tail releasing each page before
+--   reading the next, so they could leapfrog on a multi-part document: the drain
+--   buffers part 0 (TID still valid), the sweep then invalidates parts 0 and 1, and
+--   the drain reads part 1, sees an invalid TID, skips it, and publishes the
+--   document carrying only part 0's tokens -- a truncated token list and a wrong
+--   per-field doclen folded into the segment header's corpus statistics, skewing
+--   every other document's score until a merge rewrites it.  The sweep now takes
+--   the same singleton in ShareLock mode: it does not conflict with a concurrent
+--   appender (same mode) but does conflict with the sealer's ExclusiveLock.
+--
+-- PEND-11 -- three VACUUM-path loops used the bare interrupt check.
+--   bm25_pending_mark_dead, _drain and _truncate called CHECK_FOR_INTERRUPTS where
+--   the codebase's own stated rule (ADR 0025, and the comments in bm25_fsm.c and
+--   bm25_handler.c) requires BM25_VACUUM_DELAY_POINT for VACUUM-path loops, so
+--   autovacuum's cost budget was silently bypassed for the whole pending sweep.
+--
+-- BUILD-05 -- key_field is structural but was re-resolved from live reloptions.
+--   See the long comment at the call site in bm25_insert.  The check lives at
+--   INSERT time: amoptions receives (Datum, bool) and never sees the index, so it
+--   cannot reject the ALTER at DDL time, and a seal-time check would leave the
+--   divergent rows queued and wedge every later seal, autovacuum's included.
+--
+-- WHAT THIS SUITE CAN AND CANNOT PIN.  PEND-06 and PEND-11 are both concurrency /
+-- resource-accounting properties with no single-session observable: a lock that is
+-- taken and a delay point that is inert unless VacuumCostActive.  Asserting them
+-- from pg_regress would mean asserting on timing, which is exactly the shape of
+-- test that passes for the wrong reason.  What IS deterministic here is that the
+-- new lock acquisition does not deadlock or self-conflict against the paths that
+-- legitimately overlap it -- VACUUM against an unsealed chain, VACUUM against a
+-- concurrent seal in the same session, repeated VACUUMs -- and that is asserted
+-- below.  BUILD-05 is fully observable and is the real assertion in this file.
+CREATE EXTENSION bm25_native;
+-- ------------------------------------------------------------------- PEND-06/11
+-- The sweep now runs under the seal singleton, and vacuumcleanup's seal takes that
+-- same singleton in Exclusive mode immediately afterwards, in the same backend and
+-- the same VACUUM.  If the sweep failed to release, or took a conflicting mode,
+-- this VACUUM would self-deadlock rather than complete.
+CREATE TABLE vsi (id int, body text);
+CREATE INDEX vsi_idx ON vsi USING bm25_native (body);
+SET bm25_native.seal_threshold = '1GB';   -- keep the chain unsealed through INSERT
+INSERT INTO vsi SELECT g, 'sweep token alpha beta ' || (g % 11) FROM generate_series(1, 300) g;
+DELETE FROM vsi WHERE id % 2 = 0;
+-- Partially-tombstoned chain: the sweep invalidates half the entries, then the same
+-- VACUUM's cleanup seals the survivors.  Exercises sweep-then-drain back to back.
+-- VACUUM hands bulkdelete only REMOVABLE tuples. Another backend in this database
+-- holding an older snapshot (in installcheck, an autovacuum worker's ANALYZE) leaves
+-- the rows deleted above "recently dead": bulkdelete never sees them and nothing is
+-- tombstoned. Each VACUUM that depends on reclaiming them waits for no other backend
+-- here to hold an xmin first; sql/17_delete documents the mechanism and why the wait
+-- is sufficient, not just a narrower race.
+CREATE FUNCTION pg_temp.wait_for_xmin_horizon() RETURNS void AS $$
+DECLARE
+  deadline timestamptz := clock_timestamp() + interval '30 seconds';
+BEGIN
+  LOOP
+    PERFORM pg_stat_clear_snapshot();   -- else pg_stat_activity is cached per xact
+    EXIT WHEN NOT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND backend_xmin IS NOT NULL);
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION
+        'xmin horizon still held by another backend after 30s; VACUUM cannot reclaim';
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+SELECT pg_temp.wait_for_xmin_horizon();
+ wait_for_xmin_horizon 
+-----------------------
+ 
+(1 row)
+
+VACUUM vsi;
+SET enable_seqscan = off;
+SELECT count(*) AS live_rows_after_sweep_and_seal FROM vsi WHERE body @@@ 'alpha';
+ live_rows_after_sweep_and_seal 
+--------------------------------
+                            150
+(1 row)
+
+RESET enable_seqscan;
+SELECT count(*) AS expected_live FROM vsi;
+ expected_live 
+---------------
+           150
+(1 row)
+
+-- Repeated VACUUM over an already-sealed index: the singleton must be re-acquirable.
+VACUUM vsi;
+VACUUM vsi;
+SELECT bm25_debug_pending_head('vsi_idx') IS NULL AS chain_detached;
+ chain_detached 
+----------------
+ t
+(1 row)
+
+-- A seal issued explicitly in the same session that just ran VACUUM: proves the
+-- sweep left no lock behind (an unreleased ShareLock would block this Exclusive
+-- acquisition against itself and hang the suite).
+INSERT INTO vsi SELECT g, 'second wave gamma ' || (g % 5) FROM generate_series(1001, 1100) g;
+SELECT bm25_seal('vsi_idx');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT bm25_debug_pending_head('vsi_idx') IS NULL AS chain_detached_after_manual_seal;
+ chain_detached_after_manual_seal 
+----------------------------------
+ t
+(1 row)
+
+-- --------------------------------------------------------------------- BUILD-05
+-- Two INCLUDE columns of DIFFERENT width, so an ALTER between them changes the
+-- KEYMAP key_type/key_size -- the divergence that corrupts the on-disk keymap.
+CREATE TABLE kf (id int, uid uuid, body text);
+INSERT INTO kf SELECT g, ('00000000-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid,
+                      'key config token delta ' || (g % 7)
+  FROM generate_series(1, 50) g;
+CREATE INDEX kf_idx ON kf USING bm25_native (body) INCLUDE (id, uid) WITH (key_field = 'id');
+SELECT bm25_seal('kf_idx');   -- segments now carry an int4 KEYMAP
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+-- The ALTER itself is still accepted: amoptions receives (Datum, bool) and never
+-- sees the index, so there is no DDL-time hook that could refuse it.  Documented,
+-- not an oversight.
+ALTER INDEX kf_idx SET (key_field = 'uid');
+-- The INSERT is what gets refused.  A row resolving to a uuid key cannot join an
+-- index whose segments carry int4 keys.  Pre-fix this succeeded, the row entered
+-- the pending chain, and the next seal published a segment whose KEYMAP disagreed
+-- with every existing one -- which a later merge silently re-keyed to whichever
+-- segment it read first.
+INSERT INTO kf VALUES (101, '00000000-0000-0000-0000-000000000101'::uuid,
+                       'key config token epsilon one');
+ERROR:  bm25: key_field does not match the key column this index was built with
+DETAIL:  This row resolves key_field to column "uid" (key type 3, width 16); the index was built with column "id" (key type 1, width 4).
+HINT:  key_field is structural, not a tunable knob. Restore the previous key_field, or REINDEX after changing it.
+-- Nothing entered the chain, so the index is not wedged.  This is the whole reason
+-- the check is at insert time rather than seal time: a seal-time refusal would
+-- leave the divergent rows queued, and every later seal -- including autovacuum's
+-- -- would hit them and fail identically, with REINDEX the only way out.
+SELECT bm25_debug_pending_head('kf_idx') IS NULL AS chain_never_poisoned;
+ chain_never_poisoned 
+----------------------
+ t
+(1 row)
+
+-- A VACUUM (which seals) therefore still succeeds while the reloption is wrong.
+VACUUM kf;
+-- Restoring key_field is enough to recover; no REINDEX required.
+ALTER INDEX kf_idx SET (key_field = 'id');
+INSERT INTO kf SELECT g, ('00000000-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid,
+                      'key config token epsilon ' || (g % 7)
+  FROM generate_series(101, 120) g;
+SELECT bm25_seal('kf_idx');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT bm25_debug_pending_head('kf_idx') IS NULL AS seal_succeeds_once_config_agrees;
+ seal_succeeds_once_config_agrees 
+----------------------------------
+ t
+(1 row)
+
+SET enable_seqscan = off;
+SELECT count(*) AS rows_matching_after_recovery FROM kf WHERE body @@@ 'epsilon';
+ rows_matching_after_recovery 
+------------------------------
+                           20
+(1 row)
+
+RESET enable_seqscan;
+-- A keyless index is unaffected as long as it STAYS keyless: nothing changed, so
+-- nothing disagrees.
+-- INCLUDE (id) but deliberately NO key_field: the index is keyless, yet 'id' is a
+-- resolvable column, so a later ALTER ... SET (key_field='id') gets past
+-- bm25_resolve_fields' column check and actually reaches the key-config gate.
+-- Without the INCLUDE, that ALTER is refused earlier for an unrelated reason and
+-- the keyless->keyed direction below would not be exercised at all.
+CREATE TABLE nokey (id int, body text);
+CREATE INDEX nokey_idx ON nokey USING bm25_native (body) INCLUDE (id);
+INSERT INTO nokey SELECT g, 'keyless token zeta ' || (g % 3) FROM generate_series(1, 40) g;
+SELECT bm25_seal('nokey_idx');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT bm25_debug_pending_head('nokey_idx') IS NULL AS keyless_seal_unaffected;
+ keyless_seal_unaffected 
+-------------------------
+ t
+(1 row)
+
+-- ------------------------------------------- both directions across the key/keyless
+-- The two transitions an earlier version of this check let through.  Each produces
+-- exactly the mixed-KEYMAP state the check exists to prevent, so each must be
+-- refused; neither was, because the check returned early on a keyless resolution
+-- and skipped past keyless segments when looking for something to compare against.
+-- (1) KEYED -> KEYLESS.  RESET makes the next row resolve to no key at all; the
+-- early return let it into the chain and the seal published a keyless segment into
+-- a keyed catalog.
+ALTER INDEX kf_idx RESET (key_field);
+INSERT INTO kf VALUES (201, '00000000-0000-0000-0000-000000000201'::uuid,
+                       'key config token reset direction');
+ERROR:  bm25: key_field does not match the key column this index was built with
+DETAIL:  This row resolves key_field to no key column (key type 0, width 0); the index was built with column "id" (key type 1, width 4).
+HINT:  key_field is structural, not a tunable knob. Restore the previous key_field, or REINDEX after changing it.
+SELECT bm25_debug_pending_head('kf_idx') IS NULL AS reset_direction_chain_clean;
+ reset_direction_chain_clean 
+-----------------------------
+ t
+(1 row)
+
+ALTER INDEX kf_idx SET (key_field = 'id');   -- restore
+-- (2) KEYLESS -> KEYED.  Skipping keyless segments left the loop with nothing to
+-- compare, so the check passed vacuously and the seal published a keyed segment
+-- into a keyless catalog -- after which the next merge (bm25_merge_maybe fires one
+-- at autovacuum cadence) took its key config from the keyless segment and silently
+-- dropped the committed row's key while key_field was still set.
+ALTER INDEX nokey_idx SET (key_field = 'id');
+INSERT INTO nokey VALUES (201, 'keyless token becoming keyed');
+ERROR:  bm25: key_field does not match the key column this index was built with
+DETAIL:  This row resolves key_field to column "id" (key type 1, width 4); the index was built with no key column (key type 0, width 0).
+HINT:  key_field is structural, not a tunable knob. Restore the previous key_field, or REINDEX after changing it.
+SELECT bm25_debug_pending_head('nokey_idx') IS NULL AS set_direction_chain_clean;
+ set_direction_chain_clean 
+---------------------------
+ t
+(1 row)
+
+ALTER INDEX nokey_idx RESET (key_field);     -- restore
+-- Both indexes are still sealable and still correct after the two refusals.
+SELECT bm25_seal('kf_idx');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT bm25_seal('nokey_idx');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SET enable_seqscan = off;
+SELECT count(*) AS kf_rows FROM kf WHERE body @@@ 'config';
+ kf_rows 
+---------
+      70
+(1 row)
+
+SELECT count(*) AS nokey_rows FROM nokey WHERE body @@@ 'zeta';
+ nokey_rows 
+------------
+         40
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE vsi;
+DROP TABLE kf;
+DROP TABLE nokey;
+DROP EXTENSION bm25_native;

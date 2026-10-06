@@ -1,0 +1,59 @@
+-- 100_ingest_token_ceiling: both ingest paths agree on what is indexable (#158).
+--
+-- The INSERT path has always capped a document at PG_UINT16_MAX tokens, because
+-- BM25PendingTermEntry.tf is uint16 on disk. CREATE INDEX bypasses the pending list
+-- entirely and feeds the accumulator, whose AccumPosting.tf is uint32, so it had no
+-- ceiling at all.
+--
+-- The consequence was not a missing check in the abstract: the SAME ROW was accepted or
+-- rejected depending on index-creation order. Load-then-index worked; index-then-load
+-- did not, for byte-identical data. And it was durable rather than a one-off, because
+-- REINDEX takes the builder path -- an index in that state rebuilt into the same state
+-- instead of surfacing the limit.
+CREATE EXTENSION bm25_native;
+
+-- 70000 tokens, comfortably over the 65535 ceiling.
+CREATE TABLE ceil_a (id int primary key, body text);
+INSERT INTO ceil_a SELECT 1, (SELECT string_agg('t'||g, ' ') FROM generate_series(1,70000) g);
+
+\set VERBOSITY terse
+-- LOAD THEN INDEX. This used to succeed and produce a sealed segment carrying
+-- tf > 65535 for some term; it now refuses, like the other path always has.
+CREATE INDEX ceil_a_bm ON ceil_a USING bm25_native (body);
+\set VERBOSITY default
+
+-- INDEX THEN LOAD. Unchanged: this has always been rejected.
+CREATE TABLE ceil_b (id int primary key, body text);
+CREATE INDEX ceil_b_bm ON ceil_b USING bm25_native (body);
+\set VERBOSITY terse
+INSERT INTO ceil_b SELECT 1, (SELECT string_agg('t'||g, ' ') FROM generate_series(1,70000) g);
+\set VERBOSITY default
+
+-- The ceiling is on the DOCUMENT, summed across fields -- not per field. Two fields of
+-- 40000 tokens each is 80000 for the row, so it is refused even though neither column
+-- reaches the limit alone. This is the case a per-field check would have missed.
+CREATE TABLE ceil_multi (id int primary key, a text, b text);
+INSERT INTO ceil_multi SELECT 1,
+  (SELECT string_agg('x'||g, ' ') FROM generate_series(1,40000) g),
+  (SELECT string_agg('y'||g, ' ') FROM generate_series(1,40000) g);
+\set VERBOSITY terse
+CREATE INDEX ceil_multi_bm ON ceil_multi USING bm25_native (a, b);
+\set VERBOSITY default
+
+-- A document just UNDER the ceiling still indexes on both paths, so the cap did not
+-- swallow the useful range. 60000 distinct tokens, well inside 65535.
+CREATE TABLE ceil_ok (id int primary key, body text);
+INSERT INTO ceil_ok SELECT 1, (SELECT string_agg('u'||g, ' ') FROM generate_series(1,60000) g);
+CREATE INDEX ceil_ok_bm ON ceil_ok USING bm25_native (body);
+SET enable_seqscan = off;
+SELECT count(*) AS builder_path_ok FROM ceil_ok WHERE body @@@ 'u42';
+-- And the same size through the INSERT path.
+INSERT INTO ceil_ok SELECT 2, (SELECT string_agg('v'||g, ' ') FROM generate_series(1,60000) g);
+SELECT count(*) AS insert_path_ok FROM ceil_ok WHERE body @@@ 'v42';
+RESET enable_seqscan;
+
+DROP TABLE ceil_ok;
+DROP TABLE ceil_multi;
+DROP TABLE ceil_b;
+DROP TABLE ceil_a;
+DROP EXTENSION bm25_native;

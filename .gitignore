@@ -1,0 +1,39 @@
+# Build artifacts (PGXS)
+*.o
+*.so
+*.bc
+*.dylib
+
+# pg_regress / TAP test output
+results/
+regression.diffs
+regression.out
+tmp_check/
+log/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local no-sudo test cluster (isolated PG 18 instance + logs)
+_localtest/
+
+# PG18 extension_control_path lookup dir for the no-sudo harness: symlinks to
+# the real root .control/.sql, created by harness setup. Not a build artifact.
+extension/
+
+# Local clangd config (machine-specific include paths)
+.clangd
+
+# macOS / editors
+.DS_Store
+*.swp
+
+# Local development tooling state (never published)
+.claude/
+.superpowers/
+.codebase-memory/
+graphify-out/
+
+# Internal design plans and specs (not part of the public tree)
+docs/superpowers/

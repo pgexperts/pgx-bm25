@@ -1,0 +1,443 @@
+-- 136_page_lever -- the raw corruption lever (bm25_debug_poke_page) and the layout
+-- table it is aimed with (bm25_debug_layout), added for the corrupt-pointer tests of
+-- issues #302/#303/#309.
+--
+-- The stamp levers each forge one named field. The remaining corrupt-pointer tests need
+-- about twenty more (metapage pointers, retired roots, catalog gen, fieldcfg field_id,
+-- pending field_id, DICT/POS nextblk, impact max_tf, pd_special), so they get one raw
+-- writer plus a table of offsets instead. This suite characterizes both: the layout
+-- rows, the writer's argument and result checks, an exact round trip, and one poke that
+-- reaches a validator the catalog walkers already run.
+--
+-- Endian-independent: every multi-byte value poked here reads the same either way round
+-- (\x7f7f7f7f, \x0101, \xffff), as in 96_wal_page_determinism. Privileges are in
+-- 63_debug_privileges.
+CREATE EXTENSION bm25_native;
+-- SQLSTATE beside the message. The index's block count and the metapage's pd_lower are
+-- stripped: they depend on the page layout, not on the check under test.
+CREATE FUNCTION pg_temp.err_of(q text) RETURNS text AS $$
+BEGIN
+    EXECUTE q;
+    RETURN 'NO ERROR RAISED';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' ' ||
+           regexp_replace(regexp_replace(SQLERRM, 'block \d+ is past the end of the index \(\d+ blocks\)',
+                                         'block N is past the end of the index (N blocks)'),
+                          'hole \[\d+, \d+\)', 'hole [pd_lower, pd_upper)', 'g');
+END; $$ LANGUAGE plpgsql;
+-- Page offset of a struct member placed at a page anchor: anchor + member.
+CREATE FUNCTION pg_temp.at(anchor text, s text, f text) RETURNS int AS $$
+    SELECT (SELECT off FROM bm25_debug_layout() WHERE struct = 'page' AND field = anchor)
+         + (SELECT off FROM bm25_debug_layout() WHERE struct = s AND field = f);
+$$ LANGUAGE sql;
+CREATE FUNCTION pg_temp.blk_size() RETURNS int AS $$
+    SELECT size FROM bm25_debug_layout() WHERE struct = 'page' AND field = '*';
+$$ LANGUAGE sql;
+CREATE FUNCTION pg_temp.hdr(f text) RETURNS int AS $$
+    SELECT off FROM bm25_debug_layout() WHERE struct = 'PageHeaderData' AND field = f;
+$$ LANGUAGE sql;
+-- ======================================================= 1. layout table
+-- The whole table, in declaration order. It doubles as a SQL pin of the on-disk struct
+-- sizes and offsets: a format change shows up here as a diff.
+SELECT l.struct, l.field, l.off, l.size
+  FROM bm25_debug_layout() WITH ORDINALITY AS l(struct, field, off, size, n)
+ ORDER BY l.n;
+        struct         |         field         | off  | size 
+-----------------------+-----------------------+------+------
+ PageHeaderData        | *                     |    0 |   24
+ PageHeaderData        | pd_lsn                |    0 |    8
+ PageHeaderData        | pd_checksum           |    8 |    2
+ PageHeaderData        | pd_flags              |   10 |    2
+ PageHeaderData        | pd_lower              |   12 |    2
+ PageHeaderData        | pd_upper              |   14 |    2
+ PageHeaderData        | pd_special            |   16 |    2
+ PageHeaderData        | pd_pagesize_version   |   18 |    2
+ PageHeaderData        | pd_prune_xid          |   20 |    4
+ page                  | *                     |    0 | 8192
+ page                  | contents              |   24 | 8144
+ page                  | special               | 8168 |   24
+ BM25PageOpaque        | *                     |    0 |   24
+ BM25PageOpaque        | flags                 |    0 |    2
+ BM25PageOpaque        | unused                |    2 |    2
+ BM25PageOpaque        | nextblk               |    4 |    4
+ BM25PageOpaque        | retire_xid            |    8 |    8
+ BM25PageOpaque        | seg_gen               |   16 |    4
+ BM25MetaPageData      | *                     |    0 |  120
+ BM25MetaPageData      | magic                 |    0 |    4
+ BM25MetaPageData      | format_version        |    4 |    4
+ BM25MetaPageData      | k1                    |    8 |    8
+ BM25MetaPageData      | b                     |   16 |    8
+ BM25MetaPageData      | pending_head          |   24 |    4
+ BM25MetaPageData      | pending_tail          |   28 |    4
+ BM25MetaPageData      | pending_tail_free     |   32 |    4
+ BM25MetaPageData      | pending_npages        |   36 |    4
+ BM25MetaPageData      | pending_ndocs         |   40 |    8
+ BM25MetaPageData      | segcat_root           |   48 |    4
+ BM25MetaPageData      | nsegs                 |   52 |    4
+ BM25MetaPageData      | ndocs                 |   56 |    8
+ BM25MetaPageData      | total_len             |   64 |    8
+ BM25MetaPageData      | retired_head          |   72 |    4
+ BM25MetaPageData      | next_gen              |   76 |    4
+ BM25MetaPageData      | analyzer_fingerprint  |   80 |    4
+ BM25MetaPageData      | field_config_blkno    |   84 |    4
+ BM25MetaPageData      | field_count           |   88 |    4
+ BM25MetaPageData      | min_read_version      |   92 |    4
+ BM25MetaPageData      | feature_flags         |   96 |    4
+ BM25MetaPageData      | reserved_tail_pad     |  100 |    4
+ BM25MetaPageData      | orphan_ops_begun      |  104 |    4
+ BM25MetaPageData      | orphan_ops_done       |  108 |    4
+ BM25MetaPageData      | swept_epoch           |  112 |    8
+ BM25SegCatEntry       | *                     |    0 |   40
+ BM25SegCatEntry       | header_blkno          |    0 |    4
+ BM25SegCatEntry       | total_tokens          |    4 |    4
+ BM25SegCatEntry       | ndocs                 |    8 |    8
+ BM25SegCatEntry       | live_ndocs            |   16 |    8
+ BM25SegCatEntry       | total_len             |   24 |    8
+ BM25SegCatEntry       | nterms                |   32 |    4
+ BM25SegCatEntry       | gen                   |   36 |    4
+ BM25RetiredEntry      | *                     |    0 |   48
+ BM25RetiredEntry      | header_blkno          |    0 |    4
+ BM25RetiredEntry      | dict_root             |    4 |    4
+ BM25RetiredEntry      | norms_root            |    8 |    4
+ BM25RetiredEntry      | livedocs_root         |   12 |    4
+ BM25RetiredEntry      | docmap_root           |   16 |    4
+ BM25RetiredEntry      | posts_root            |   20 |    4
+ BM25RetiredEntry      | keymap_root           |   24 |    4
+ BM25RetiredEntry      | pos_root              |   28 |    4
+ BM25RetiredEntry      | gen                   |   32 |    4
+ BM25RetiredEntry      | retire_xid            |   40 |    8
+ BM25SegmentHeader     | *                     |    0 |   64
+ BM25SegmentHeader     | gen                   |    0 |    4
+ BM25SegmentHeader     | total_tokens          |    4 |    4
+ BM25SegmentHeader     | ndocs                 |    8 |    8
+ BM25SegmentHeader     | total_len             |   16 |    8
+ BM25SegmentHeader     | nterms                |   24 |    4
+ BM25SegmentHeader     | dict_root             |   28 |    4
+ BM25SegmentHeader     | norms_root            |   32 |    4
+ BM25SegmentHeader     | livedocs_root         |   36 |    4
+ BM25SegmentHeader     | docmap_root           |   40 |    4
+ BM25SegmentHeader     | posts_root            |   44 |    4
+ BM25SegmentHeader     | field_count           |   48 |    4
+ BM25SegmentHeader     | pos_root              |   52 |    4
+ BM25SegmentHeader     | keymap_root           |   56 |    4
+ BM25KeymapHeader      | *                     |    0 |    8
+ BM25KeymapHeader      | key_type              |    0 |    1
+ BM25KeymapHeader      | pad0                  |    1 |    1
+ BM25KeymapHeader      | key_size              |    2 |    2
+ BM25KeymapHeader      | ndocs                 |    4 |    4
+ BM25DictEntry         | *                     |    0 |   20
+ BM25DictEntry         | df                    |    0 |    4
+ BM25DictEntry         | post_root             |    4 |    4
+ BM25DictEntry         | post_off              |    8 |    2
+ BM25DictEntry         | termlen               |   10 |    2
+ BM25DictEntry         | pos_post_root         |   12 |    4
+ BM25DictEntry         | pos_post_off          |   16 |    2
+ BM25DictEntry         | dict_pad              |   18 |    2
+ BM25BlockHeader       | *                     |    0 |   16
+ BM25BlockHeader       | ndocs                 |    0 |    2
+ BM25BlockHeader       | last_docid            |    4 |    4
+ BM25BlockHeader       | docid_bytes           |    8 |    2
+ BM25BlockHeader       | tf_bytes              |   10 |    2
+ BM25BlockHeader       | field_rle_bytes       |   12 |    2
+ BM25BlockHeader       | impact_bytes          |   14 |    2
+ impact_table          | *                     |    0 |  289
+ impact_table          | nfields               |    0 |    1
+ impact_table          | entries               |    1 |  288
+ impact_entry          | *                     |    0 |    9
+ impact_entry          | field_id              |    0 |    1
+ impact_entry          | max_tf                |    1 |    4
+ impact_entry          | min_doclen            |    5 |    4
+ BM25FieldConfigHeader | *                     |    0 |  132
+ BM25FieldConfigHeader | field_count           |    0 |    4
+ BM25FieldConfigHeader | per_field_fingerprint |    4 |  128
+ BM25FieldConfig       | *                     |    0 |  136
+ BM25FieldConfig       | field_id              |    0 |    4
+ BM25FieldConfig       | field_name            |    4 |   64
+ BM25FieldConfig       | k1                    |   72 |    8
+ BM25FieldConfig       | b                     |   80 |    8
+ BM25FieldConfig       | boost                 |   88 |    8
+ BM25FieldConfig       | tokenizer_type        |   96 |    4
+ BM25FieldConfig       | stemmer_name          |  100 |   32
+ BM25KeyStamp          | *                     |    0 |   12
+ BM25KeyStamp          | magic                 |    0 |    4
+ BM25KeyStamp          | key_type              |    4 |    1
+ BM25KeyStamp          | pad0                  |    5 |    1
+ BM25KeyStamp          | key_size              |    6 |    2
+ BM25KeyStamp          | key_attno             |    8 |    2
+ BM25KeyStamp          | pad1                  |   10 |    2
+ BM25PendingDocHeader  | *                     |    0 |   40
+ BM25PendingDocHeader  | tid                   |    0 |    6
+ BM25PendingDocHeader  | nfieldlens            |    6 |    2
+ BM25PendingDocHeader  | ndocterms             |    8 |    4
+ BM25PendingDocHeader  | doclen                |   12 |    4
+ BM25PendingDocHeader  | flags                 |   16 |    4
+ BM25PendingDocHeader  | key_type              |   20 |    1
+ BM25PendingDocHeader  | key_pad0              |   21 |    1
+ BM25PendingDocHeader  | key_size              |   22 |    2
+ BM25PendingDocHeader  | key                   |   24 |   16
+ BM25PendingTermEntry  | *                     |    0 |    8
+ BM25PendingTermEntry  | termlen               |    0 |    2
+ BM25PendingTermEntry  | tf                    |    2 |    2
+ BM25PendingTermEntry  | field_id              |    4 |    2
+ BM25PendingTermEntry  | pos_bytes             |    6 |    2
+(136 rows)
+
+-- Every struct a corruption test addresses is present.
+SELECT want AS missing_struct
+  FROM unnest(ARRAY['PageHeaderData', 'page', 'BM25PageOpaque', 'BM25MetaPageData',
+                    'BM25SegCatEntry', 'BM25RetiredEntry', 'BM25SegmentHeader',
+                    'BM25KeymapHeader', 'BM25DictEntry', 'BM25BlockHeader',
+                    'impact_table', 'impact_entry', 'BM25FieldConfigHeader',
+                    'BM25FieldConfig', 'BM25KeyStamp', 'BM25PendingDocHeader',
+                    'BM25PendingTermEntry']) AS want
+ WHERE NOT EXISTS (SELECT 1 FROM bm25_debug_layout() WHERE struct = want AND field = '*');
+ missing_struct 
+----------------
+(0 rows)
+
+-- Internal consistency: every member lies inside its struct, and no two members of a
+-- struct overlap (the 'page' anchors are deliberately disjoint too).
+SELECT m.struct, m.field AS member_outside_struct
+  FROM bm25_debug_layout() m JOIN bm25_debug_layout() w
+    ON w.struct = m.struct AND w.field = '*'
+ WHERE m.field <> '*' AND (m.off < 0 OR m.size <= 0 OR m.off + m.size > w.size);
+ struct | member_outside_struct 
+--------+-----------------------
+(0 rows)
+
+SELECT a.struct, a.field, b.field AS overlaps
+  FROM bm25_debug_layout() a JOIN bm25_debug_layout() b
+    ON a.struct = b.struct AND a.field < b.field
+ WHERE a.field <> '*' AND b.field <> '*'
+   AND a.off < b.off + b.size AND b.off < a.off + a.size;
+ struct | field | overlaps 
+--------+-------+----------
+(0 rows)
+
+-- ======================================================= 2. argument checks
+CREATE TABLE pl_docs (id int PRIMARY KEY, body text);
+INSERT INTO pl_docs VALUES (1, 'alpha beta'), (2, 'beta gamma'), (3, 'gamma delta');
+-- Sixty distinct terms, so the DICT page's pd_lower is well past 257 (section 3).
+INSERT INTO pl_docs SELECT g, 'w' || g FROM generate_series(10, 69) g;
+CREATE INDEX pl_bm ON pl_docs USING bm25_native (body);
+SELECT bm25_seal('pl_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+-- Not a block number; past the end of the index; nothing to write.
+SELECT pg_temp.err_of($q$SELECT bm25_debug_poke_page('pl_bm', -1, 100, '\x00')$q$) AS neg_block;
+                         neg_block                          
+------------------------------------------------------------
+ 22023 bm25_debug_poke_page: block -1 is not a block number
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT bm25_debug_poke_page('pl_bm', 4294967295, 100, '\x00')$q$)
+       AS invalid_block;
+                           invalid_block                            
+--------------------------------------------------------------------
+ 22023 bm25_debug_poke_page: block 4294967295 is not a block number
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT bm25_debug_poke_page('pl_bm', bm25_debug_npages('pl_bm'), 100, '\x00')$q$)
+       AS past_end;
+                                  past_end                                   
+-----------------------------------------------------------------------------
+ 22023 bm25_debug_poke_page: block N is past the end of the index (N blocks)
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT bm25_debug_poke_page('pl_bm', 0, 100, '')$q$) AS empty;
+                     empty                     
+-----------------------------------------------
+ 22023 bm25_debug_poke_page: no bytes to write
+(1 row)
+
+-- The range: below pd_flags (pd_lsn and pd_checksum are rewritten by WAL and by the
+-- buffer write, so a poke there would be lost), negative, and past the block's end.
+SELECT pg_temp.err_of(format($q$SELECT bm25_debug_poke_page('pl_bm', 0, %s, '\x00')$q$,
+                             pg_temp.hdr('pd_checksum'))) AS into_checksum;
+                                        into_checksum                                         
+----------------------------------------------------------------------------------------------
+ 22023 bm25_debug_poke_page: bytes [8, 9) are outside the writable range [10, 8192) of a page
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT bm25_debug_poke_page('pl_bm', 0, -5, '\x00')$q$) AS neg_off;
+                                            neg_off                                             
+------------------------------------------------------------------------------------------------
+ 22023 bm25_debug_poke_page: bytes [-5, -4) are outside the writable range [10, 8192) of a page
+(1 row)
+
+SELECT pg_temp.err_of(format($q$SELECT bm25_debug_poke_page('pl_bm', 0, %s, '\x0000')$q$,
+                             pg_temp.blk_size() - 1)) AS past_block;
+                                             past_block                                             
+----------------------------------------------------------------------------------------------------
+ 22023 bm25_debug_poke_page: bytes [8191, 8193) are outside the writable range [10, 8192) of a page
+(1 row)
+
+-- ======================================================= 3. result checks
+-- A poke whose result would fail PostgreSQL's page header check is refused: such a page
+-- reads fine while cached and is an "invalid page" once evicted, so a test built on it
+-- would pass or fail with buffer pressure. pd_lower above pd_upper would also PANIC in
+-- GenericXLogFinish, which zeroes the hole inside its critical section.
+SELECT pg_temp.err_of(format($q$SELECT bm25_debug_poke_page('pl_bm', 0, %s, '\xffff')$q$,
+                             pg_temp.hdr('pd_lower'))) AS lower_above_upper;
+                                  lower_above_upper                                   
+--------------------------------------------------------------------------------------
+ 22023 bm25_debug_poke_page: the poked page would fail PostgreSQL's page header check
+(1 row)
+
+SELECT pg_temp.err_of(format($q$SELECT bm25_debug_poke_page('pl_bm', 0, %s, '\x0000')$q$,
+                             pg_temp.hdr('pd_upper'))) AS upper_zero;
+                                      upper_zero                                      
+--------------------------------------------------------------------------------------
+ 22023 bm25_debug_poke_page: the poked page would fail PostgreSQL's page header check
+(1 row)
+
+SELECT pg_temp.err_of(format($q$SELECT bm25_debug_poke_page('pl_bm', 0, %s, '\x0101')$q$,
+                             pg_temp.hdr('pd_special'))) AS special_unaligned;
+                                  special_unaligned                                   
+--------------------------------------------------------------------------------------
+ 22023 bm25_debug_poke_page: the poked page would fail PostgreSQL's page header check
+(1 row)
+
+SELECT pg_temp.err_of(format($q$SELECT bm25_debug_poke_page('pl_bm', 0, %s, '\xffff')$q$,
+                             pg_temp.hdr('pd_flags'))) AS unknown_flag_bits;
+                                  unknown_flag_bits                                   
+--------------------------------------------------------------------------------------
+ 22023 bm25_debug_poke_page: the poked page would fail PostgreSQL's page header check
+(1 row)
+
+-- pd_lower inside the page header passes core's check, but the hole would then start
+-- in the header: Generic WAL would zero pd_upper and pd_special in the buffer, leaving
+-- pd_lower > pd_upper there, the PANIC precondition the check above excludes. The case
+-- that matters ends the poked bytes exactly at the new pd_lower (14), where the overlap
+-- check below does not see it. No byte-symmetric value lies in [14, 24), so 14 is
+-- written in host order, read off the metapage's pd_pagesize_version (BLCKSZ 8192 |
+-- layout version 4 = 0x2004): poke its little-endian image, keep what it replaced, and
+-- poke that back, so the page is unchanged either way.
+CREATE TEMP TABLE pl_host AS
+SELECT bm25_debug_poke_page('pl_bm', 0, pg_temp.hdr('pd_pagesize_version'), '\x0420') AS was;
+SELECT length(bm25_debug_poke_page('pl_bm', 0, pg_temp.hdr('pd_pagesize_version'), was))
+       AS pagesize_version_restored
+  FROM pl_host;
+ pagesize_version_restored 
+---------------------------
+                         2
+(1 row)
+
+SELECT pg_temp.err_of(format($q$SELECT bm25_debug_poke_page('pl_bm', 0, %s, %L)$q$,
+                             pg_temp.hdr('pd_lower'),
+                             CASE WHEN was = '\x0420' THEN '\x0e00' ELSE '\x000e' END))
+       AS lower_in_header
+  FROM pl_host;
+                                   lower_in_header                                    
+--------------------------------------------------------------------------------------
+ 22023 bm25_debug_poke_page: the poked page would fail PostgreSQL's page header check
+(1 row)
+
+-- Lowering pd_lower over live bytes would turn them into hole, which Generic WAL zeroes:
+-- they could not be restored by poking the old pd_lower back. 257 (\x0101) lands inside
+-- the DICT page's entries.
+SELECT pg_temp.err_of(format($q$SELECT bm25_debug_poke_page('pl_bm', %s, %s, '\x0101')$q$,
+                             (SELECT min(b) FROM generate_series(0, bm25_debug_npages('pl_bm') - 1) b
+                               WHERE bm25_debug_page_flags('pl_bm', b::int) & 8 <> 0),
+                             pg_temp.hdr('pd_lower'))) AS lower_over_live_bytes;
+                                   lower_over_live_bytes                                    
+--------------------------------------------------------------------------------------------
+ 22023 bm25_debug_poke_page: the poked page's hole [pd_lower, pd_upper) holds nonzero bytes
+(1 row)
+
+-- A byte in the hole between pd_lower and pd_upper would be zeroed by Generic WAL. The
+-- last byte before the special area is in the metapage's hole.
+SELECT pg_temp.err_of(format($q$SELECT bm25_debug_poke_page('pl_bm', 0, %s, '\x01')$q$,
+                             pg_temp.at('special', 'BM25PageOpaque', 'flags') - 1)) AS into_hole;
+                                         into_hole                                         
+-------------------------------------------------------------------------------------------
+ 22023 bm25_debug_poke_page: bytes [8167, 8168) overlap the page hole [pd_lower, pd_upper)
+(1 row)
+
+-- None of the refusals wrote anything: the index still answers.
+SELECT id FROM pl_docs WHERE body @@@ 'beta' ORDER BY id;
+ id 
+----
+  1
+  2
+(2 rows)
+
+-- ======================================================= 4. round trip
+-- Poke the metapage's opaque flags, read them back through an independent probe, then
+-- poke the returned bytes back. The second poke must hand back exactly the bytes the
+-- first wrote, and the page must read as before.
+CREATE TEMP TABLE pl_rt AS
+SELECT bm25_debug_page_flags('pl_bm', 0) AS flags_before,
+       bm25_debug_poke_page('pl_bm', 0, pg_temp.at('special', 'BM25PageOpaque', 'flags'),
+                            '\x0101') AS old_bytes;
+SELECT bm25_debug_page_flags('pl_bm', 0) AS flags_poked;
+ flags_poked 
+-------------
+         257
+(1 row)
+
+SELECT bm25_debug_poke_page('pl_bm', 0, pg_temp.at('special', 'BM25PageOpaque', 'flags'),
+                            old_bytes) AS second_poke_returns
+  FROM pl_rt;
+ second_poke_returns 
+---------------------
+ \x0101
+(1 row)
+
+SELECT bm25_debug_page_flags('pl_bm', 0) = flags_before AS flags_restored,
+       length(old_bytes) = (SELECT size FROM bm25_debug_layout()
+                             WHERE struct = 'BM25PageOpaque' AND field = 'flags')
+       AS old_bytes_sized
+  FROM pl_rt;
+ flags_restored | old_bytes_sized 
+----------------+-----------------
+ t              | t
+(1 row)
+
+-- A poke may end exactly at the block's last byte (the opaque's tail padding here).
+-- Nested: the inner poke writes, the outer one writes the inner one's old bytes back.
+SELECT bm25_debug_poke_page('pl_bm', 0, pg_temp.blk_size() - 4,
+                            bm25_debug_poke_page('pl_bm', 0, pg_temp.blk_size() - 4,
+                                                 '\x7f7f7f7f')) AS tail_restored_returns;
+ tail_restored_returns 
+-----------------------
+ \x7f7f7f7f
+(1 row)
+
+SELECT id FROM pl_docs WHERE body @@@ 'beta' ORDER BY id;
+ id 
+----
+  1
+  2
+(2 rows)
+
+-- ======================================================= 5. a poke reaches a validator
+-- The metapage's segcat_root moved past the end of the index. The catalog walkers
+-- already bound a catalog link by the relation's extent (issue #225); this pins that a
+-- poked metapage pointer reaches that check, through the snapshot walker the ranked
+-- scan uses and through bm25_segcat_read.
+SELECT length(bm25_debug_poke_page('pl_bm', 0, pg_temp.at('contents', 'BM25MetaPageData', 'segcat_root'),
+                                   '\x7f7f7f7f')) AS poked_root;
+ poked_root 
+------------
+          4
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT bm25_debug_segcat_walk('pl_bm', 'scan_snapshot', -1)$q$)
+       AS snapshot_walker;
+                  snapshot_walker                   
+----------------------------------------------------
+ XX002 bm25: segment catalog chain leaves the index
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_segcat('pl_bm')$q$) AS segcat_read;
+                    segcat_read                     
+----------------------------------------------------
+ XX002 bm25: segment catalog chain leaves the index
+(1 row)
+
+DROP TABLE pl_docs;
+DROP EXTENSION bm25_native;

@@ -1,0 +1,25 @@
+CREATE EXTENSION bm25_native;
+CREATE TABLE docs (id int primary key, body text);
+CREATE INDEX docs_bm25 ON docs USING bm25_native (body) WITH (language = 'english');
+-- The field-config page must exist (root block allocated, not InvalidBlockNumber
+-- which prints as 4294967295). field_count must be 1 (single default field, M3).
+SELECT field_count = 1 AS one_field,
+       field_config_blkno <> 4294967295 AS cfg_written
+  FROM bm25_stats('docs_bm25');
+ one_field | cfg_written 
+-----------+-------------
+ t         | t
+(1 row)
+
+-- Round-trip the single field-config page: M5 one field, id 0, name = the column
+-- attname (was "" in M3; M5 resolves field_name from the indexed column),
+-- k1/b = metapage defaults (1.2 / 0.75), boost 1.0, stemmer "english".
+SELECT field_id, field_name, k1, b, boost, stemmer_name
+  FROM bm25_debug_fieldcfg('docs_bm25');
+ field_id | field_name | k1  |  b   | boost | stemmer_name 
+----------+------------+-----+------+-------+--------------
+        0 | body       | 1.2 | 0.75 |     1 | english
+(1 row)
+
+DROP TABLE docs;
+DROP EXTENSION bm25_native;

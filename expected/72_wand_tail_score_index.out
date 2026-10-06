@@ -1,0 +1,172 @@
+-- H9 (issue #49): the WAND over-pull tail rebuild replaced so->ranked/scores/nranked
+-- with the full exhaustive ranking but left so->score_by_tid / so->score_by_key
+-- pointing at hashes built from the WAND-capped top-k.
+--
+-- bm25_build_score_index's own precondition is that so->ranked/scores/ranked_keys are
+-- already at their FINAL nranked. A hash built from a k-row array therefore answers
+-- NULL for every row k+1..N once the rebuild has extended the ranking -- a silent
+-- wrong answer (NULL substituted for a real score) whose presence depends on
+-- bm25_native.wand_top_k, a GUC documented as performance-only.
+--
+-- The hashes are now dropped inside BOTH ranking builders, right where so->ranked is
+-- reassigned, so any future rebuild path is covered by construction rather than only
+-- the one caller that rebuilds today.
+--
+-- Measured on the report's own 6-row shape, probing a constant ctid: pre-fix, every
+-- probe that was not the current row returned NULL, k=2 -- the report saw a score on
+-- exactly one row, and only because the current-row fast path happened to match it.
+--
+-- THE FIRST TWO ROWS EMITTED STILL RETURN NULL, AND THAT IS NOT THIS BUG. Those
+-- probes happen BEFORE the over-pull, when the ranking genuinely holds only k rows
+-- and the probed row is not in it yet -- there is no score to report. Closing that
+-- would require a score-accessor miss to trigger the exhaustive rebuild
+-- mid-projection, which changes the accessor's no-mutation contract (ADR 0007) and
+-- deserves its own decision. Pinned below so the boundary is explicit and any future
+-- change to it is visible.
+CREATE EXTENSION bm25_native;
+-- Constant doclen, varying tf, so every score is distinct and the ranked SEQUENCE
+-- below has no ties to break. Rows are inserted in one statement so ctids are
+-- (0,1)..(0,6) in id order.
+CREATE TABLE wt (id int PRIMARY KEY, body text);
+INSERT INTO wt VALUES
+  (1, 'alpha filler filler filler filler filler'),
+  (2, 'alpha alpha filler filler filler filler'),
+  (3, 'alpha alpha alpha filler filler filler'),
+  (4, 'alpha alpha alpha alpha filler filler'),
+  (5, 'alpha alpha alpha alpha alpha filler'),
+  (6, 'alpha alpha alpha alpha alpha alpha');
+-- INCLUDE + key_field so bm25_score_key() has a key to resolve by; without one it
+-- returns NULL unconditionally and the keyed assertions below would be vacuous.
+CREATE INDEX wt_idx ON wt USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id');
+SELECT ctid, id FROM wt ORDER BY id;
+ ctid  | id 
+-------+----
+ (0,1) |  1
+ (0,2) |  2
+ (0,3) |  3
+ (0,4) |  4
+ (0,5) |  5
+ (0,6) |  6
+(6 rows)
+
+SET enable_seqscan = off;
+-- ------------------------------------------------------------ reference
+-- wand_top_k = 0 disables WAND entirely: the exhaustive scorer builds the whole
+-- ranking up front, so there is no tail rebuild and every probe resolves.
+SET bm25_native.wand_top_k = 0;
+SELECT id, bm25_score('(0,1)'::tid) IS NOT NULL AS score_resolved
+FROM wt WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha';
+ id | score_resolved 
+----+----------------
+  6 | t
+  5 | t
+  4 | t
+  3 | t
+  2 | t
+  1 | t
+(6 rows)
+
+-- ------------------------------------------------------------ WAND-capped
+-- wand_top_k = 2 forces the over-pull tail rebuild after two rows. Rows 3..6 are
+-- served from the REBUILT full ranking and must resolve the probe; before the fix
+-- they kept hitting the stale 2-row hash and returned NULL.
+SET bm25_native.wand_top_k = 2;
+SELECT id, bm25_score('(0,1)'::tid) IS NOT NULL AS score_resolved
+FROM wt WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha';
+ id | score_resolved 
+----+----------------
+  6 | f
+  5 | f
+  4 | t
+  3 | t
+  2 | t
+  1 | t
+(6 rows)
+
+-- Same for the keyed accessor, probing the lowest-ranked row (id 1, rank 6) so the
+-- probe is genuinely outside the top-2 and exercises the miss.
+SET bm25_native.wand_top_k = 0;
+SELECT id, bm25_score_key(1) IS NOT NULL AS key_score_resolved
+FROM wt WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha';
+ id | key_score_resolved 
+----+--------------------
+  6 | t
+  5 | t
+  4 | t
+  3 | t
+  2 | t
+  1 | t
+(6 rows)
+
+SET bm25_native.wand_top_k = 2;
+SELECT id, bm25_score_key(1) IS NOT NULL AS key_score_resolved
+FROM wt WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha';
+ id | key_score_resolved 
+----+--------------------
+  6 | f
+  5 | f
+  4 | t
+  3 | t
+  2 | t
+  1 | t
+(6 rows)
+
+-- ------------------------------------------------------------ no row lost
+-- The tail rebuild resumes by (score, TID) KEY rather than by ordinal, and scores
+-- under the first build's pinned statistics (#268; sql/120 covers writes between the
+-- two builds). The ranked sequence must be identical whether or not the rebuild
+-- happened, and must contain every row exactly once.
+SET bm25_native.wand_top_k = 0;
+SELECT array_agg(id) AS ranked_sequence_k0 FROM
+  (SELECT id FROM wt WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha') s;
+ ranked_sequence_k0 
+--------------------
+ {6,5,4,3,2,1}
+(1 row)
+
+SET bm25_native.wand_top_k = 2;
+SELECT array_agg(id) AS ranked_sequence_k2 FROM
+  (SELECT id FROM wt WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha') s;
+ ranked_sequence_k2 
+--------------------
+ {6,5,4,3,2,1}
+(1 row)
+
+SET bm25_native.wand_top_k = 1;
+SELECT array_agg(id) AS ranked_sequence_k1 FROM
+  (SELECT id FROM wt WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha') s;
+ ranked_sequence_k1 
+--------------------
+ {6,5,4,3,2,1}
+(1 row)
+
+-- Explicitly: no duplicate and no missing row at any cap.
+SELECT count(*) AS rows_emitted, count(DISTINCT id) AS distinct_ids
+FROM (SELECT id FROM wt WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha') s;
+ rows_emitted | distinct_ids 
+--------------+--------------
+            6 |            6
+(1 row)
+
+-- The scores themselves are unchanged by the cap -- the WAND == exhaustive contract.
+SET bm25_native.wand_top_k = 0;
+SELECT array_agg(round(bm25_score(ctid)::numeric, 6)) AS scores_k0 FROM
+  (SELECT ctid FROM wt WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha') s;
+                        scores_k0                        
+---------------------------------------------------------
+ {0.135865,0.131482,0.125413,0.116455,0.101898,0.074108}
+(1 row)
+
+SET bm25_native.wand_top_k = 2;
+SELECT array_agg(round(bm25_score(ctid)::numeric, 6)) AS scores_k2 FROM
+  (SELECT ctid FROM wt WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha') s;
+                        scores_k2                        
+---------------------------------------------------------
+ {0.135865,0.131482,0.125413,0.116455,0.101898,0.074108}
+(1 row)
+
+RESET bm25_native.wand_top_k;
+RESET enable_seqscan;
+DROP TABLE wt;
+DROP EXTENSION bm25_native;

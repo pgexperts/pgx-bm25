@@ -1,0 +1,546 @@
+-- 110_chain_walk_consistency -- issue #225, the three chain walks ADR 0095 left out of
+-- scope: the SEGCAT walkers' missing extent bound, bm25_seg_key's per-row KEYMAP
+-- re-walk (also unbounded), and bm25_debug_postings' per-posting NORMS re-walk.
+CREATE EXTENSION bm25_native;
+-- A shared error renderer. SQLSTATE is pinned alongside the message because "some
+-- corruption error" is exactly what the pre-fix behaviour also produced -- the change
+-- is WHICH error. Block numbers are stripped: they depend on BLCKSZ and on how many
+-- pages this build happened to write.
+CREATE FUNCTION pg_temp.err_of(q text) RETURNS text AS $$
+BEGIN
+    EXECUTE q;
+    RETURN 'NO ERROR RAISED';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' ' || regexp_replace(SQLERRM, 'block [0-9]+', 'block N');
+END; $$ LANGUAGE plpgsql;
+-- ===================================================== 1. SEGCAT extent bound
+-- bm25_scan_snapshot and bm25_segcat_read walked the catalog chain bounded only by an
+-- entry COUNT (`filled < nsegs`), which constrains how many entries are copied and
+-- nothing about where nextblk points. An out-of-extent link reached ReadBuffer and
+-- surfaced as the buffer manager's short-read error -- a file and a block, no bm25
+-- structure named, and a different SQLSTATE depending on how far past the end it
+-- pointed. They now raise ERRCODE_INDEX_CORRUPTED naming the chain, like the four
+-- walkers ADR 0095 bounded.
+--
+-- A two-page catalog, so a mid-chain link exists to corrupt. A catalog page holds 203
+-- entries and the seal PREPENDS a fresh root when the current one is full, so after
+-- 210 one-row seals the root carries the last 7 entries and links to the full page.
+CREATE TABLE sc_docs (id int primary key, body text);
+CREATE INDEX sc_bm ON sc_docs USING bm25_native (body);
+DO $$
+BEGIN
+  FOR i IN 1..210 LOOP
+    INSERT INTO sc_docs VALUES (i, 'alpha doc' || i);
+    PERFORM bm25_seal('sc_bm');
+  END LOOP;
+END $$;
+-- Negative control first, so a bound that rejected everything could not pass below.
+-- nblocks = -1 runs each walker's public entry point, which samples for itself.
+-- find_entry and locate_entry look up the catalog's LAST entry, so they cross both
+-- pages too.
+SELECT bm25_debug_segcat_walk('sc_bm', 'scan_snapshot', -1) AS snapshot_entries,
+       bm25_debug_segcat_walk('sc_bm', 'segcat_read',   -1) AS read_entries,
+       bm25_debug_segcat_walk('sc_bm', 'find_entry',    -1) AS find_found,
+       bm25_debug_segcat_walk('sc_bm', 'locate_entry',  -1) AS locate_found,
+       bm25_debug_segcat_walk('sc_bm', 'first_entry',   -1) AS first_found;
+ snapshot_entries | read_entries | find_found | locate_found | first_found 
+------------------+--------------+------------+--------------+-------------
+              210 |          210 |          1 |            1 |           1
+(1 row)
+
+-- The pre-lock sample. All five walkers must sample the extent BEFORE they read
+-- segcat_root (bm25_scan_snapshot reads it under the metapage SHARE and walks under
+-- it), and a seal or merge can extend the relation for a fresh catalog page and flip
+-- segcat_root to it between that sample and the root read. The walker is then handed a
+-- HEALTHY root at or past its own sample. No suite can land a concurrent seal in that
+-- window, but the race only changes the sample's value, so the probe substitutes one:
+-- 1 is the metapage alone, which puts the root (and every other catalog page) past
+-- the sample, and 0 is staler still. A healthy catalog must read back in full -- the
+-- walkers re-sample the extent before they call a link corrupt. Without the re-sample
+-- the undamaged index fails every walker here, each in its own way: scan_snapshot and
+-- segcat_read raise "segment catalog chain leaves the index", find_entry reports the
+-- gen absent, and locate_entry raises "segment header N not found in catalog".
+-- first_entry (issue #270, the INSERT key check's root read) samples the same way and
+-- would raise "segment catalog chain leaves the index" on the root.
+SELECT bm25_debug_segcat_walk('sc_bm', 'scan_snapshot', 1) AS snapshot_stale,
+       bm25_debug_segcat_walk('sc_bm', 'segcat_read',   1) AS read_stale,
+       bm25_debug_segcat_walk('sc_bm', 'find_entry',    1) AS find_stale,
+       bm25_debug_segcat_walk('sc_bm', 'locate_entry',  1) AS locate_stale,
+       bm25_debug_segcat_walk('sc_bm', 'first_entry',   1) AS first_stale;
+ snapshot_stale | read_stale | find_stale | locate_stale | first_stale 
+----------------+------------+------------+--------------+-------------
+            210 |        210 |          1 |            1 |           1
+(1 row)
+
+SELECT bm25_debug_segcat_walk('sc_bm', 'scan_snapshot', 0) AS snapshot_stale_0,
+       bm25_debug_segcat_walk('sc_bm', 'locate_entry',  0) AS locate_stale_0,
+       bm25_debug_segcat_walk('sc_bm', 'first_entry',   0) AS first_stale_0;
+ snapshot_stale_0 | locate_stale_0 | first_stale_0 
+------------------+----------------+---------------
+              210 |              1 |             1
+(1 row)
+
+-- The lever validates its arguments (97_debug_probe_arguments' rule), and so does the
+-- probe.
+\set VERBOSITY terse
+SELECT bm25_debug_stamp_chain_next('sc_bm', 'nosuch', -1, 0, 1);
+ERROR:  bm25_debug_stamp_chain_next: unknown chain "nosuch"
+SELECT bm25_debug_stamp_chain_next('sc_bm', 'segcat', 0, 0, 1);
+ERROR:  bm25_debug_stamp_chain_next: seg must be -1 for chain segcat
+SELECT bm25_debug_stamp_chain_next('sc_bm', 'segcat', -1, -1, 1);
+ERROR:  bm25_debug_stamp_chain_next: page -1 is negative
+SELECT bm25_debug_stamp_chain_next('sc_bm', 'segcat', -1, 0, -1);
+ERROR:  bm25_debug_stamp_chain_next: nextblk -1 is not a block number
+SELECT bm25_debug_stamp_chain_next('sc_bm', 'segcat', -1, 0, 4294967296);
+ERROR:  bm25_debug_stamp_chain_next: nextblk 4294967296 is not a block number
+SELECT bm25_debug_stamp_chain_next('sc_bm', 'segcat', -1, 2, 1);
+ERROR:  bm25_debug_stamp_chain_next: segcat chain has only 2 page(s)
+SELECT bm25_debug_segcat_walk('sc_bm', 'nosuch', -1);
+ERROR:  bm25_debug_segcat_walk: unknown walker "nosuch"
+SELECT bm25_debug_segcat_walk('sc_bm', 'segcat_read', -2);
+ERROR:  bm25_debug_segcat_walk: nblocks -2 is not a block count
+SELECT bm25_debug_segcat_walk('sc_bm', 'segcat_read', 4294967296);
+ERROR:  bm25_debug_segcat_walk: nblocks 4294967296 is not a block count
+\set VERBOSITY default
+-- Now a real corrupt link: the ROOT page's nextblk, i.e. the link from the 7-entry
+-- page to the full one. 4294967294 is one below InvalidBlockNumber -- the largest value
+-- that is still a block number, so nothing that tests for InvalidBlockNumber can
+-- answer instead of the extent bound. The lever returns the block it stamped; only
+-- its being a real block matters here.
+SELECT bm25_debug_stamp_chain_next('sc_bm', 'segcat', -1, 0, 4294967294) > 0
+       AS stamped_root_page;
+ stamped_root_page 
+-------------------
+ t
+(1 row)
+
+-- Every scan starts with bm25_scan_snapshot, so an ordinary query is the real path.
+-- Pre-fix this raised the buffer manager's own error for block 4294967294.
+SET enable_seqscan = off;
+SELECT pg_temp.err_of($q$SELECT count(*) FROM sc_docs WHERE body @@@ 'alpha'$q$)
+       AS scan_past_extent;
+                  scan_past_extent                  
+----------------------------------------------------
+ XX002 bm25: segment catalog chain leaves the index
+(1 row)
+
+-- bm25_segcat_read, through the catalog SRF.
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_segcat('sc_bm')$q$)
+       AS segcat_read_past_extent;
+              segcat_read_past_extent               
+----------------------------------------------------
+ XX002 bm25: segment catalog chain leaves the index
+(1 row)
+
+-- A stale sample must not mask real corruption: the re-sample raises the bound again.
+SELECT pg_temp.err_of($q$SELECT bm25_debug_segcat_walk('sc_bm', 'scan_snapshot', 1)$q$)
+       AS snapshot_stale_past_extent;
+             snapshot_stale_past_extent             
+----------------------------------------------------
+ XX002 bm25: segment catalog chain leaves the index
+(1 row)
+
+-- One past the last real page: the smallest rejected value, which shows the bound is
+-- `>=` against the live extent rather than a comparison with some constant.
+SELECT bm25_debug_stamp_chain_next('sc_bm', 'segcat', -1, 0, bm25_debug_npages('sc_bm')) > 0
+       AS stamped_one_past_end;
+ stamped_one_past_end 
+----------------------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM sc_docs WHERE body @@@ 'alpha'$q$)
+       AS scan_one_past_end;
+                 scan_one_past_end                  
+----------------------------------------------------
+ XX002 bm25: segment catalog chain leaves the index
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_segcat('sc_bm')$q$)
+       AS segcat_read_one_past_end;
+              segcat_read_one_past_end              
+----------------------------------------------------
+ XX002 bm25: segment catalog chain leaves the index
+(1 row)
+
+RESET enable_seqscan;
+-- The lever leaves the catalog permanently corrupt by construction.
+DROP TABLE sc_docs;
+-- ======================================= 3. bm25_debug_postings' per-posting NORMS walk
+-- dbg_post_cb, bm25_debug_postings' per-posting callback, read each posting's doclen
+-- through the one-shot bm25_seg_doclen: a NORMS walk from the ROOT plus one
+-- RelationGetNumberOfBlocks per posting -- the cost ADR 0095 removed from every other
+-- per-posting path by giving it a BM25SegReader. It now reads through a reader opened
+-- once per segment, via the new bm25_seg_reader_doclen.
+--
+-- Three fields, so a NORMS row is 12 bytes and 6000 docs span nine NORMS pages; each
+-- field's length is a different function of id, so a cell read from the wrong row or
+-- the wrong field shows up as a wrong sum.
+CREATE TABLE dl_docs (id int, a text, b text, c text);
+INSERT INTO dl_docs
+SELECT g, repeat('alpha ', g % 5 + 1), repeat('beta ', g % 7 + 1), repeat('gamma ', g % 11 + 1)
+FROM generate_series(1, 6000) g;
+CREATE INDEX dl_bm ON dl_docs USING bm25_native (a, b, c);
+SELECT bm25_seal('dl_bm');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+-- The cost is the defect, and it is visible as buffer traffic. Each posting reads
+-- field_count NORMS cells, and through a reader each cell is one page visit -- the page
+-- the previous cell landed on -- plus a walk from the root only at each term's first
+-- posting. The one-shot form walked from the root for EVERY posting, about half the
+-- chain on average, so it came in well above the (field_count + 1) visits per posting
+-- asserted here. The count covers the whole SRF, DICT and POST pages included, so a
+-- ratio rather than an exact number: that keeps the assertion independent of BLCKSZ and
+-- of how this build lays out a page.
+CREATE FUNCTION pg_temp.postings_hits(idx text) RETURNS bigint AS $$
+DECLARE
+    plan json;
+BEGIN
+    EXECUTE format('EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) '
+                   'SELECT count(*) FROM bm25_debug_postings(%L)', idx) INTO plan;
+    RETURN (plan -> 0 -> 'Plan' ->> 'Shared Hit Blocks')::bigint
+         + (plan -> 0 -> 'Plan' ->> 'Shared Read Blocks')::bigint;
+END; $$ LANGUAGE plpgsql;
+SELECT count(*) AS postings FROM bm25_debug_postings('dl_bm');
+ postings 
+----------
+    18000
+(1 row)
+
+SELECT pg_temp.postings_hits('dl_bm')
+         < (3 + 1) * (SELECT count(*) FROM bm25_debug_postings('dl_bm'))
+       AS postings_pages_bounded_per_posting;
+ postings_pages_bounded_per_posting 
+------------------------------------
+ t
+(1 row)
+
+-- Differential: bm25_seg_reader_doclen, carried across the whole docid list by ONE
+-- reader, against bm25_seg_doclen called fresh for each docid (a root walk every time,
+-- the pre-fix path), AND against the length computed from the row itself -- joined
+-- through the doc's TID, so two readings that were wrong the same way would still
+-- fail. Three orders: ascending is the converted caller's pattern; descending and a
+-- hash-scattered order make the cursor jump backward, the branch where resuming from
+-- a stale position would read the wrong cell.
+CREATE FUNCTION pg_temp.doclen_diff(docids int[]) RETURNS TABLE
+    (rows bigint, reader_eq_oneshot bigint, reader_eq_heap bigint) AS $$
+    SELECT count(*),
+           count(*) FILTER (WHERE r.reader_bytes = r.oneshot_bytes),
+           count(*) FILTER (WHERE r.reader_int = (d.id % 5 + 1) + (d.id % 7 + 1)
+                                                  + (d.id % 11 + 1))
+    FROM bm25_debug_seg_reader_diff('dl_bm', 0, 'doclen', docids) r
+    JOIN dl_docs d ON d.ctid = r.tid;
+$$ LANGUAGE sql;
+SELECT * FROM pg_temp.doclen_diff(ARRAY(SELECT generate_series(0, 5999)));
+ rows | reader_eq_oneshot | reader_eq_heap 
+------+-------------------+----------------
+ 6000 |              6000 |           6000
+(1 row)
+
+SELECT * FROM pg_temp.doclen_diff(ARRAY(SELECT generate_series(5999, 0, -1)));
+ rows | reader_eq_oneshot | reader_eq_heap 
+------+-------------------+----------------
+ 6000 |              6000 |           6000
+(1 row)
+
+SELECT * FROM pg_temp.doclen_diff(
+    ARRAY(SELECT d FROM generate_series(0, 5999) d ORDER BY hashint4(d), d));
+ rows | reader_eq_oneshot | reader_eq_heap 
+------+-------------------+----------------
+ 6000 |              6000 |           6000
+(1 row)
+
+-- The SRF's own output agrees with the row: every posting's doclen is its document's
+-- total length, whichever term it belongs to.
+SELECT count(*) AS postings_with_wrong_doclen
+FROM bm25_debug_postings('dl_bm') p
+WHERE p.doclen NOT IN (SELECT (id % 5 + 1) + (id % 7 + 1) + (id % 11 + 1) FROM dl_docs);
+ postings_with_wrong_doclen 
+----------------------------
+                          0
+(1 row)
+
+SELECT count(DISTINCT doclen) AS distinct_doclens FROM bm25_debug_postings('dl_bm');
+ distinct_doclens 
+------------------
+               21
+(1 row)
+
+\set VERBOSITY terse
+SELECT * FROM bm25_debug_seg_reader_diff('dl_bm', 0, 'nosuch', ARRAY[0]);
+ERROR:  bm25_debug_seg_reader_diff: unknown accessor "nosuch"
+SELECT * FROM bm25_debug_seg_reader_diff('dl_bm', 0, 'doclen', ARRAY[-1]);
+ERROR:  bm25_debug_seg_reader_diff: docid at index 0 is NULL or negative
+SELECT * FROM bm25_debug_seg_reader_diff('dl_bm', 0, 'doclen', ARRAY[0, NULL]);
+ERROR:  bm25_debug_seg_reader_diff: docid at index 1 is NULL or negative
+SELECT * FROM bm25_debug_seg_reader_diff('dl_bm', 0, 'doclen', ARRAY[6000]);
+ERROR:  bm25_debug_seg_reader_diff: docid 6000 out of range (segment has 6000 docs)
+SELECT * FROM bm25_debug_seg_reader_diff('dl_bm', 1, 'doclen', ARRAY[0]);
+ERROR:  bm25: segment 1 out of range (1 live)
+\set VERBOSITY default
+DROP TABLE dl_docs;
+-- ============================================ 2. KEYMAP: extent bound + reader cursor
+-- bm25_seg_key walked the KEYMAP chain from its root on every call with no extent
+-- bound, and it was called once per ranked row (both ranking builders, each also
+-- re-reading the row's segment header) and once per document in the merge. Its comment
+-- declined the bound on the cost of a per-call RelationGetNumberOfBlocks -- the
+-- argument ADR 0095 answered for the other dense chains by capturing the extent once
+-- per reader. KEYMAP now has a cursor in BM25SegReader (bm25_seg_reader_key); the merge
+-- uses its per-source reader, the ranking builders a per-segment reader cache, and the
+-- walk raises ERRCODE_INDEX_CORRUPTED on an out-of-extent link.
+--
+-- int8 keys are 8 bytes, so 3000 documents span three KEYMAP pages per segment.
+-- ---- 2a. the answers do not change
+-- Four segments, so a ranked row's winning segment varies row to row and the ranking
+-- builders' per-segment reader cache is exercised across segments, not just within one;
+-- and four of one size, because that is what bm25_merge needs to merge them
+-- (BM25_MERGE_LAYER_FANOUT).
+-- Scores depend on length (13 distinct lengths), so a key resolved from the wrong
+-- document -- or from the wrong segment's reader -- makes bm25_score_key(id) return
+-- another document's score, or NULL.
+CREATE TABLE kk (id bigint primary key, body text);
+CREATE INDEX kk_bm ON kk USING bm25_native (body) INCLUDE (id) WITH (key_field = 'id');
+DO $$
+DECLARE k int;
+BEGIN
+  FOR k IN 0..3 LOOP
+    INSERT INTO kk SELECT g, 'common ' || repeat('pad ', (g % 13)::int)
+      FROM generate_series(k * 3000 + 1, k * 3000 + 3000) g;
+    PERFORM bm25_seal('kk_bm');
+  END LOOP;
+END $$;
+SELECT count(*) AS kk_segments FROM bm25_debug_segcat('kk_bm');
+ kk_segments 
+-------------
+           4
+(1 row)
+
+-- Every ranked row's key-path score equals its ctid-path score, under both builders.
+-- The ctid path does not touch the KEYMAP, so it is the independent side.
+SET enable_seqscan = off;
+CREATE FUNCTION pg_temp.key_vs_ctid() RETURNS TABLE
+    (ranked bigint, key_resolved bigint, key_eq_ctid bigint) AS $$
+    SELECT count(*), count(by_key),
+           count(*) FILTER (WHERE by_key = by_ctid)
+    FROM (SELECT bm25_score(ctid) AS by_ctid, bm25_score_key(id) AS by_key
+            FROM kk WHERE body @@@ 'common' ORDER BY body &@@ 'common' LIMIT 12000) q;
+$$ LANGUAGE sql;
+SET bm25_native.wand_top_k = 20000;
+SELECT * FROM pg_temp.key_vs_ctid();        -- WAND builder
+ ranked | key_resolved | key_eq_ctid 
+--------+--------------+-------------
+  12000 |        12000 |       12000
+(1 row)
+
+SET bm25_native.wand_top_k = 0;
+SELECT * FROM pg_temp.key_vs_ctid();        -- exhaustive builder
+ ranked | key_resolved | key_eq_ctid 
+--------+--------------+-------------
+  12000 |        12000 |       12000
+(1 row)
+
+RESET bm25_native.wand_top_k;
+-- Differential on one segment: ONE reader carried across the docid list against
+-- bm25_seg_key called fresh per docid (a root walk each time, the pre-fix path), and
+-- both against the row's own id, joined through its TID. Descending and scattered
+-- orders drive the cursor's backward-jump fallback.
+CREATE FUNCTION pg_temp.key_diff(seg int, docids int[]) RETURNS TABLE
+    (rows bigint, reader_eq_oneshot bigint, reader_eq_heap bigint) AS $$
+    SELECT count(*),
+           count(*) FILTER (WHERE r.reader_bytes = r.oneshot_bytes),
+           count(*) FILTER (WHERE r.reader_int = d.id)
+    FROM bm25_debug_seg_reader_diff('kk_bm', seg, 'key', docids) r
+    JOIN kk d ON d.ctid = r.tid;
+$$ LANGUAGE sql;
+SELECT * FROM pg_temp.key_diff(1, ARRAY(SELECT generate_series(0, 2999)));
+ rows | reader_eq_oneshot | reader_eq_heap 
+------+-------------------+----------------
+ 3000 |              3000 |           3000
+(1 row)
+
+SELECT * FROM pg_temp.key_diff(1, ARRAY(SELECT generate_series(2999, 0, -1)));
+ rows | reader_eq_oneshot | reader_eq_heap 
+------+-------------------+----------------
+ 3000 |              3000 |           3000
+(1 row)
+
+SELECT * FROM pg_temp.key_diff(1,
+    ARRAY(SELECT d FROM generate_series(0, 2999) d ORDER BY hashint4(d), d));
+ rows | reader_eq_oneshot | reader_eq_heap 
+------+-------------------+----------------
+ 3000 |              3000 |           3000
+(1 row)
+
+-- Chain identity: a reader's KEYMAP cursor parked on segment 0, then used for segment
+-- 1. The resume test's root clause must send the lookup back to segment 1's own root;
+-- without it the walk resumes on segment 0's page. Compared with segment 1's key read
+-- the one-shot way, at a docid on each of its three KEYMAP pages.
+SELECT bool_and(bm25_debug_keymap_cursor_crosstalk('kk_bm', 0, 1, d) =
+                (SELECT oneshot_bytes FROM bm25_debug_seg_reader_diff('kk_bm', 1, 'key',
+                                                                      ARRAY[d::int])))
+       AS keymap_crosstalk_reads_own_chain
+  FROM (VALUES (0), (1500), (2999)) v(d);
+ keymap_crosstalk_reads_own_chain 
+----------------------------------
+ t
+(1 row)
+
+\set VERBOSITY terse
+SELECT bm25_debug_keymap_cursor_crosstalk('kk_bm', 0, 0, 0);
+ERROR:  bm25_debug_keymap_cursor_crosstalk: segments 0 and 0 must be two different live segments (4 live)
+SELECT bm25_debug_keymap_cursor_crosstalk('kk_bm', 0, 9, 0);
+ERROR:  bm25_debug_keymap_cursor_crosstalk: segments 0 and 9 must be two different live segments (4 live)
+SELECT bm25_debug_keymap_cursor_crosstalk('kk_bm', 0, 1, 3000);
+ERROR:  bm25_debug_keymap_cursor_crosstalk: docid 3000 out of range for segment 1 (3000 documents)
+\set VERBOSITY default
+-- The merge replays every source document's key through its per-source reader. After
+-- merging the four segments into one, every document still carries its own id.
+SELECT bm25_merge('kk_bm');
+ bm25_merge 
+------------
+ 
+(1 row)
+
+SELECT count(*) AS kk_segments_after_merge FROM bm25_debug_segcat('kk_bm');
+ kk_segments_after_merge 
+-------------------------
+                       1
+(1 row)
+
+SELECT * FROM pg_temp.key_diff(0, ARRAY(SELECT generate_series(0, 11999)));
+ rows  | reader_eq_oneshot | reader_eq_heap 
+-------+-------------------+----------------
+ 12000 |             12000 |          12000
+(1 row)
+
+SET bm25_native.wand_top_k = 0;
+SELECT * FROM pg_temp.key_vs_ctid();
+ ranked | key_resolved | key_eq_ctid 
+--------+--------------+-------------
+  12000 |        12000 |       12000
+(1 row)
+
+RESET bm25_native.wand_top_k;
+-- The keymap SRF reads through a reader too; its rows still decode to the ids.
+SELECT count(*) AS keymap_rows,
+       count(*) FILTER (WHERE key_int8 BETWEEN 1 AND 12000) AS keymap_ids_in_range,
+       count(DISTINCT key_int8) AS keymap_distinct_ids
+  FROM bm25_debug_seg_keymap('kk_bm', 0);
+ keymap_rows | keymap_ids_in_range | keymap_distinct_ids 
+-------------+---------------------+---------------------
+       12000 |               12000 |               12000
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE kk;
+-- ---- 2b. an out-of-extent KEYMAP link raises, naming the chain
+-- Four segments of 1500 documents -- two KEYMAP pages each -- so bm25_merge takes all
+-- four, the corrupted one among them.
+CREATE TABLE kf (id bigint primary key, body text);
+CREATE INDEX kf_bm ON kf USING bm25_native (body) INCLUDE (id) WITH (key_field = 'id');
+DO $$
+DECLARE k int;
+BEGIN
+  FOR k IN 0..3 LOOP
+    INSERT INTO kf SELECT g, 'common word' || g
+      FROM generate_series(k * 1500 + 1, k * 1500 + 1500) g;
+    PERFORM bm25_seal('kf_bm');
+  END LOOP;
+END $$;
+\set VERBOSITY terse
+SELECT bm25_debug_stamp_chain_next('kf_bm', 'keymap', -1, 0, 1);
+ERROR:  bm25_debug_stamp_chain_next: seg -1 is negative
+SELECT bm25_debug_stamp_chain_next('kf_bm', 'keymap', 4, 0, 1);
+ERROR:  bm25: segment 4 out of range (4 live)
+SELECT bm25_debug_stamp_chain_next('kf_bm', 'keymap', 0, 2, 1);
+ERROR:  bm25_debug_stamp_chain_next: keymap chain has only 2 page(s)
+\set VERBOSITY default
+-- The link out of segment 0's first KEYMAP page. Every document past the first page
+-- needs it, so a ranked query over all 6000 rows reaches it through the ranking
+-- builder's reader cache, and the other paths reach it through their own readers.
+SELECT bm25_debug_stamp_chain_next('kf_bm', 'keymap', 0, 0, 4294967294) > 0
+       AS stamped_keymap_page;
+ stamped_keymap_page 
+---------------------
+ t
+(1 row)
+
+SET enable_seqscan = off;
+SET bm25_native.wand_top_k = 10000;
+SELECT pg_temp.err_of($q$SELECT count(bm25_score_key(id)) FROM (SELECT id FROM kf
+    WHERE body @@@ 'common' ORDER BY body &@@ 'common' LIMIT 6000) q$q$)
+       AS wand_rank_past_extent;
+               wand_rank_past_extent               
+---------------------------------------------------
+ XX002 bm25: segment KEYMAP chain leaves the index
+(1 row)
+
+SET bm25_native.wand_top_k = 0;
+SELECT pg_temp.err_of($q$SELECT count(bm25_score_key(id)) FROM (SELECT id FROM kf
+    WHERE body @@@ 'common' ORDER BY body &@@ 'common' LIMIT 6000) q$q$)
+       AS exhaustive_rank_past_extent;
+            exhaustive_rank_past_extent            
+---------------------------------------------------
+ XX002 bm25: segment KEYMAP chain leaves the index
+(1 row)
+
+RESET bm25_native.wand_top_k;
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_seg_keymap('kf_bm', 0)$q$)
+       AS keymap_srf_past_extent;
+              keymap_srf_past_extent               
+---------------------------------------------------
+ XX002 bm25: segment KEYMAP chain leaves the index
+(1 row)
+
+-- The one-shot form carries the bound too, so no KEYMAP walk is left unbounded. The
+-- differential probe calls it before the reader, so it is the one-shot walk that meets
+-- the corrupt link here.
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_seg_reader_diff('kf_bm', 0,
+    'key', ARRAY[1499])$q$) AS oneshot_past_extent;
+                oneshot_past_extent                
+---------------------------------------------------
+ XX002 bm25: segment KEYMAP chain leaves the index
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT bm25_merge('kf_bm')$q$) AS merge_past_extent;
+                 merge_past_extent                 
+---------------------------------------------------
+ XX002 bm25: segment KEYMAP chain leaves the index
+(1 row)
+
+-- One past the last real page: the smallest rejected value.
+SELECT bm25_debug_stamp_chain_next('kf_bm', 'keymap', 0, 0, bm25_debug_npages('kf_bm')) > 0
+       AS stamped_keymap_one_past_end;
+ stamped_keymap_one_past_end 
+-----------------------------
+ t
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT count(*) FROM bm25_debug_seg_keymap('kf_bm', 0)$q$)
+       AS keymap_srf_one_past_end;
+              keymap_srf_one_past_end              
+---------------------------------------------------
+ XX002 bm25: segment KEYMAP chain leaves the index
+(1 row)
+
+SELECT pg_temp.err_of($q$SELECT bm25_merge('kf_bm')$q$) AS merge_one_past_end;
+                merge_one_past_end                 
+---------------------------------------------------
+ XX002 bm25: segment KEYMAP chain leaves the index
+(1 row)
+
+-- Documents on the first page never follow the corrupt link, so they still resolve:
+-- the bound rejects the bad pointer, not the chain.
+SELECT reader_int = oneshot_int AS first_page_key_agrees, reader_int AS first_page_key
+  FROM bm25_debug_seg_reader_diff('kf_bm', 0, 'key', ARRAY[0]);
+ first_page_key_agrees | first_page_key 
+-----------------------+----------------
+ t                     |              1
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE kf;
+DROP EXTENSION bm25_native;

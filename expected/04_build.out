@@ -1,0 +1,43 @@
+CREATE EXTENSION bm25_native;
+CREATE TABLE docs (id int primary key, body text);
+INSERT INTO docs VALUES
+  (1, 'the quick brown fox'),
+  (2, 'the lazy brown dog'),
+  (3, 'quick quick fox');
+CREATE INDEX docs_bm25 ON docs USING bm25_native (body);
+-- 3 docs indexed; total_len = 4+4+3 = 11 tokens.
+SELECT ndocs, total_len FROM bm25_stats('docs_bm25');
+ ndocs | total_len 
+-------+-----------
+     3 |         9
+(1 row)
+
+-- distinct terms present (debug introspection of the dictionary):
+SELECT term, df FROM bm25_debug_terms('docs_bm25') ORDER BY term;
+ term  | df 
+-------+----
+ brown |  2
+ dog   |  1
+ fox   |  2
+ lazi  |  1
+ quick |  2
+(5 rows)
+
+-- v4: the metapage carries the analyzer fingerprint + a single default field.
+SELECT analyzer_fingerprint <> 0 AS fp_set, field_count
+  FROM bm25_stats('docs_bm25');
+ fp_set | field_count 
+--------+-------------
+ t      |           1
+(1 row)
+
+-- bm25_debug_analyzer_fingerprint(index) must equal the stored metapage value.
+SELECT bm25_debug_analyzer_fingerprint('docs_bm25')
+     = (SELECT analyzer_fingerprint FROM bm25_stats('docs_bm25')) AS fp_matches;
+ fp_matches 
+------------
+ t
+(1 row)
+
+DROP TABLE docs;
+DROP EXTENSION bm25_native;

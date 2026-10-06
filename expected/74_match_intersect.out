@@ -1,0 +1,260 @@
+-- H15 (issue #54): the @@@ standalone evaluator compared every query token against
+-- every document token with a doubly nested loop -- no hashing, no sorting -- and there
+-- was no CHECK_FOR_INTERRUPTS in it, in memcmp, or anywhere in the tokenizer that feeds
+-- it. Both operands come straight from SQL with no length cap beyond the tokenizer's own
+-- palloc ceiling (~87 MB per side, ~13M tokens), and the all-miss case is both the worst
+-- case and the common one for a nonsense query: ~1.8e14 length compares at that ceiling,
+-- days of CPU in a backend that ignored pg_cancel_backend, pg_terminate_backend and
+-- statement_timeout for the whole run while holding its snapshot open and pinning the
+-- cluster-wide vacuum horizon. COST 5000 discourages the planner from choosing this path
+-- but does nothing about an explicitly written call.
+--
+-- Fixed two ways: sort the SMALLER token set and probe it with the larger
+-- (O(s log s + l log s) instead of O(nd x nq)), and add CHECK_FOR_INTERRUPTS to the
+-- probe loop AND to bm25_analyze's per-word-run loop -- the latter was itself an
+-- uninterruptible stretch on a large value, for every caller, not just this one.
+--
+-- Measured, all-miss, this machine (Apple silicon, PG 18.3):
+--      20k tokens/side     390 ms  ->  16.9 ms
+--      80k tokens/side    6025 ms  ->  39.5 ms
+--     800k tokens/side   ~10 min*  ->  375 ms      (*extrapolated; not run to completion)
+--
+-- WHAT THIS SUITE CAN AND CANNOT PROVE. Like 66_scan_interrupts, the pre-fix defect was
+-- LATENCY plus cancellability, not the answer: a pre-fix call returned the same boolean,
+-- just far later, and a pre-fix statement_timeout also eventually raised -- after the
+-- loop finished. pg_regress compares output, not wall clock, so the timing above is not
+-- assertable here and the CI interrupt-check floor is what fails if the checks are
+-- deleted. What IS assertable is that the operator is interruptible at all, and that
+-- replacing the nested scan with sort+bsearch did not move the answer for any shape.
+CREATE EXTENSION bm25_native;
+-- ---------------------------------------------------------------- semantics
+-- OR semantics: true iff the two token sets intersect. The rewrite sorts one side in
+-- place and binary-searches it, so every shape below is a chance for the comparator's
+-- (len, bytes) total order to disagree with the old exact-equality test.
+SELECT 'alpha beta gamma'::text @@@ 'beta'::text            AS hit_middle;
+ hit_middle 
+------------
+ t
+(1 row)
+
+SELECT 'alpha beta gamma'::text @@@ 'alpha'::text           AS hit_first;
+ hit_first 
+-----------
+ t
+(1 row)
+
+SELECT 'alpha beta gamma'::text @@@ 'gamma'::text           AS hit_last;
+ hit_last 
+----------
+ t
+(1 row)
+
+SELECT 'alpha beta gamma'::text @@@ 'delta'::text           AS miss;
+ miss 
+------
+ f
+(1 row)
+
+SELECT 'alpha beta gamma'::text @@@ 'delta gamma'::text     AS hit_second_qterm;
+ hit_second_qterm 
+------------------
+ t
+(1 row)
+
+SELECT 'alpha beta gamma'::text @@@ 'delta epsilon'::text   AS miss_multi;
+ miss_multi 
+------------
+ f
+(1 row)
+
+-- Empty sides. An empty query matches nothing (documented), and so does an empty doc.
+SELECT 'alpha beta'::text @@@ ''::text     AS empty_query;
+ empty_query 
+-------------
+ f
+(1 row)
+
+SELECT ''::text @@@ 'alpha'::text          AS empty_doc;
+ empty_doc 
+-----------
+ f
+(1 row)
+
+SELECT ''::text @@@ ''::text               AS empty_both;
+ empty_both 
+------------
+ f
+(1 row)
+
+-- Punctuation-only tokenizes to nothing, so it behaves as empty rather than matching.
+SELECT '... ,,, ---'::text @@@ 'alpha'::text  AS punct_doc;
+ punct_doc 
+-----------
+ f
+(1 row)
+
+SELECT 'alpha'::text @@@ '... ,,, ---'::text  AS punct_query;
+ punct_query 
+-------------
+ f
+(1 row)
+
+-- The analyzer still runs first: lowercasing, stemming and stopword removal all apply,
+-- and duplicate tokens on either side are harmless to a sorted probe.
+SELECT 'ALPHA'::text @@@ 'alpha'::text                 AS case_fold_doc;
+ case_fold_doc 
+---------------
+ t
+(1 row)
+
+SELECT 'alpha'::text @@@ 'ALPHA'::text                 AS case_fold_query;
+ case_fold_query 
+-----------------
+ t
+(1 row)
+
+SELECT 'running quickly'::text @@@ 'run'::text          AS stemmed;
+ stemmed 
+---------
+ t
+(1 row)
+
+SELECT 'alpha alpha alpha'::text @@@ 'alpha'::text      AS dup_doc;
+ dup_doc 
+---------
+ t
+(1 row)
+
+SELECT 'alpha'::text @@@ 'alpha alpha alpha'::text      AS dup_query;
+ dup_query 
+-----------
+ t
+(1 row)
+
+-- 'the' is an english stopword: dropped from both sides, so it can never match.
+SELECT 'the alpha'::text @@@ 'the'::text                AS stopword_only_query;
+ stopword_only_query 
+---------------------
+ f
+(1 row)
+
+-- BOTH branches of the smaller/larger choice must be exercised: the code sorts whichever
+-- side has fewer tokens, so a query LONGER than the document sorts the DOCUMENT instead.
+-- Same answers either way, which is the property that would break if the branch mixed up
+-- which array it sorted and which it probed.
+SELECT 'gamma'::text @@@ 'alpha beta gamma delta epsilon zeta eta theta'::text
+  AS long_query_hit;
+ long_query_hit 
+----------------
+ t
+(1 row)
+
+SELECT 'omega'::text @@@ 'alpha beta gamma delta epsilon zeta eta theta'::text
+  AS long_query_miss;
+ long_query_miss 
+-----------------
+ f
+(1 row)
+
+SELECT 'alpha beta gamma delta epsilon zeta eta theta'::text @@@ 'gamma'::text
+  AS long_doc_hit;
+ long_doc_hit 
+--------------
+ t
+(1 row)
+
+SELECT 'alpha beta gamma delta epsilon zeta eta theta'::text @@@ 'omega'::text
+  AS long_doc_miss;
+ long_doc_miss 
+---------------
+ f
+(1 row)
+
+-- Tokens of differing byte length, since length is the comparator's primary key. A
+-- shorter token that is a prefix of a longer one must not match it.
+SELECT 'ab abc abcd'::text @@@ 'abc'::text   AS exact_len_hit;
+ exact_len_hit 
+---------------
+ t
+(1 row)
+
+SELECT 'abcd'::text @@@ 'abc'::text          AS prefix_is_not_a_match;
+ prefix_is_not_a_match 
+-----------------------
+ f
+(1 row)
+
+SELECT 'abc'::text @@@ 'abcd'::text          AS suffix_is_not_a_match;
+ suffix_is_not_a_match 
+-----------------------
+ f
+(1 row)
+
+-- ---------------------------------------------------------------- index parity
+-- @@@ as a seqscan filter must still agree with itself across a real table. (The INDEX
+-- path deliberately does not route through bm25_match -- xs_recheck=false, see the
+-- function's header -- so this pins the filter path only.)
+CREATE TABLE mi (id int, body text);
+INSERT INTO mi VALUES
+  (1, 'alpha beta gamma'),
+  (2, 'delta epsilon'),
+  (3, 'gamma delta'),
+  (4, ''),
+  (5, 'ALPHA running');
+SET enable_seqscan = on;
+SET enable_indexscan = off;
+SELECT array_agg(id ORDER BY id) AS filter_gamma FROM mi WHERE body @@@ 'gamma';
+ filter_gamma 
+--------------
+ {1,3}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS filter_alpha FROM mi WHERE body @@@ 'alpha';
+ filter_alpha 
+--------------
+ {1,5}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS filter_run   FROM mi WHERE body @@@ 'run';
+ filter_run 
+------------
+ {5}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS filter_or    FROM mi WHERE body @@@ 'epsilon gamma';
+ filter_or 
+-----------
+ {1,2,3}
+(1 row)
+
+SELECT array_agg(id ORDER BY id) AS filter_none  FROM mi WHERE body @@@ 'omega';
+ filter_none 
+-------------
+ 
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_seqscan;
+-- ---------------------------------------------------------------- interruptible
+-- 800k tokens per side, all-miss: ~375 ms of real work after the fix, against a 1 ms
+-- timeout -- a ~375x margin, and the margin only widens on a slower CI runner. Pre-fix
+-- this same call ran for minutes and the timeout was honored only once the loop had
+-- finished; the check now fires during tokenization, well before the probe loop.
+--
+-- If a future machine is fast enough to finish this inside 1 ms, raise the repeat count
+-- rather than lowering the timeout (1 ms is already the floor).
+SET statement_timeout = '1ms';
+SELECT repeat('alpha beta gamma delta ', 200000) @@@ repeat('zeta eta theta iota ', 200000)
+  AS never_completes;
+ERROR:  canceling statement due to statement timeout
+RESET statement_timeout;
+-- The backend is healthy afterwards: the interrupt unwound cleanly, it did not leave the
+-- session wedged, and an ordinary call still answers.
+SELECT 'alpha beta'::text @@@ 'beta'::text AS still_works;
+ still_works 
+-------------
+ t
+(1 row)
+
+DROP TABLE mi;
+DROP EXTENSION bm25_native;

@@ -1,0 +1,595 @@
+-- 131_scored_scan_owner -- the score accessors cannot read another role's open
+-- scored scan, nor a scan over rows the caller may not read (#301).
+--
+-- The registry of open scored scans is per backend, and the accessors are
+-- executable by PUBLIC. A SECURITY DEFINER function whose ranked scan is still
+-- open while the caller's own expressions run -- a LANGUAGE sql set-returning
+-- function in the caller's target list, or a refcursor it opens -- used to let
+-- the caller probe that scan's whole ranking by tid or key, including rows the
+-- definer filtered out above the index scan (here: the other tenant's rows).
+--
+-- The fix, and what each part pins:
+--   - every walker sees only scans registered under the caller's user id
+--     (Part 1: the SQL SRF shape, including the &@@ distance and the snippet);
+--   - the row-addressed accessors also need SELECT on the scan's heap, or on an
+--     ancestor, or on every indexed column (Part 2: refcursor, caller has no
+--     privilege; Part 5: column privileges; Part 6: SELECT on a partitioned
+--     parent only);
+--   - and refuse when row-level security applies to the caller (Part 3: definer
+--     cursor over an RLS table the caller may SELECT; Part 4: the documented
+--     cost, a policy that folds to true);
+--   - a refused scan is invisible: its ranking cannot change any accessor's
+--     answer for the caller's own scans, neither as a NULL that marks a hidden
+--     row nor as a live rival (Part 9);
+--   - a legacy inheritance parent's grant does not cover a child's own columns
+--     (Part 10);
+--   - the &@@ distance is NOT privilege-checked: a role ranking through a view it
+--     was granted, over a partitioned table, still gets an ordered Merge Append
+--     (Part 7); and a role change between FETCHes of one cursor yields NULL
+--     (Part 8, documented).
+-- Same-role use of the accessors is unchanged (the definer's own probes, Part 1;
+-- sql/116 section 3d covers two cursors probed from a separate statement).
+--
+-- Every leaking probe is printed as IS NULL / = Infinity, so a regression shows
+-- as a flipped boolean rather than a float.
+CREATE EXTENSION bm25_native;
+SET enable_seqscan = off;
+CREATE ROLE bm25_s301_owner NOLOGIN;
+CREATE ROLE bm25_s301_mallory NOLOGIN;
+CREATE ROLE bm25_s301_colfull NOLOGIN;
+CREATE ROLE bm25_s301_colpart NOLOGIN;
+CREATE ROLE bm25_s301_reader NOLOGIN;
+-- The issue's corpus. Inserted in id order into a fresh table, so row k is (0,k).
+CREATE TABLE docs (id int, tenant int, body text);
+INSERT INTO docs VALUES (1, 1, 'public alpha news'),
+                        (2, 2, 'secret alpha merger acquisition'),
+                        (3, 1, 'alpha beta'),
+                        (4, 2, 'alpha confidential layoffs');
+CREATE INDEX docs_i ON docs USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id', language = 'english');
+SELECT bm25_seal('docs_i') IS NOT NULL AS sealed;
+ sealed 
+--------
+ t
+(1 row)
+
+ANALYZE docs;
+SELECT ctid, id FROM docs ORDER BY id;
+ ctid  | id 
+-------+----
+ (0,1) |  1
+ (0,2) |  2
+ (0,3) |  3
+ (0,4) |  4
+(4 rows)
+
+ALTER TABLE docs OWNER TO bm25_s301_owner;
+-- EXPLAIN lines for a query, run as the calling role (SECURITY INVOKER).
+CREATE FUNCTION s301_plan(q text) RETURNS SETOF text LANGUAGE plpgsql AS
+$$ BEGIN RETURN QUERY EXECUTE 'EXPLAIN (COSTS OFF) ' || q; END $$;
+-- The definer's search API: tenant 1 only.
+CREATE FUNCTION s301_search(q text) RETURNS SETOF int
+  LANGUAGE sql SECURITY DEFINER SET search_path = public
+AS $$ SELECT id FROM docs WHERE body @@@ q AND tenant = 1 ORDER BY body &@@ q LIMIT 10 $$;
+-- The same, with the definer's own accessor: proves the definer's query takes the
+-- index path (a seqscan registers no scan and every score would be NULL) and that
+-- a role's probes of its own scan still resolve.
+CREATE FUNCTION s301_search_scored(q text) RETURNS TABLE (id int, scored bool)
+  LANGUAGE sql SECURITY DEFINER SET search_path = public
+AS $$ SELECT id, bm25_score(ctid, q) IS NOT NULL FROM docs
+      WHERE body @@@ q AND tenant = 1 ORDER BY body &@@ q LIMIT 10 $$;
+CREATE FUNCTION s301_open(q text) RETURNS refcursor
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE c refcursor := 's301_cur';
+BEGIN
+  OPEN c FOR SELECT id FROM docs WHERE body @@@ q AND tenant = 1 ORDER BY body &@@ q;
+  RETURN c;
+END $$;
+ALTER FUNCTION s301_search(text) OWNER TO bm25_s301_owner;
+ALTER FUNCTION s301_search_scored(text) OWNER TO bm25_s301_owner;
+ALTER FUNCTION s301_open(text) OWNER TO bm25_s301_owner;
+-- ===========================================================================
+-- Part 1: LANGUAGE sql SRF in the caller's target list. ProjectSet calls it once
+-- per output row, so the definer's scan is open while the probes run.
+-- ===========================================================================
+SET ROLE bm25_s301_mallory;
+SELECT count(*) FROM docs;                       -- no privilege on the table
+ERROR:  permission denied for table docs
+-- The definer's own probes still resolve (same role as its scan).
+SELECT id, scored FROM s301_search_scored('alpha merger');
+ id | scored 
+----+--------
+  3 | t
+  1 | t
+(2 rows)
+
+-- Row 2 is tenant 2 and contains "merger"; the definer filtered it out.
+SELECT s301_search('alpha merger') AS visible_id,
+       bm25_score('(0,2)'::tid, 'alpha merger') IS NULL AS q_tid_null,
+       bm25_score('(0,2)'::tid, 'alpha merger', 'docs'::regclass) IS NULL AS q_tid_rel_null,
+       bm25_score('(0,2)'::tid) IS NULL AS tid_null,
+       bm25_score_key(2, 'alpha merger') IS NULL AS q_key_null,
+       bm25_score_key(2) IS NULL AS key_null,
+       ('x' &@@ 'alpha merger') = 'Infinity'::float8 AS dist_inf,
+       bm25_snippet('secret alpha merger', '<b>', '</b>', 100) IS NULL AS snippet_null;
+ visible_id | q_tid_null | q_tid_rel_null | tid_null | q_key_null | key_null | dist_inf | snippet_null 
+------------+------------+----------------+----------+------------+----------+----------+--------------
+          3 | t          | t              | t        | t          | t        | t        | t
+          1 | t          | t              | t        | t          | t        | t        | t
+(2 rows)
+
+-- The whole ranking: with wand_top_k at its maximum every tenant-2 match would be
+-- ranked by the definer's scan.
+SET bm25_native.wand_top_k = 100000;
+SELECT s301_search('alpha') AS visible_id,
+       bm25_score_key(2, 'alpha') IS NULL AS key2_null,
+       bm25_score_key(4, 'alpha') IS NULL AS key4_null;
+ visible_id | key2_null | key4_null 
+------------+-----------+-----------
+          3 | t         | t
+          1 | t         | t
+(2 rows)
+
+RESET bm25_native.wand_top_k;
+-- ===========================================================================
+-- Part 2: definer-opened refcursor. The scan begins at the caller's first FETCH
+-- and so registers under the CALLER's user id; the privilege check refuses it.
+-- ===========================================================================
+BEGIN;
+SELECT s301_open('alpha merger');
+ s301_open 
+-----------
+ s301_cur
+(1 row)
+
+FETCH ALL FROM s301_cur;
+ id 
+----
+  3
+  1
+(2 rows)
+
+SELECT bm25_score('(0,2)'::tid, 'alpha merger') IS NULL AS q_tid_null,
+       bm25_score('(0,2)'::tid) IS NULL AS tid_null,
+       bm25_score_key(2, 'alpha merger') IS NULL AS q_key_null,
+       bm25_score_key(2) IS NULL AS key_null,
+       bm25_score('(0,3)'::tid, 'alpha merger') IS NULL AS visible_row_null_too;
+ q_tid_null | tid_null | q_key_null | key_null | visible_row_null_too 
+------------+----------+------------+----------+----------------------
+ t          | t        | t          | t        | t
+(1 row)
+
+-- bm25_snippet raises rather than returning NULL.
+SELECT bm25_snippet('secret alpha merger', '<b>', '</b>', 100);
+ERROR:  bm25: bm25_snippet cannot read the table ranked by the active bm25 scan
+DETAIL:  The function bm25_snippet requires SELECT on table "docs" or on every column its index reads, and no row-level security in force for the current user.
+ROLLBACK;
+RESET ROLE;
+-- The owner opening the same cursor still reads its own scan.
+SET ROLE bm25_s301_owner;
+BEGIN;
+SELECT s301_open('alpha merger');
+ s301_open 
+-----------
+ s301_cur
+(1 row)
+
+FETCH ALL FROM s301_cur;
+ id 
+----
+  3
+  1
+(2 rows)
+
+SELECT bm25_score('(0,2)'::tid, 'alpha merger') IS NULL AS q_tid_null,
+       bm25_score_key(2) IS NULL AS key_null,
+       bm25_snippet('secret alpha merger', '<b>', '</b>', 100) AS snippet;
+ q_tid_null | key_null |              snippet              
+------------+----------+-----------------------------------
+ f          | f        | secret <b>alpha</b> <b>merger</b>
+(1 row)
+
+ROLLBACK;
+RESET ROLE;
+-- ===========================================================================
+-- Part 3: row-level security. The caller may SELECT the table but sees only
+-- tenant 1. A definer cursor bypasses the policy (the definer owns the table),
+-- the caller fetches it and holds SELECT, so only the RLS check refuses.
+-- ===========================================================================
+CREATE TABLE rdocs (id int, tenant int, body text);
+INSERT INTO rdocs SELECT * FROM docs ORDER BY id;
+CREATE INDEX rdocs_i ON rdocs USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id', language = 'english');
+SELECT bm25_seal('rdocs_i') IS NOT NULL AS sealed;
+ sealed 
+--------
+ t
+(1 row)
+
+ANALYZE rdocs;
+ALTER TABLE rdocs OWNER TO bm25_s301_owner;
+ALTER TABLE rdocs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY rdocs_t1 ON rdocs USING (tenant = 1);
+GRANT SELECT ON rdocs TO bm25_s301_mallory;
+CREATE FUNCTION s301_open_rls(q text) RETURNS refcursor
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE c refcursor := 's301_rcur';
+BEGIN
+  OPEN c FOR SELECT id FROM rdocs WHERE body @@@ q AND tenant = 1 ORDER BY body &@@ q;
+  RETURN c;
+END $$;
+ALTER FUNCTION s301_open_rls(text) OWNER TO bm25_s301_owner;
+SET ROLE bm25_s301_mallory;
+SELECT id FROM rdocs ORDER BY id;                -- the policy's rows only
+ id 
+----
+  1
+  3
+(2 rows)
+
+BEGIN;
+SELECT s301_open_rls('alpha merger');
+ s301_open_rls 
+---------------
+ s301_rcur
+(1 row)
+
+FETCH ALL FROM s301_rcur;
+ id 
+----
+  3
+  1
+(2 rows)
+
+SELECT bm25_score('(0,2)'::tid, 'alpha merger') IS NULL AS q_tid_null,
+       bm25_score('(0,2)'::tid) IS NULL AS tid_null,
+       bm25_score_key(2, 'alpha merger') IS NULL AS q_key_null,
+       bm25_score_key(2) IS NULL AS key_null;
+ q_tid_null | tid_null | q_key_null | key_null 
+------------+----------+------------+----------
+ t          | t        | t          | t
+(1 row)
+
+ROLLBACK;
+RESET ROLE;
+-- ===========================================================================
+-- Part 4: the documented cost. Under a policy that folds to true the caller's
+-- OWN ranked query uses the index, and its row accessors are refused all the
+-- same; the &@@ ranking itself is unaffected.
+-- ===========================================================================
+CREATE TABLE tdocs (id int, body text);
+INSERT INTO tdocs SELECT id, body FROM docs ORDER BY id;
+CREATE INDEX tdocs_i ON tdocs USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id', language = 'english');
+SELECT bm25_seal('tdocs_i') IS NOT NULL AS sealed;
+ sealed 
+--------
+ t
+(1 row)
+
+ANALYZE tdocs;
+ALTER TABLE tdocs OWNER TO bm25_s301_owner;
+ALTER TABLE tdocs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tdocs_all ON tdocs USING (true);
+GRANT SELECT ON tdocs TO bm25_s301_mallory;
+SET ROLE bm25_s301_mallory;
+SELECT bool_or(l ~ 'Index Scan using tdocs_i') AS index_scan
+FROM s301_plan($q$ SELECT id FROM tdocs WHERE body @@@ 'alpha'
+                   ORDER BY body &@@ 'alpha' $q$) l;
+ index_scan 
+------------
+ t
+(1 row)
+
+SELECT count(*) AS rows_,
+       bool_and(key_null) AS key_null, bool_and(q_tid_null) AS q_tid_null,
+       bool_and(ranked) AS ranked
+FROM (SELECT bm25_score_key(id) IS NULL AS key_null,
+             bm25_score(ctid, 'alpha') IS NULL AS q_tid_null,
+             (body &@@ 'alpha') < 0 AS ranked
+      FROM tdocs WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha') s;
+ rows_ | key_null | q_tid_null | ranked 
+-------+----------+------------+--------
+     4 | t        | t          | t
+(1 row)
+
+RESET ROLE;
+-- ===========================================================================
+-- Part 5: column privileges. SELECT on every column the index reads (body and
+-- the INCLUDEd key) is enough; SELECT on body alone is not, because the key
+-- accessor would map ids the role cannot read to scores.
+-- ===========================================================================
+GRANT SELECT (id, body) ON docs TO bm25_s301_colfull;
+GRANT SELECT (body) ON docs TO bm25_s301_colpart;
+SET ROLE bm25_s301_colfull;
+SELECT count(*) AS rows_, bool_and(scored) AS scored
+FROM (SELECT bm25_score_key(id) IS NOT NULL AS scored
+      FROM docs WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha') s;
+ rows_ | scored 
+-------+--------
+     4 | t
+(1 row)
+
+RESET ROLE;
+SET ROLE bm25_s301_colpart;
+SELECT bm25_score_key(2, 'alpha') IS NULL AS q_key_null,
+       bm25_score_key(2) IS NULL AS key_null,
+       (body &@@ 'alpha') < 0 AS ranked
+FROM docs WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha' LIMIT 1;
+ q_key_null | key_null | ranked 
+------------+----------+--------
+ t          | t        | t
+(1 row)
+
+RESET ROLE;
+-- ===========================================================================
+-- Part 6 and 7: a partitioned table. Each partition is ranked by its own index
+-- scan under a Merge Append, so the scans' heaps are the partitions.
+-- ===========================================================================
+CREATE TABLE pp (id int, body text) PARTITION BY RANGE (id);
+CREATE TABLE pp1 PARTITION OF pp FOR VALUES FROM (1) TO (13);
+CREATE TABLE pp2 PARTITION OF pp FOR VALUES FROM (13) TO (25);
+INSERT INTO pp SELECT g, repeat('foo ', (g % 5) + 1) || 'x' || g || ' ' || repeat('pad ', g % 3)
+  FROM generate_series(1, 24) g;
+CREATE INDEX pp_i ON pp USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id', language = 'english');
+SELECT bm25_seal('pp1_body_id_idx') IS NOT NULL AS sealed_1,
+       bm25_seal('pp2_body_id_idx') IS NOT NULL AS sealed_2;
+ sealed_1 | sealed_2 
+----------+----------
+ t        | t
+(1 row)
+
+ANALYZE pp;
+-- Baseline: each child ranked on its own (sql/112's oracle).
+CREATE TABLE pp_base AS
+  SELECT id, body &@@ 'foo' AS d FROM pp1 WHERE body @@@ 'foo' ORDER BY body &@@ 'foo';
+INSERT INTO pp_base
+  SELECT id, body &@@ 'foo' AS d FROM pp2 WHERE body @@@ 'foo' ORDER BY body &@@ 'foo';
+SELECT count(*) AS base_rows, bool_and(d < 0) AS base_all_ranked FROM pp_base;
+ base_rows | base_all_ranked 
+-----------+-----------------
+        24 | t
+(1 row)
+
+GRANT SELECT ON pp_base TO PUBLIC;
+ALTER TABLE pp OWNER TO bm25_s301_owner;
+ALTER TABLE pp1 OWNER TO bm25_s301_owner;
+ALTER TABLE pp2 OWNER TO bm25_s301_owner;
+-- Part 6: SELECT on the partitioned parent only. Every partition is readable
+-- through the parent, so the accessors answer for rows of both partitions.
+GRANT SELECT ON pp TO bm25_s301_reader;
+SET ROLE bm25_s301_reader;
+SELECT count(*) AS rows_,
+       bool_and(bm25_score_key(id, 'foo') IS NOT NULL) AS q_key_scored,
+       bool_and(-bm25_score_key(id, 'foo') = b.d) AS q_key_matches_baseline
+FROM (SELECT id FROM pp WHERE body @@@ 'foo' ORDER BY body &@@ 'foo') s
+JOIN pp_base b USING (id);
+ rows_ | q_key_scored | q_key_matches_baseline 
+-------+--------------+------------------------
+    24 | t            | t
+(1 row)
+
+RESET ROLE;
+-- Part 7: a view granted to a role with no privilege on the tables. The ranked
+-- query runs under the caller's id; the &@@ distance must still order the Merge
+-- Append, while the row accessors are refused (the documented cost).
+CREATE VIEW pv AS SELECT id, body FROM pp;
+ALTER VIEW pv OWNER TO bm25_s301_owner;
+GRANT SELECT ON pv TO bm25_s301_mallory;
+SET ROLE bm25_s301_mallory;
+SELECT count(*) FROM pp;                         -- no privilege on the table
+ERROR:  permission denied for table pp
+SELECT bool_or(l ~ 'Merge Append') AS merge_append,
+       count(*) FILTER (WHERE l ~ 'Index Scan using pp[12]_body_id_idx') AS child_index_scans
+FROM s301_plan($q$ SELECT id FROM pv WHERE body @@@ 'foo'
+                   ORDER BY body &@@ 'foo' $q$) l;
+ merge_append | child_index_scans 
+--------------+-------------------
+ t            |                 2
+(1 row)
+
+SELECT count(*) AS rows_,
+       count(b.id) AS rows_with_baseline,
+       bool_and(o.d = b.d) AS distance_is_baseline,
+       count(*) FILTER (WHERE o.d < o.prev_d) AS order_violations,
+       bool_and(o.key_null) AS accessors_refused
+FROM (SELECT id, d, key_null, lag(d) OVER (ORDER BY rn) AS prev_d, rn
+      FROM (SELECT id, d, key_null, row_number() OVER () AS rn
+            FROM (SELECT id, body &@@ 'foo' AS d, bm25_score_key(id) IS NULL AS key_null
+                  FROM pv WHERE body @@@ 'foo' ORDER BY body &@@ 'foo') s) r) o
+LEFT JOIN pp_base b USING (id);
+ rows_ | rows_with_baseline | distance_is_baseline | order_violations | accessors_refused 
+-------+--------------------+----------------------+------------------+-------------------
+    24 |                 24 | t                    |                0 | t
+(1 row)
+
+SELECT (SELECT array_agg(id ORDER BY id)
+          FROM (SELECT id FROM pv WHERE body @@@ 'foo'
+                ORDER BY body &@@ 'foo' LIMIT 5) s)
+     = (SELECT array_agg(id ORDER BY id)
+          FROM (SELECT id FROM pp_base ORDER BY d LIMIT 5) s) AS limit5_is_true_top5;
+ limit5_is_true_top5 
+---------------------
+ t
+(1 row)
+
+RESET ROLE;
+-- ===========================================================================
+-- Part 8: a role change between FETCHes of one cursor. The scan is owned by the
+-- role that fetched first; after the change its rows' accessors are NULL
+-- (documented).
+-- ===========================================================================
+SET ROLE bm25_s301_owner;
+BEGIN;
+DECLARE c8 CURSOR FOR
+  SELECT bm25_score_key(id) IS NOT NULL AS scored
+  FROM docs WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha';
+FETCH 1 FROM c8;
+ scored 
+--------
+ t
+(1 row)
+
+RESET ROLE;
+FETCH 1 FROM c8;
+ scored 
+--------
+ f
+(1 row)
+
+COMMIT;
+-- ===========================================================================
+-- Part 9: a refused scan must not shape answers about the caller's own scan.
+-- mallory owns `mine`, one row per probed id, every row matching the query, so
+-- its own ranking holds every id. With the definer's refcursor fetched (0 rows:
+-- tenant 1 has no "merger"), an accessor that consulted the refused scan at all
+-- -- even only to turn a hit into NULL -- would answer NULL exactly for the ids
+-- whose hidden docs row contains the term (row 2), and score for the rest.
+-- ===========================================================================
+CREATE TABLE mine (id int, body text);
+INSERT INTO mine SELECT g, 'merger alpha' FROM generate_series(1, 4) g;
+CREATE INDEX mine_i ON mine USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id', language = 'english');
+SELECT bm25_seal('mine_i') IS NOT NULL AS sealed;
+ sealed 
+--------
+ t
+(1 row)
+
+ANALYZE mine;
+ALTER TABLE mine OWNER TO bm25_s301_mallory;
+SET ROLE bm25_s301_mallory;
+BEGIN;
+SELECT s301_open('merger');
+ s301_open 
+-----------
+ s301_cur
+(1 row)
+
+FETCH ALL FROM s301_cur;
+ id 
+----
+(0 rows)
+
+SELECT count(*) AS rows_,
+       count(*) FILTER (WHERE key_null) AS q_key_nulls,
+       count(*) FILTER (WHERE tid_null) AS q_tid_nulls,
+       count(*) FILTER (WHERE onearg_null) AS onearg_nulls
+FROM (SELECT bm25_score_key(id, 'merger') IS NULL AS key_null,
+             bm25_score(ctid, 'merger') IS NULL AS tid_null,
+             bm25_score_key(id) IS NULL AS onearg_null
+      FROM mine WHERE body @@@ 'merger' ORDER BY body &@@ 'merger') s;
+ rows_ | q_key_nulls | q_tid_nulls | onearg_nulls 
+-------+-------------+-------------+--------------
+     4 |           0 |           0 |            0
+(1 row)
+
+ROLLBACK;
+-- The rival count. The definer's cursor is fetched part way, so its scan could
+-- still emit (that depends on what it ranked). mallory's own ranking is then
+-- read decoupled from its scan (aggregated first), which resolves through the
+-- sole-live-scan fallback; a refused scan counted as a live rival there would
+-- turn most of these answers into NULL (all but the one that resolves through
+-- the current-row match).
+BEGIN;
+SELECT s301_open('alpha');
+ s301_open 
+-----------
+ s301_cur
+(1 row)
+
+FETCH 1 FROM s301_cur;
+ id 
+----
+  3
+(1 row)
+
+SELECT count(*) AS rows_,
+       count(*) FILTER (WHERE bm25_score_key(id) IS NULL) AS onearg_nulls
+FROM (SELECT array_agg(id) AS ids
+      FROM (SELECT id FROM mine WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha') r) a,
+     unnest(a.ids) AS id;
+ rows_ | onearg_nulls 
+-------+--------------
+     4 |            0
+(1 row)
+
+ROLLBACK;
+RESET ROLE;
+-- ===========================================================================
+-- Part 10: legacy inheritance. A child can add columns, and SELECT on the parent
+-- reads only the parent's, so the parent's grant must not let a role probe a
+-- bm25 index on the child's own column.
+-- ===========================================================================
+CREATE TABLE par (id int, title text);
+CREATE TABLE kid (secret text) INHERITS (par);
+INSERT INTO kid VALUES (1, 't1', 'public stuff'), (2, 't2', 'secret merger plan'),
+                       (3, 't3', 'nothing'), (4, 't4', 'merger rumor');
+CREATE INDEX kid_i ON kid USING bm25_native (secret) INCLUDE (id)
+  WITH (key_field = 'id', language = 'english');
+SELECT bm25_seal('kid_i') IS NOT NULL AS sealed;
+ sealed 
+--------
+ t
+(1 row)
+
+ANALYZE kid;
+ALTER TABLE par OWNER TO bm25_s301_owner;
+ALTER TABLE kid OWNER TO bm25_s301_owner;
+GRANT SELECT ON par TO bm25_s301_mallory;
+CREATE FUNCTION s301_open_kid(q text) RETURNS refcursor
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE c refcursor := 's301_kcur';
+BEGIN
+  OPEN c FOR SELECT id FROM kid WHERE secret @@@ q AND id = 1 ORDER BY secret &@@ q;
+  RETURN c;
+END $$;
+ALTER FUNCTION s301_open_kid(text) OWNER TO bm25_s301_owner;
+SET ROLE bm25_s301_mallory;
+SELECT count(*) AS rows_via_parent FROM par;
+ rows_via_parent 
+-----------------
+               4
+(1 row)
+
+SELECT secret FROM kid;                          -- the child's column is not readable
+ERROR:  permission denied for table kid
+BEGIN;
+SELECT s301_open_kid('merger');
+ s301_open_kid 
+---------------
+ s301_kcur
+(1 row)
+
+FETCH ALL FROM s301_kcur;
+ id 
+----
+(0 rows)
+
+SELECT k, bm25_score_key(k, 'merger') IS NULL AS q_key_null,
+       bm25_score_key(k) IS NULL AS key_null
+FROM generate_series(1, 4) k;
+ k | q_key_null | key_null 
+---+------------+----------
+ 1 | t          | t
+ 2 | t          | t
+ 3 | t          | t
+ 4 | t          | t
+(4 rows)
+
+ROLLBACK;
+RESET ROLE;
+-- ===========================================================================
+-- Cleanup.
+-- ===========================================================================
+DROP VIEW pv;
+DROP TABLE pp, pp_base, docs, rdocs, tdocs, mine, kid, par;
+DROP FUNCTION s301_search(text), s301_search_scored(text), s301_open(text),
+              s301_open_rls(text), s301_open_kid(text), s301_plan(text);
+DROP ROLE bm25_s301_owner, bm25_s301_mallory, bm25_s301_colfull,
+          bm25_s301_colpart, bm25_s301_reader;
+DROP EXTENSION bm25_native;

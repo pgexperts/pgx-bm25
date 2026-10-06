@@ -1,0 +1,53 @@
+comment = 'Native BM25 ranked full-text index access method'
+default_version = '1.0'
+# $libdir-prefixed, which is the PGXS convention, so the shipped artifact names
+# its load target the way every other extension on the box does (#148 SQL-11).
+#
+# WHAT THAT PREFIX ACTUALLY PINS IS VERSION-DEPENDENT, and both versions matter
+# here because src/bm25.h #errors below PG17:
+#
+#   PG17 and earlier -- load_external_function() hands the name straight to
+#   expand_dynamic_library_name(), which sees the slash, macro-substitutes
+#   $libdir to pkglibdir and NEVER consults dynamic_library_path. The load
+#   target is genuinely pinned. This is the behavior the convention assumes.
+#
+#   PG18 -- load_external_function() STRIPS a leading "$libdir/" from a simple
+#   (non-nested) name before expanding it, so the remainder is searched through
+#   dynamic_library_path exactly as a bare name would be. That strip was added
+#   with extension_control_path (4f7f7b03758), moved out of
+#   expand_dynamic_library_name so LOAD keeps the old meaning (f777d773878),
+#   and narrowed to non-nested names (d07e2d4237c on REL_18_STABLE, 990c8db1827
+#   on master) -- all before 18.0, so every released 18.x behaves this way.
+#
+#   The strip lives INSIDE load_external_function, not at its call sites, so it
+#   is per-ENTRY-FUNCTION and nothing can opt in or out: every caller of
+#   load_external_function gets it and no caller of load_file() does. That
+#   second family is LOAD plus the *_preload_libraries GUCs (shared_, session_,
+#   local_), which therefore keep the pre-18 meaning. module_pathname goes
+#   through the first. PG18's own xfunc.sgml still documents the pre-18
+#   algorithm; the code is authoritative.
+#
+# Measured on the PG 18.3 dev server: with dynamic_library_path forced to
+# '$libdir', '$libdir/bm25_native' resolved to <pkglibdir>; with the repo build
+# dir prepended (what the no-sudo harness sets) the SAME string resolved to the
+# repo build. So on PG18 the two forms are indistinguishable FOR RESOLUTION --
+# they still differ in what lands in pg_proc.probin, and so in \df+,
+# pg_get_functiondef and pg_dump output, and in the not-found error text. That
+# equivalence is what lets the no-sudo, no-`make install` dev flow keep working
+# across this change. A no-sudo harness on PG17 would NOT work -- there the
+# prefix really does pin pkglibdir, and the module has to be installed.
+#
+# DEPLOYMENT CONSTRAINT, stated because the prefix does not remove it on PG18:
+# a postgresql.conf line prepending any directory to dynamic_library_path (a
+# shared build dir, an NFS mount, a container bind-mount) silently redirects
+# every CREATE EXTENSION bm25_native in an 18.x cluster, with no error and no
+# log line. dynamic_library_path is PGC_SUSET, so that is a superuser act and
+# not an unprivileged escalation -- but it is invisible, and on PG18 a
+# $libdir-prefixed module_pathname does not prevent it.
+module_pathname = '$libdir/bm25_native'
+# NOT relocatable (#311 CI-16, D26). `relocatable = true` would let ALTER EXTENSION
+# ... SET SCHEMA move the schema-qualified objects, but no test ever relocated this
+# extension, so the claim was unverified. The access method name is global to the
+# cluster either way (ADR 0013), so relocation buys nothing. CREATE EXTENSION
+# ... SCHEMA x still works; only the later SET SCHEMA move is refused.
+relocatable = false

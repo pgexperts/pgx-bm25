@@ -1,0 +1,120 @@
+-- 56_planner_estimates: the @@@ planner numbers are honest, proven where it
+-- matters. contsel's 0.001 put reltuples*sel below LIMIT on corpora up to
+-- ~LIMIT/0.001 rows, which disabled Limit proration and billed the ordered
+-- index path its FULL scan cost (a ~25x overprice); procost=1 priced the
+-- seqscan's per-row re-analyze+tokenize at one comparison. Either lie alone
+-- loses the plan under ordinary GUC settings. This suite pins the fix INSIDE
+-- the failure window: ~5k rows, LIMIT 10, adversarial-but-ordinary page
+-- costs. Deliberately NO enable_seqscan=off anywhere here -- its absence is
+-- the point (suites that keep it do so for scan-path determinism, not
+-- because the default plan is wrong).
+CREATE EXTENSION IF NOT EXISTS bm25_native;
+\set VERBOSITY terse
+-- Corpus: 5,183 docs (inside the window: 5183 * old 0.001 = 5.18 < LIMIT 10),
+-- a realistic two-field vocabulary so multi-term queries have real recall.
+CREATE TABLE pe_docs (id int PRIMARY KEY, title text, body text)
+    WITH (autovacuum_enabled = off);
+INSERT INTO pe_docs SELECT g,
+  concat_ws(' ', CASE WHEN g % 40 = 0 THEN 'negligence' END,
+                 CASE WHEN g % 25 = 0 THEN 'liability' END,
+                 CASE WHEN g % 10 = 0 THEN 'contract' END, 'brief'),
+  concat_ws(' ', CASE WHEN g % 4  = 0 THEN 'liability' END,
+                 CASE WHEN g % 15 = 0 THEN 'negligence' END,
+                 CASE WHEN g % 3  = 0 THEN 'damages' END,
+                 CASE WHEN g % 6  = 0 THEN 'equity' END,
+                 CASE WHEN g % 10 = 0 THEN 'contract' END,
+                 repeat('pad ', g % 11))
+FROM generate_series(1, 5183) g;
+-- body is the anchor field for @@@ / &@@ below (by convention the
+-- ordered-scan path anchors on the FIRST indexed column), so it leads here;
+-- its richer per-doc frequency gradient (vs title's coarser one) is what
+-- gives the multi-term query real, non-trivial recall.
+CREATE INDEX pe_bm25 ON pe_docs USING bm25_native (body, title) INCLUDE (id)
+    WITH (key_field = 'id');
+SELECT bm25_seal('pe_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+ANALYZE pe_docs;  -- reltuples drives the proration window; do not skip
+-- Portable plan-shape guard (sql/53 pattern): count matching plan lines, never
+-- pin raw EXPLAIN (Disabled:/cost lines vary by PG version).
+CREATE FUNCTION pe_plan(q text) RETURNS SETOF text LANGUAGE plpgsql AS
+$$ BEGIN RETURN QUERY EXECUTE 'EXPLAIN (COSTS OFF) ' || q; END $$;
+-- (1) Outcome, adversarial GUC #1: high random_page_cost (ordinary SSD-hostile
+-- tuning). RED on main: contsel+procost=1 plans Seq Scan + Sort here.
+SET random_page_cost = 8;
+SELECT count(*) AS ranked_uses_index_rpc8
+FROM pe_plan(
+  $q$ SELECT id FROM pe_docs WHERE body @@@ 'negligence liability'
+      ORDER BY body &@@ 'negligence liability' LIMIT 10 $q$) AS line
+WHERE line LIKE '%Index Scan using pe_bm25%';
+ ranked_uses_index_rpc8 
+------------------------
+                      1
+(1 row)
+
+RESET random_page_cost;
+-- (1) Outcome, adversarial GUC #2: cheap sequential pages.
+SET seq_page_cost = 0.5;
+SELECT count(*) AS ranked_uses_index_spc05
+FROM pe_plan(
+  $q$ SELECT id FROM pe_docs WHERE body @@@ 'negligence liability'
+      ORDER BY body &@@ 'negligence liability' LIMIT 10 $q$) AS line
+WHERE line LIKE '%Index Scan using pe_bm25%';
+ ranked_uses_index_spc05 
+-------------------------
+                       1
+(1 row)
+
+RESET seq_page_cost;
+-- The jsonb variant shares the selectivity/cost mechanism; this pins its
+-- plan shape so the catalog pins in (2) are not its only coverage.
+SET random_page_cost = 8;
+SELECT count(*) AS ranked_uses_index_jsonb_rpc8
+FROM pe_plan(
+  $q$ SELECT id FROM pe_docs WHERE body @@@ bm25_term('body','negligence')
+      ORDER BY body &@@ bm25_term('body','negligence') LIMIT 10 $q$) AS line
+WHERE line LIKE '%Index Scan using pe_bm25%';
+ ranked_uses_index_jsonb_rpc8 
+------------------------------
+                            1
+(1 row)
+
+RESET random_page_cost;
+-- (2) Mechanism pins. The outcome test alone cannot say WHICH number
+-- regressed (either alone flips the tested cells); these can. oprleft is
+-- pinned to text: core ships a pre-existing (tsvector,tsquery) '@@@' pair
+-- (the deprecated tsearch2-compat spelling of '@@'), so an unqualified
+-- oprname match returns four rows, not bm25_native's two.
+SELECT oprright::regtype AS rhs, oprrest::regproc, oprjoin::regproc
+FROM pg_operator WHERE oprname = '@@@' AND oprleft = 'text'::regtype
+ORDER BY oprright::regtype::text;
+  rhs  |    oprrest    |      oprjoin      
+-------+---------------+-------------------
+ jsonb | bm25_matchsel | bm25_matchjoinsel
+ text  | bm25_matchsel | bm25_matchjoinsel
+(2 rows)
+
+SELECT proname, procost >= 1000 AS priced_honestly
+FROM pg_proc WHERE proname IN ('bm25_match', 'bm25_match_jsonb')
+ORDER BY proname;
+     proname      | priced_honestly 
+------------------+-----------------
+ bm25_match       | t
+ bm25_match_jsonb | t
+(2 rows)
+
+-- (3) Packaging: 1.0 ships as a single consolidated bm25_native--1.0.sql
+-- (fresh install only; the former 0.1->0.2->0.3 upgrade chain is folded in, no
+-- upgrade script), so the installed version identity IS the parity check.
+SELECT extversion FROM pg_extension WHERE extname = 'bm25_native';
+ extversion 
+------------
+ 1.0
+(1 row)
+
+DROP FUNCTION pe_plan(text);
+DROP TABLE pe_docs;
+DROP EXTENSION bm25_native;

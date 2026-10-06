@@ -1,0 +1,105 @@
+-- NULL runtime scan keys (review ref C2).
+--
+-- The executor evaluates a runtime key that comes out NULL by setting
+-- sk_argument = (Datum) 0 and raising SK_ISNULL, then calls index_rescan anyway.
+-- Testing that flag is the AM's job.  Before the fix nothing in the extension
+-- tested it, so the NULL reached DatumGetTextPP(0) / DatumGetJsonbP(0) and took
+-- SIGSEGV -- restarting the entire cluster, from unprivileged user SQL.
+--
+-- A literal `@@@ NULL` never reproduces it: bm25_match is STRICT, so the planner
+-- const-folds the qual away.  It takes a runtime key (PREPARE + generic plan, or a
+-- parameterized nested-loop inner scan) to reach bm25_rescan with SK_ISNULL set.
+--
+-- The two key kinds are deliberately NOT symmetric:
+--   @@@ NULL  -> bm25_match is STRICT, no row can match  -> empty result.
+--   &@@ NULL  -> the rows still qualify via the @@@ key; only their ORDER BY value
+--                is unknown (bm25_distance is STRICT, so the executor's resjunk is
+--                NULL for every row) -> all matching rows, order unspecified.
+--                This mirrors GiST's NULL-KNN-key behaviour.  Returning nothing
+--                would be a silent wrong answer.
+
+CREATE EXTENSION bm25_native;
+
+CREATE TABLE docs (id int primary key, body text);
+INSERT INTO docs VALUES
+  (1, 'alpha banana cherry'),
+  (2, 'alpha alpha banana'),
+  (3, 'banana cherry date'),
+  (4, 'alpha cherry date');
+CREATE INDEX docs_bm25 ON docs USING bm25_native (body);
+SELECT bm25_seal('docs_bm25');
+
+SET enable_seqscan = off;
+SET plan_cache_mode = force_generic_plan;
+
+-- ---------------------------------------------------------------- boolean @@@
+PREPARE m(text) AS SELECT id FROM docs WHERE body @@@ $1 ORDER BY id;
+EXPLAIN (COSTS OFF) EXECUTE m('alpha');
+
+-- Non-NULL parameter: ordinary membership, proves the generic plan really is
+-- index-driven (so the NULL execution below goes through bm25_rescan).
+EXECUTE m('alpha');
+
+-- NULL parameter: no row can match a STRICT operator.  Empty, and alive.
+EXECUTE m(NULL);
+
+-- Still alive and still correct afterwards.
+EXECUTE m('cherry');
+
+-- ------------------------------------------------------------- ranked &@@
+-- LIMIT is above the match count so every matching row is returned; the ORDER BY
+-- value is NULL for all of them, so the emission order is unspecified and the
+-- result is re-sorted by id to stay deterministic.
+-- Plan shape first, on the bare ranked query, so the EXPLAIN stays a portable
+-- `Limit -> Index Scan` and visibly carries the `Order By: (body &@@ $1)`
+-- runtime key that is the crashing one.
+PREPARE rplan(text) AS
+  SELECT id FROM docs WHERE body @@@ 'alpha' ORDER BY body &@@ $1 LIMIT 10;
+EXPLAIN (COSTS OFF) EXECUTE rplan('alpha');
+
+PREPARE r(text) AS
+  SELECT array_agg(id ORDER BY id) AS ids
+    FROM (SELECT id FROM docs WHERE body @@@ 'alpha' ORDER BY body &@@ $1 LIMIT 10) s;
+EXECUTE r('alpha');
+
+-- NULL ORDER BY key: the @@@ 'alpha' rows must still come back (1,2,4).
+EXECUTE r(NULL);
+
+-- 'cherry' here is NOT the WHERE query ('alpha'). The scan returns the WHERE set
+-- (1,2,4) ranked by 'cherry', the row 'cherry' does not match (2) last (#290); it
+-- used to return the 'cherry' matches instead, the WHERE key never being applied.
+EXECUTE r('cherry');
+
+-- ------------------------------------------------------------- jsonb subtype
+PREPARE mj(jsonb) AS SELECT id FROM docs WHERE body @@@ $1 ORDER BY id;
+EXECUTE mj(bm25_match_terms('body', 'alpha'));
+EXECUTE mj(NULL);
+
+PREPARE rj(jsonb) AS
+  SELECT array_agg(id ORDER BY id) AS ids
+    FROM (SELECT id FROM docs WHERE body @@@ 'alpha'
+           ORDER BY body &@@ $1 LIMIT 10) s;
+EXECUTE rj(bm25_match_terms('body', 'alpha'));
+EXECUTE rj(NULL);
+
+-- --------------------------------------------- parameterized nested-loop inner
+-- The other shape that produces a runtime key: a join whose outer side supplies
+-- NULL on one row.  The NULL outer row contributes nothing; the others match.
+CREATE TABLE q (qid int, term text);
+INSERT INTO q VALUES (1, 'alpha'), (2, NULL), (3, 'date');
+
+SELECT q.qid, count(docs.id) AS hits
+  FROM q LEFT JOIN docs ON docs.body @@@ q.term
+ GROUP BY q.qid ORDER BY q.qid;
+
+-- ------------------------------------------------------ const-folded control
+-- Same query with a literal NULL: STRICT const-folding removes the qual before
+-- the AM ever sees it.  Included so the two paths are visibly distinguished.
+SELECT id FROM docs WHERE body @@@ NULL::text ORDER BY id;
+
+RESET plan_cache_mode;
+RESET enable_seqscan;
+DEALLOCATE ALL;
+DROP TABLE q;
+DROP TABLE docs;
+DROP EXTENSION bm25_native;

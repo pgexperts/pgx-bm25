@@ -1,0 +1,161 @@
+-- 35_m5_acceptance: end-to-end M5 (multi-field / BM25F / key_field) acceptance
+-- (spec §10 M5 bullet; ROADMAP §3/§5). One consolidated suite proving the five M5
+-- guarantees on a live ranked scan:
+--   (1) one index over (title, summary, body) -> a SINGLE Index Scan in EXPLAIN;
+--   (2) a `title` hit scores EXACTLY 5x the same term in `body` (the 5:1 boost);
+--   (3) a `field:term`-scoped query ignores other fields (other-field docs ABSENT);
+--   (4) results return the user key `id` (not ctid);
+--   (5) per-field avgdl is exact (Σ doclen_field / N_field, N_field over docs that
+--       HAVE the field -> a field present in a SUBSET of docs has N_field < ndocs).
+-- Plus a no-key_field block asserting the ctid-fallback back-compat path.
+--
+-- Every ranked query uses SET enable_seqscan = off + ORDER BY ... &@@, the ONLY form
+-- the planner can satisfy via the bm25_native index (a bare @@@ boolean filter could be
+-- answered by a recheck on another index, bypassing the BM25F scorer / field-scope
+-- parse). The operator is text @@@ text: the LHS column is just the opclass anchor,
+-- the RHS text carries the scope; driving @@@ on any indexed text column runs the one
+-- multi-column scan (mirrors 31_bm25f_score / 32_field_query). All assertions are
+-- version-stable: row orderings, an exact boost RATIO, exact avgdl floats, key values,
+-- and the EXPLAIN node shape do NOT depend on the english_stem catalog OID (PG 16/17/18).
+CREATE EXTENSION bm25_native;
+
+-- The three-field corpus. `running` appears in the TITLE of doc 1 and the BODY of
+-- doc 2; `summary` is present in every doc (so N_summary = ndocs) but `body` is EMPTY
+-- on doc 3, so N_body = 2 < ndocs = 3 -- that inequality is what makes block (5)'s
+-- per-field avgdl a REAL N_field, not the naive "N_field == ndocs" shortcut.
+CREATE TABLE docs (
+    id       int PRIMARY KEY,
+    title    text,
+    summary  text,
+    body     text
+) WITH (autovacuum_enabled = off);
+INSERT INTO docs VALUES
+    (1, 'running shoes',     'athletic footwear',  'padded filler alpha bravo'),
+    (2, 'athletic footwear', 'trail gear review',  'padded running alpha bravo'),
+    (3, 'hiking boots',      'mountain equipment', '');   -- empty body: NOT in N_body
+
+-- key_field='id' (carried as an INCLUDE column, amcaninclude) binds docid->key to the
+-- heap `id`; boost_title=5, boost_body=1 (summary defaults to 1.0). Field names ARE the
+-- column attnames baked on the field-config page.
+CREATE INDEX docs_bm25 ON docs USING bm25_native (title, summary, body) INCLUDE (id)
+    WITH (key_field = 'id', boost_title = '5.0', boost_body = '1.0');
+
+-- Sanity: the field-config page carries three real fields, attname-keyed, dense ids,
+-- with the boosts as set (summary defaulting to 1.0). OID-independent.
+SELECT field_id, field_name, boost FROM bm25_debug_fieldcfg('docs_bm25')
+ORDER BY field_id;
+
+SET enable_seqscan = off;
+
+-- ===== (1) single Index Scan in EXPLAIN =====
+-- The multi-column bm25_native index is driven by ONE scan key (the &@@ order-by amop); the
+-- plan must be a single "Index Scan using docs_bm25" with NO Seq Scan and NO Sort.
+-- COSTS OFF keeps the (cost=...)/rows=... volatility out of the expected file; this
+-- EXPLAIN form is version-stable (32_field_query pins the identical shape on 16/17/18).
+-- A regression that split the multi-column drive into per-column scan keys, lost the
+-- order-by amop, or fell back to a heap scan surfaces here as a Seq Scan / Sort diff.
+EXPLAIN (COSTS OFF)
+SELECT id FROM docs WHERE title @@@ 'running'
+ORDER BY title &@@ 'running' LIMIT 5;
+
+-- ===== (2) BM25F 5:1 boost -- EXACT ratio, not just rank order =====
+-- Boost in ISOLATION needs a corpus where title and body have IDENTICAL stats for the
+-- term, so the ONLY factor separating a title-hit doc from a body-hit doc is the 5:1
+-- boost. The main `docs` corpus is asymmetric (N_title=3 vs N_body=2, differing field
+-- doclens), so idf/length-norm also move -- a ratio there is not a clean boost lock. A
+-- symmetric 2-doc mirror (each doc's non-'zeta' field is 2 tokens, 'zeta' field is 1
+-- token) gives title and body identical corpus stats for 'zeta' (N_field=2, df=1,
+-- avgdl=1.5, doclen=1 on both sides), so the boosted-title doc must score EXACTLY 5x
+-- the un-boosted-body doc. A neutered boost (1:1) collapses the ratio to 1.0; a weak
+-- "doc1 ranks first" check would still pass a tie-break, so we pin the RATIO to
+-- 5.000000. (Same isolation technique as 31_bm25f_score's boost_sym.)
+CREATE TABLE boost_sym (id int PRIMARY KEY, title text, body text)
+    WITH (autovacuum_enabled = off);
+INSERT INTO boost_sym VALUES
+    (1, 'zeta',         'kappa lambda'),   -- 'zeta' in title only (tf1, dl1)
+    (2, 'kappa lambda', 'zeta');           -- mirror: 'zeta' in body only (tf1, dl1)
+CREATE INDEX boost_sym_bm25 ON boost_sym USING bm25_native (title, body)
+    WITH (boost_title = '5.0', boost_body = '1.0');
+SET enable_seqscan = off;
+WITH scored AS (
+  SELECT id, bm25_score(ctid) AS score
+  FROM boost_sym WHERE title @@@ 'zeta' ORDER BY title &@@ 'zeta'
+)
+SELECT round(((SELECT score FROM scored WHERE id = 1) /
+              (SELECT score FROM scored WHERE id = 2))::numeric, 6)
+       AS title_over_body_ratio;   -- 5.000000 iff the 5:1 boost is the isolated factor
+RESET enable_seqscan;
+DROP TABLE boost_sym;
+
+SET enable_seqscan = off;
+
+-- ===== (3) field-scope ABSENCE -- other-field docs are absent, not just present =====
+-- 'body:running' scopes to field `body` only: doc 2 (running in body) matches; doc 1
+-- (running in TITLE) must be ABSENT. The ranked &@@ form forces the bm25_native index, which
+-- parses field:term in bm25_rescan (a bare boolean @@@ could be answered by the PK
+-- index and mis-scope). Returning ONLY {2} -- not {1,2} -- is the discriminating check:
+-- a scope that leaked to all fields, or resolved "field 0 vs everything", would include
+-- doc 1 here.
+SELECT id FROM docs WHERE title @@@ 'body:running'
+ORDER BY title &@@ 'body:running', id;
+
+-- The complementary scope: 'title:running' returns ONLY doc 1, never doc 2. Together
+-- these prove the scope is a real per-field filter in both directions.
+SELECT id FROM docs WHERE title @@@ 'title:running'
+ORDER BY title &@@ 'title:running', id;
+
+-- ===== (4) results return the user key `id` (not ctid) =====
+-- With key_field='id' the scorer stashes key[docid] beside the TID. bm25_score_key(id)
+-- resolves a ranked row by the USER KEY and must return the SAME score bm25_score(ctid)
+-- does for every ranked row -- if the scorer keyed on ctid instead of storing the key,
+-- by_key would diverge (or find no row). Both need an active &@@ scan.
+SELECT id, round(bm25_score(ctid)::numeric, 6) AS by_ctid,
+            round(bm25_score_key(id)::numeric, 6) AS by_key
+FROM docs WHERE title @@@ 'running' ORDER BY title &@@ 'running';
+
+-- The debug SRF projects the key column directly: bm25_debug_rank_key returns the user
+-- id (key_int4), not a ctid, for the ranked set -- the boosted title doc (id 1) leads.
+SELECT key_int4, round(score::numeric, 6) AS score
+FROM bm25_debug_rank_key('docs_bm25', 'running')
+ORDER BY score DESC, key_int4;
+
+-- ===== (5) per-field avgdl EXACT (Σ doclen_field / N_field over docs that HAVE it) =====
+-- Field lengths (english analyzer; these tokens are stem-stable non-stopwords, so a
+-- field's doclen -- its count of word runs -- equals both its token count and its
+-- word count):
+--   title:   [2,2,2] = 6 over 3 docs        -> avgdl_title   = 6/3 = 2.0000
+--   summary: [2,3,2] = 7 over 3 docs        -> avgdl_summary = 7/3 = 2.3333
+--   body:    [4,4,0] = 8 over 2 docs        -> avgdl_body    = 8/2 = 4.0000
+-- doc 3's EMPTY body is NOT in body's N_field: N_body = 2 while ndocs = 3. Pinning the
+-- exact avgdl float (not an inequality) with N_body != ndocs proves the header carries a
+-- REAL per-field ndocs_by_field[], not the corpus ndocs. A field-agnostic N (dividing
+-- Σlen_body by 3) would give 2.6667, so this fails on the naive implementation.
+SELECT field_id, ndocs_field, total_len_field,
+       round((total_len_field::numeric / ndocs_field), 4) AS avgdl_field
+FROM bm25_debug_field_stats('docs_bm25')
+ORDER BY field_id;
+
+RESET enable_seqscan;
+DROP TABLE docs;
+
+-- ===== (6) no key_field -> ctid fallback (back-compat, spec §3.7 / contract §F) =====
+-- An index built WITHOUT key_field leaves keymap_root Invalid; the scan keys on ctid
+-- and results return by ctid exactly as v4-M3. We can't pin a physical ctid, so we
+-- assert the ranked scan still returns the RIGHT rows in the RIGHT order (the 5:1 boost
+-- still ranks the title hit first), proving the fallback path produces correct results.
+CREATE TABLE nokey (id int PRIMARY KEY, title text, body text)
+    WITH (autovacuum_enabled = off);
+INSERT INTO nokey VALUES
+    (1, 'running shoes', 'padded filler alpha bravo'),
+    (2, 'athletic gear', 'padded running alpha bravo');
+CREATE INDEX nokey_bm25 ON nokey USING bm25_native (title, body)   -- no key_field, no INCLUDE
+    WITH (boost_title = '5.0', boost_body = '1.0');
+SET enable_seqscan = off;
+-- doc 1 (running in boosted title) ranks ahead of doc 2 (running in un-boosted body);
+-- the ctid-fallback scan still returns both rows in the correct boosted order.
+SELECT id FROM nokey WHERE title @@@ 'running'
+ORDER BY title &@@ 'running', id;
+RESET enable_seqscan;
+DROP TABLE nokey;
+
+DROP EXTENSION bm25_native;

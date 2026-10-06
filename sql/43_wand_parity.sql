@@ -1,0 +1,527 @@
+-- 43_wand_parity: M2b Task 4 -- the WAND block-max upper bound must be a true
+-- upper bound on any real per-doc contribution the exact scorer would compute
+-- for the same term, using the SAME live idf/avgdl/k1/b/boost. The whole WAND
+-- milestone depends on this: a bound that ever undercuts a real contribution
+-- would let the later block-max driver silently drop a top-N doc.
+--
+-- Corpus deliberately makes max_tf and min_doclen come from DIFFERENT docs,
+-- so the block's (max_tf, min_doclen) combination is not any single real
+-- doc's (tf, doclen) pair -- proving the bound is a genuine, non-trivial
+-- bound (strictly above every real contribution here), not merely safe by
+-- coincidence or +inf:
+--   doc 1 (long, high tf): 'zulu zulu zulu bravo charlie delta echo foxtrot
+--     golf hotel india juliet' -> {zulu,zulu,zulu,bravo,charli,delta,echo,
+--     foxtrot,golf,hotel,india,juliet}: doclen=12, tf(zulu)=3
+--   doc 2 (short, low tf):  'zulu mike november' -> {zulu,mike,novemb}:
+--     doclen=3, tf(zulu)=1
+-- (verified against bm25_debug_tokenize before writing these numbers down)
+-- Both docs fit in ONE 128-posting block, one field (the sole default
+-- field): max_tf = max(3,1) = 3 (from doc 1), min_doclen = min(12,3) = 3
+-- (from doc 2) -- a combination neither doc actually has.
+CREATE EXTENSION bm25_native;
+CREATE TABLE wp (id int, body text);
+INSERT INTO wp VALUES
+  (1, 'zulu zulu zulu bravo charlie delta echo foxtrot golf hotel india juliet'),
+  (2, 'zulu mike november');
+CREATE INDEX wp_bm25 ON wp USING bm25_native (body);
+SELECT bm25_seal('wp_bm25');
+
+-- The bound must dominate the REAL max per-posting contribution in the block,
+-- computed from the identical live stats (bm25_debug_term_contrib walks the
+-- SAME block's actual postings with the SAME ctx bm25_debug_block_ub used).
+SELECT round(block_ub::numeric, 6) AS block_ub,
+       round(true_max::numeric, 6) AS true_max,
+       (block_ub >= true_max)      AS bound_is_safe,
+       (block_ub > true_max)       AS bound_is_nontrivial
+FROM (
+  SELECT bm25_debug_block_ub('wp_bm25', 'zulu') AS block_ub,
+         (SELECT max(contrib) FROM bm25_debug_term_contrib('wp_bm25', 'zulu')) AS true_max
+) s;
+
+DROP TABLE wp;
+
+-- M2b Task 5: the bounded top-k min-heap (BM25TopK) must drain in EXACTLY the
+-- exhaustive scan's order (score desc, tid asc; bm25_scan_rank.c:scored_desc) --
+-- Task 8's WAND driver has to be bit-identical to the exhaustive scan it
+-- replaces, and this heap is what it drains into. No index/corpus needed:
+-- these probe the heap's own comparator directly via bm25_debug_topk.
+
+-- top-2 of scores {5,5,3,9} with tids {10,4,7,2}: expect (9,tid2) then the tie
+-- (5,*) broken by ASCENDING tid => (5,tid4). A heap that kept tid10 instead
+-- (e.g. tie-broken the wrong direction, or by insertion order) would be wrong.
+SELECT rank, score, tid FROM bm25_debug_topk(2, ARRAY[5,5,3,9]::float8[], ARRAY[10,4,7,2]::int[])
+ORDER BY rank;   -- expect (1, 9, 2), (2, 5, 4)
+
+-- Eviction case: 6 candidates offered into a capacity-3 heap, forcing THREE
+-- evictions/rejections of increasingly demanding kinds:
+--   (1,tid100) -- lowest score, evicted outright once the heap fills
+--   (3,tid7)   -- also a plain low-score reject (never enters the top 3)
+--   (5,tid20)  -- SAME score as two survivors (5,tid5)/(5,tid12); this is the
+--                k-boundary tie: it must lose to both under ascending-tid and
+--                be the one evicted, not either of the other two.
+-- Full order (score desc, tid asc) over all 6 is
+--   (9,2) (5,5) (5,12) (5,20) (3,7) (1,100)
+-- so the top-3 kept must be exactly the first three.
+SELECT rank, score, tid FROM bm25_debug_topk(3,
+    ARRAY[1,9,5,5,5,3]::float8[], ARRAY[100,2,20,5,12,7]::int[])
+ORDER BY rank;   -- expect (1, 9, 2), (2, 5, 5), (3, 5, 12)
+
+-- M2b Task 6: the per-term per-segment pull cursor (BM25WandCursor) walked
+-- LINEARLY (next()/score_doc(), no block-skip yet -- that's Task 7) must
+-- reproduce the exact (docid, summed field-contribution) stream the
+-- exhaustive scorer produces for a term. bm25_debug_cursor_scan drives the
+-- cursor end to end; compare its per-doc scores to bm25_debug_rank restricted
+-- to a single-term query. Term 'x' appears in every one of the 200 docs
+-- (200 > BM25_POSTINGS_PER_BLOCK=128), so this exercises multi-block decode
+-- and the linear cross-block/page advance, not just a single block.
+CREATE TABLE cur (id int, body text);
+INSERT INTO cur SELECT g, (ARRAY['x','x y','y z x','x x q'])[1+(g%4)] FROM generate_series(1,200) g;
+CREATE INDEX cur_bm25 ON cur USING bm25_native (body);
+SELECT bm25_seal('cur_bm25');
+SELECT bool_and(cursor_score = exhaustive_score) AS scores_match
+FROM bm25_debug_cursor_scan('cur_bm25','x') c
+JOIN (SELECT tid, score AS exhaustive_score FROM bm25_debug_rank('cur_bm25','x')) e USING (tid);
+
+-- An INNER JOIN on tid alone would silently pass even if the cursor dropped or
+-- duplicated a doc (the mismatched rows would just vanish from the join, not
+-- fail the assertion above), so make the gate discriminating against that too:
+-- all three counts below must agree exactly (all 200 docs carry 'x').
+SELECT
+  (SELECT count(*) FROM bm25_debug_cursor_scan('cur_bm25','x'))            AS cursor_rows,
+  (SELECT count(*) FROM bm25_debug_rank('cur_bm25','x'))                   AS exhaustive_rows,
+  (SELECT count(*) FROM bm25_debug_cursor_scan('cur_bm25','x') c
+     JOIN (SELECT tid FROM bm25_debug_rank('cur_bm25','x')) e USING (tid)) AS joined_rows;
+-- expect (200, 200, 200)
+
+DROP TABLE cur;
+
+-- M2b Task 7: bm25_wand_cursor_next_geq must (a) land on the FIRST posting
+-- with docid >= target and (b) actually bypass blocks HEADER-ONLY (no
+-- posting decode) rather than disguise a linear walk as a skip.
+--
+-- Corpus: term 'x' in every one of 4000 docs -> ceil(4000/128) = 32 blocks.
+-- The brief's own suggestion (2000 postings, ~16 blocks) was checked first
+-- and found to fit entirely on ONE physical page (verified via
+-- bm25_debug_block_impacts: 16 rows, 1 distinct block_no) -- that would never
+-- exercise a real page-chain (nextblk) transition during a skip, only a
+-- same-page block-to-block one. 4000 postings' 32 blocks were verified
+-- (same probe) to split 28/4 across TWO physical pages, so a target on the
+-- second page forces next_geq to actually follow nextblk mid-skip.
+CREATE TABLE skp (id int, body text);
+INSERT INTO skp SELECT g, 'x' FROM generate_series(1,4000) g;
+CREATE INDEX skp_bm25 ON skp USING bm25_native (body);
+SELECT bm25_seal('skp_bm25');
+
+-- Confirms the corpus does what the comment above claims before trusting any
+-- skip result below: 32 blocks, split across more than one physical page.
+SELECT count(*) AS nblocks, (count(DISTINCT block_no) > 1) AS spans_gt_1_page
+FROM bm25_debug_block_impacts('skp_bm25','x');
+
+-- target <= the first docid (0): no-op -- lands at posting 0 without
+-- consulting a single other block.
+SELECT landed_ok, blocks_skipped = 0 AS zero_skips
+FROM bm25_debug_cursor_skip('skp_bm25', 'x', 0);
+
+-- Mid-corpus target: skips several blocks, lands mid-block, all within the
+-- first physical page (docid 500 is well inside block 4 of 28 on page 1).
+SELECT landed_ok, blocks_skipped > 0 AS did_skip
+FROM bm25_debug_cursor_skip('skp_bm25', 'x', 500);
+
+-- Target on the SECOND physical page: forces next_geq past every block on
+-- page 1 and onto page 2 via nextblk mid-skip -- the cross-page transition
+-- Task 6 could never exercise (it only walked linearly, one block at a time,
+-- never needing to reason about how many blocks lie ahead before deciding to
+-- jump). 27, not 28: page 1 holds blocks 0..27, but block 0 is the cursor's
+-- already-decoded RESIDENT block, which blocks_skipped deliberately excludes
+-- (it was never bypassed header-only). So 27 header-only bypasses, blocks
+-- 1..27, before the landing block 28 on page 2 gets decoded.
+SELECT landed_ok, blocks_skipped >= 27 AS crossed_a_page
+FROM bm25_debug_cursor_skip('skp_bm25', 'x', 3600);
+
+-- Target past ALL postings: cursor must end up exhausted (its docid
+-- comparison against the ground-truth linear cursor, both landing on
+-- BM25_DOCID_MAX, is what landed_ok verifies here) while STILL reporting the
+-- blocks it bypassed on the way to that conclusion.
+SELECT landed_ok, blocks_skipped > 0 AS still_counts_skips
+FROM bm25_debug_cursor_skip('skp_bm25', 'x', 999999);
+
+-- Equivalence sweep: for a broad set of targets spanning both pages (stride
+-- 47 is coprime with the 128-posting block size, so consecutive targets land
+-- at different offsets within their block rather than always the same one),
+-- next_geq's landing docid must equal a LINEAR next()-only walk's landing
+-- docid for every target -- bm25_debug_cursor_skip's landed_ok IS that
+-- per-target comparison (see bm25_scan.c), so bool_and over the sweep proves
+-- the skip path visits identical positions to the decode-all path across the
+-- whole corpus, not just the four hand-picked cases above.
+SELECT bool_and(landed_ok) AS all_targets_agree, count(*) AS targets_checked
+FROM (SELECT (bm25_debug_cursor_skip('skp_bm25', 'x', t)).*
+      FROM generate_series(0, 4200, 47) AS t) s;
+
+DROP TABLE skp;
+
+-- ==========================================================================
+-- M2b Task 8: the BMW DRIVER (bm25_debug_wand_rank) must return the SAME
+-- ranked (tid, score) rows as the exhaustive scorer (bm25_debug_rank),
+-- BIT-FOR-BIT -- same tids, in the same order, with the same score bits
+-- (D1/D8). This is the milestone's core exactness gate. Two non-obvious
+-- summation-order traps that the single-field/single-term cursor test above
+-- never exercised are covered by the multi-term and BM25F cases below:
+--   trap #1 -- a candidate's per-term contributions must be summed in ORIGINAL
+--     QUERY-TERM order (qi = 0..nq-1), not the docid-sorted cursor order the
+--     WAND pivot walks in;
+--   trap #2 -- postings fold into ONE running double a posting at a time, so a
+--     term matching in >1 field accumulates ((r+a)+b) exactly as the exhaustive
+--     acc[D] += contrib does, not r+(a+b) (which diverges in the last ULP).
+-- The join-by-rank below compares WAND's top-100 against exhaustive's top-100
+-- position for position; count_ok additionally asserts WAND returned exactly
+-- LEAST(100, #matches) rows, so a driver that silently DROPPED a top-N doc
+-- fails even if the rows it did return happen to line up.
+-- ==========================================================================
+
+-- (A) Single-field, MULTI-BLOCK corpus. 'alpha' hits ~750 of 3000 docs, far
+-- past the 128-posting block size, so the block-max pivot/skip actually
+-- engages on the high-selectivity term while the rarer combinations keep the
+-- heap threshold climbing. Doclens repeat (only 7 pad lengths), so there ARE
+-- score ties -- deliberately: the heap's tid tie-break must resolve them the
+-- same way scored_desc does, or the top-100 boundary diverges.
+CREATE TABLE par (id int, body text);
+INSERT INTO par SELECT g,
+  concat_ws(' ', (ARRAY['alpha','beta','gamma','delta'])[1+(g%4)],
+                 (ARRAY['x','y','z',''])[1+(g%4)],
+                 repeat('pad ', g%7))
+FROM generate_series(1,3000) g;
+CREATE INDEX par_bm25 ON par USING bm25_native (body);
+SELECT bm25_seal('par_bm25');
+
+-- 1-, 2-, 3-, 4-term queries spanning high ('alpha') and low ('gamma','delta','z')
+-- selectivity. ranks_identical AND count_ok must both be t for every q.
+SELECT q,
+       bool_and(w_tid = e_tid AND w_score = e_score) AS ranks_identical,
+       count(*) = LEAST(100, (SELECT count(*) FROM bm25_debug_rank('par_bm25', q))) AS count_ok
+FROM (VALUES ('alpha'),
+             ('alpha beta'),
+             ('alpha beta gamma'),
+             ('beta delta x'),
+             ('alpha beta gamma delta')) qs(q),
+LATERAL (
+  SELECT row_number() OVER () r, tid AS w_tid, score AS w_score
+  FROM bm25_debug_wand_rank('par_bm25', qs.q, 100)
+) w
+JOIN LATERAL (
+  SELECT row_number() OVER () r, tid AS e_tid, score AS e_score
+  FROM bm25_debug_rank('par_bm25', qs.q)
+) e USING (r)
+GROUP BY q ORDER BY q;
+
+DROP TABLE par;
+
+-- (B) BM25F MULTI-FIELD, non-default per-field boosts, MULTI-TERM. 'alpha' is in
+-- BOTH title (boost 3.0) and body (boost 1.0) of every doc, so scoring one
+-- candidate folds TWO field-postings for a single term into its running score
+-- (trap #2); with unequal boosts the two contributions differ, so a subtotal-
+-- then-add would diverge in the last ULP. The multi-term queries additionally
+-- exercise trap #1 (sum in query-term order, not docid-sorted cursor order).
+-- 800 docs on the all-doc term 'alpha' span multiple blocks per field.
+CREATE TABLE wf (id int, title text, body text);
+INSERT INTO wf SELECT g,
+  concat_ws(' ', 'alpha', (ARRAY['beta','gamma','delta','beta'])[1+(g%4)]),
+  concat_ws(' ', 'alpha', (ARRAY['beta','gamma','','delta'])[1+(g%4)],
+                 repeat('pad ', g%13), (ARRAY['','beta','beta',''])[1+(g%4)])
+FROM generate_series(1,800) g;
+CREATE INDEX wf_bm25 ON wf USING bm25_native (title, body)
+  WITH (boost_title = '3.0', boost_body = '1.0');
+SELECT bm25_seal('wf_bm25');
+
+SELECT q,
+       bool_and(w_tid = e_tid AND w_score = e_score) AS ranks_identical,
+       count(*) = LEAST(100, (SELECT count(*) FROM bm25_debug_rank('wf_bm25', q))) AS count_ok
+FROM (VALUES ('alpha'),
+             ('alpha beta'),
+             ('beta gamma'),
+             ('alpha beta gamma delta')) qs(q),
+LATERAL (
+  SELECT row_number() OVER () r, tid AS w_tid, score AS w_score
+  FROM bm25_debug_wand_rank('wf_bm25', qs.q, 100)
+) w
+JOIN LATERAL (
+  SELECT row_number() OVER () r, tid AS e_tid, score AS e_score
+  FROM bm25_debug_rank('wf_bm25', qs.q)
+) e USING (r)
+GROUP BY q ORDER BY q;
+
+DROP TABLE wf;
+
+-- (B2) FIELD-HETEROGENEOUS straddlers (issue #289). (B) above is field-homogeneous:
+-- every block holds both fields at similar tf, so a document split across two
+-- blocks is still dominated by either block's bound. Here three fields and a
+-- skewed mix: blocks of weak title-only matches, and one "strong" doc per 128
+-- postings with the term in title, body AND tags. A one-doc prefix shifts every
+-- strong doc so that, under the old cut-every-128-postings writer
+-- (bm25_native.debug_count_slicing), its title and body postings end one block and
+-- its tags posting opens the next: every block boundary is a straddle. Most strong
+-- docs carry a long, weak tags field; the "stars" (units 0-2, then every seventh)
+-- carry a short, strong one, and later strong docs have shorter bodies, so later
+-- stars rank higher. A star's own block holds only the previous strong doc's weak
+-- tags posting, so that block's bound misses most of the star's tags score; before
+-- the fix the deep check pruned the later stars once three were in the heap, and
+-- the rows below differed from the exhaustive ranking. 70 units span three pages,
+-- so some straddles also cross a page boundary, where the reader peeks the next
+-- block instead of reading it off the page it already holds. The fixture check
+-- proves the corpus really straddles.
+CREATE TABLE wh (id int, title text, body text, tags text);
+INSERT INTO wh SELECT g,
+  CASE WHEN strong THEN 'zz zz zz' ELSE 'zz aa bb cc dd' END,
+  CASE WHEN strong THEN 'zz zz zz yy' || repeat(' pp', 80 - u)
+       WHEN g % 5 = 0 THEN 'qq yy' ELSE 'qq' END,
+  CASE WHEN NOT strong THEN 'dd'
+       WHEN u IN (0, 1, 2) OR u % 7 = 3 THEN 'zz zz'
+       ELSE 'zz' || repeat(' tt', 20) END
+FROM (SELECT g, g > 1 AND (g - 2) % 126 = 125 AS strong, (g - 2) / 126 AS u
+        FROM generate_series(1, 1 + 70 * 126) g) s;
+SET bm25_native.debug_count_slicing = on;
+CREATE INDEX wh_bm25 ON wh USING bm25_native (title, body, tags);
+RESET bm25_native.debug_count_slicing;
+
+SELECT count(*) AS wh_straddles FROM (
+  SELECT first_docid, lag(last_docid) OVER (ORDER BY block_ord) AS prev_last
+    FROM bm25_debug_block_spans('wh_bm25', 'zz')) s
+ WHERE first_docid = prev_last;
+SELECT count(DISTINCT block_no) > 1 AS wh_spans_pages
+  FROM bm25_debug_block_impacts('wh_bm25', 'zz');
+
+SELECT q, k,
+       bool_and(w_tid = e_tid AND w_score = e_score) AS ranks_identical,
+       count(*) = LEAST(k, (SELECT count(*) FROM bm25_debug_rank('wh_bm25', q))) AS count_ok
+FROM (VALUES ('zz'), ('zz yy'), ('yy zz qq')) qs(q), (VALUES (3), (10), (100)) ks(k),
+LATERAL (
+  SELECT row_number() OVER () r, tid AS w_tid, score AS w_score
+  FROM bm25_debug_wand_rank('wh_bm25', qs.q, ks.k)
+) w
+JOIN LATERAL (
+  SELECT row_number() OVER () r, tid AS e_tid, score AS e_score
+  FROM bm25_debug_rank('wh_bm25', qs.q)
+) e USING (r)
+GROUP BY q, k ORDER BY q, k;
+
+DROP TABLE wh;
+
+-- (C) Critical-1 regression: the block-max shallow-skip must cap its skip target
+-- at the NEXT cursor's docid, Min(min_last+1, next_docid). min_last+1 alone only
+-- guarantees termination; without the cap a pivot cursor can jump PAST a docid a
+-- second term also matches, dropping a top-k doc (unsafe prune).
+--
+-- Corpus geometry that provokes it: 'alpha' (single field) carries BLOCK-MAX
+-- VARIANCE with the HIGH-max region EARLY (docids <= 2000, tf 12 in short docs)
+-- and the LOW-max region LATE (docids > 2000, tf 1 in long padded docs). The
+-- early high-tf blocks set alpha's global_ub AND fill the heap first, so theta is
+-- already high by the time the late low-max blocks are walked; and because
+-- global_ub(alpha) alone clears theta, the WAND pivot lands on alpha at its own
+-- docid (no alignment step) with only its LOW late-block max in the deep check ->
+-- shallow-skip. 'beta' co-occurs LATE (rare, high idf), so those late alpha+beta
+-- docs are genuine top-k yet sit inside alpha's low-max late blocks: an uncapped
+-- skip jumps alpha past the beta docid and the doc loses alpha's contribution.
+-- The exact-equality gate below catches that drop bit-for-bit; ~750 alpha docs
+-- (6 blocks) keep the corpus firmly in the pruning regime.
+CREATE TABLE bmv (id int, body text);
+INSERT INTO bmv SELECT g,
+  concat_ws(' ',
+    CASE WHEN g % 8 = 0
+         THEN repeat('alpha ', CASE WHEN g <= 2000 THEN 12 ELSE 1 END)
+         ELSE '' END,
+    CASE WHEN g % 400 = 0 AND g > 2000 THEN repeat('beta ', 8) ELSE '' END,
+    CASE WHEN g % 8 = 0 AND g > 2000 THEN repeat('pad ', 22) ELSE '' END,
+    'filler')
+FROM generate_series(1,6000) g;
+CREATE INDEX bmv_bm25 ON bmv USING bm25_native (body);
+SELECT bm25_seal('bmv_bm25');
+
+-- WAND top-k must equal the exhaustive top-k position-for-position and bit-for-bit
+-- at every k (a dropped/mis-scored doc breaks ranks_identical; count_ok guards a
+-- silently short result). Without the next-cursor cap these are f for small k.
+SELECT k,
+       bool_and(w_tid = e_tid AND w_score = e_score) AS ranks_identical,
+       count(*) = LEAST(k, (SELECT count(*) FROM bm25_debug_rank('bmv_bm25','alpha beta'))) AS count_ok
+FROM (VALUES (20),(50),(100),(150)) ks(k),
+LATERAL (
+  SELECT row_number() OVER () r, tid AS w_tid, score AS w_score
+  FROM bm25_debug_wand_rank('bmv_bm25', 'alpha beta', ks.k)
+) w
+JOIN LATERAL (
+  SELECT row_number() OVER () r, tid AS e_tid, score AS e_score
+  FROM bm25_debug_rank('bmv_bm25', 'alpha beta')
+) e USING (r)
+GROUP BY k ORDER BY k;
+
+DROP TABLE bmv;
+
+-- (D) Critical-2 regression: bm25_block_ub must sum its per-field terms in
+-- ASCENDING field_id order (the order score_doc/seg_posting_cb fold a doc's
+-- fields in), NOT the impact table's FIRST-OCCURRENCE order. For 3+ fields with
+-- heterogeneous per-block presence the impact order is a non-adjacent permutation
+-- of field_id; at a FULL-COINCIDENCE doc each per-field bound term equals the
+-- scorer's bit-for-bit, but IEEE-754 add is not associative, so a mismatched fold
+-- order can land the bound 1 ULP BELOW the true score -> an unsafe bound.
+--
+-- Corpus: 3 fields (c0,c1,c2), non-default boosts. Doc 1 carries 'zeta' in c1,c2
+-- only (LACKS field 0) with low tf in long text; doc 2 carries 'zeta' in ALL three
+-- fields with higher tf in short text, so doc 2 is max_tf AND min_doclen in every
+-- field (full coincidence) while first-occurrence puts field 0 LAST -> impact
+-- order [1,2,0]. The boosts/tf are tuned so the two fold orders genuinely diverge
+-- in the last ULP: with the buggy fold block_ub is 1 ULP below the score.
+CREATE TABLE cf (id int, c0 text, c1 text, c2 text);
+INSERT INTO cf VALUES
+  (1, 'pad pad pad pad pad pad pad', 'zeta pad pad pad pad pad', 'zeta pad pad pad pad pad pad pad'),
+  (2, repeat('zeta ', 3), repeat('zeta ', 3), repeat('zeta ', 3));
+INSERT INTO cf SELECT g, 'lorem ipsum ' || g, 'dolor sit ' || g, 'amet ' || g
+  FROM generate_series(3, 60) g;
+CREATE INDEX cf_bm25 ON cf USING bm25_native (c0, c1, c2)
+  WITH (boost_c0 = '1.1', boost_c1 = '2.7', boost_c2 = '3.9');
+SELECT bm25_seal('cf_bm25');
+
+-- Heterogeneity sanity: the block really does hold all 3 fields with field 0
+-- present (doc 2) but not first-occurring (doc 1 lacks it) -- i.e. the impact
+-- order is a non-adjacent permutation, the exact shape that makes fold ORDER
+-- matter. (Order-independent aggregates, so no reliance on SRF row order.)
+SELECT count(*) = 3 AS three_fields, bool_or(field_id = 0) AS field0_present
+FROM bm25_debug_block_impacts('cf_bm25', 'zeta');
+
+-- The bound at the full-coincidence doc must EQUAL the exhaustive score bit-for-
+-- bit (and therefore be safe). Under the buggy impact-order fold it is 1 ULP
+-- below -> both columns flip to f.
+SELECT bm25_debug_block_ub('cf_bm25', 'zeta')
+         =  (SELECT max(score) FROM bm25_debug_rank('cf_bm25', 'zeta')) AS bound_eq_score,
+       bm25_debug_block_ub('cf_bm25', 'zeta')
+         >= (SELECT max(score) FROM bm25_debug_rank('cf_bm25', 'zeta')) AS bound_is_safe;
+
+DROP TABLE cf;
+
+-- (E) BM25F end-to-end parity over HETEROGENEOUS field presence + multi-term
+-- (the requested Critical-2 driver shape): field 0 is absent from a third of the
+-- docs and the term/field mix varies, so blocks carry permuted impact orders;
+-- non-default boosts; 800 docs so the all-doc terms span multiple blocks per
+-- field and the driver actually prunes. WAND == exhaustive bit-for-bit.
+CREATE TABLE wh (id int, c0 text, c1 text, c2 text);
+INSERT INTO wh SELECT g,
+  CASE WHEN g % 3 = 0 THEN ''   -- field 0 absent for a third of docs (heterogeneous)
+       ELSE concat_ws(' ', 'alpha', (ARRAY['beta','gamma',''])[1+(g%3)]) END,
+  concat_ws(' ', 'alpha', (ARRAY['beta','','delta'])[1+(g%3)], repeat('pad ', g%11)),
+  concat_ws(' ', 'gamma', (ARRAY['','beta','delta'])[1+(g%3)])
+FROM generate_series(1,800) g;
+CREATE INDEX wh_bm25 ON wh USING bm25_native (c0, c1, c2)
+  WITH (boost_c0 = '1.1', boost_c1 = '2.7', boost_c2 = '3.9');
+SELECT bm25_seal('wh_bm25');
+
+SELECT q,
+       bool_and(w_tid = e_tid AND w_score = e_score) AS ranks_identical,
+       count(*) = LEAST(100, (SELECT count(*) FROM bm25_debug_rank('wh_bm25', q))) AS count_ok
+FROM (VALUES ('alpha'),
+             ('alpha beta'),
+             ('beta gamma delta')) qs(q),
+LATERAL (
+  SELECT row_number() OVER () r, tid AS w_tid, score AS w_score
+  FROM bm25_debug_wand_rank('wh_bm25', qs.q, 100)
+) w
+JOIN LATERAL (
+  SELECT row_number() OVER () r, tid AS e_tid, score AS e_score
+  FROM bm25_debug_rank('wh_bm25', qs.q)
+) e USING (r)
+GROUP BY q ORDER BY q;
+
+DROP TABLE wh;
+
+-- M2b Task 10: gettuple over-pull tail fallback. With wand_top_k forced small
+-- (5), a ranked scan that pulls PAST k (via LIMIT, or via count(*) over an
+-- ordered LIMIT-bearing subquery -- the executor still drains every row of
+-- the subquery) must still return the FULL exact order: the scan lazily
+-- reruns the exhaustive scorer for the tail once rcur reaches the
+-- WAND-capped nranked, resuming from rcur (the first k rows, already
+-- returned, are provably identical -- D1/D8/§7). Capture the LIMIT-20 id
+-- sequence under wand_top_k=5 (the aggregate directly wraps a Limit node
+-- with nothing in between to reorder it, exactly the array_agg(subquery)
+-- idiom sql/19_merge.sql already relies on) and assert it is byte-identical
+-- to the same query under wand_top_k=0 (pure exhaustive, tail-rebuild never
+-- engaged -- the degenerate D9 case).
+SET enable_seqscan = off;
+CREATE TABLE tail (id int, body text);
+INSERT INTO tail SELECT g, 'alpha '||repeat('pad ', g%9) FROM generate_series(1,500) g;
+CREATE INDEX tail_bm25 ON tail USING bm25_native (body);
+SELECT bm25_seal('tail_bm25');
+
+SET bm25_native.wand_top_k = 5;
+SELECT array_agg(id) AS ids
+FROM (SELECT id FROM tail WHERE body @@@ 'alpha'
+        ORDER BY body &@@ 'alpha' LIMIT 20) s \gset wand_
+
+SET bm25_native.wand_top_k = 0;
+SELECT count(*) AS n,
+       (array_agg(id) = :'wand_ids'::int[]) AS tail_fallback_matches_exhaustive
+FROM (SELECT id FROM tail WHERE body @@@ 'alpha'
+        ORDER BY body &@@ 'alpha' LIMIT 20) s;   -- expect n=20, match=t
+
+-- Same proof with no LIMIT at all: a plain count(*) over the ordered scan
+-- forces the executor to drain every ranked row, well past wand_top_k=5.
+SET bm25_native.wand_top_k = 5;
+SELECT count(*) AS n FROM (
+  SELECT id FROM tail WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha'
+) w \gset wandall_
+
+SET bm25_native.wand_top_k = 0;
+SELECT count(*) AS n FROM (
+  SELECT id FROM tail WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha'
+) e \gset exhall_
+
+SELECT :wandall_n AS wand_full_count, :exhall_n AS exhaustive_full_count,
+       (:wandall_n = :exhall_n) AS tail_fallback_full_count_matches;
+
+RESET bm25_native.wand_top_k;
+RESET enable_seqscan;
+DROP TABLE tail;
+
+-- #67.4: the two reference SRFs must be UNCAPPED, and must stay uncapped by
+-- construction rather than by luck.
+--
+-- Everything above diffs bm25_debug_wand_rank against bm25_debug_rank and calls
+-- agreement proof of the WAND path. That inference is only valid while
+-- bm25_debug_rank is exhaustive. It reaches the exhaustive scorer because it now
+-- passes force_exhaustive=true; before this suite section it passed false and
+-- avoided the WAND branch only because MemSet left so->scoring false and the D7
+-- gate happens to test it. Under that arrangement, anything that set so->scoring
+-- in the SRF would turn every parity assertion above into WAND-vs-WAND: still
+-- green, proving nothing. This section fails if that ever happens.
+--
+-- The CANARY comes first and is the load-bearing half. "bm25_debug_rank returned
+-- more than wand_top_k rows" is ALSO satisfied by a wand_top_k that caps nothing
+-- on this corpus, so the cap must be shown observable at this k before the
+-- uncapped claim means anything -- exactly the trap sql/85's HIJACKED twins
+-- exist to close.
+CREATE TABLE unc (id int PRIMARY KEY, body text);
+INSERT INTO unc
+SELECT g, 'alpha bravo doc' || g FROM generate_series(1, 12) g;
+-- key_field is an INCLUDE column (its int type needs no bm25_native opclass),
+-- so bm25_debug_rank_key has a key to project and is exercised too.
+CREATE INDEX unc_bm25 ON unc USING bm25_native (body) INCLUDE (id)
+  WITH (key_field = 'id');
+SELECT bm25_seal('unc_bm25');
+
+SET bm25_native.wand_top_k = 5;
+
+-- CANARY: at k=5 over 12 matching docs the WAND driver really does cap, so a
+-- capped reference WOULD be visible below. If this ever returns 12, the rest of
+-- this section is vacuous and the assertions must not be trusted.
+SELECT count(*) AS wand_capped_rows,
+       count(*) = 5 AS canary_cap_is_observable
+FROM bm25_debug_wand_rank('unc_bm25', 'alpha', 5);
+
+-- The two references escape the cap that the canary just proved is real.
+SELECT count(*) AS exhaustive_rows,
+       count(*) = 12 AS rank_is_uncapped
+FROM bm25_debug_rank('unc_bm25', 'alpha');
+
+SELECT count(*) AS exhaustive_key_rows,
+       count(*) = 12 AS rank_key_is_uncapped
+FROM bm25_debug_rank_key('unc_bm25', 'alpha');
+
+RESET bm25_native.wand_top_k;
+DROP TABLE unc;
+
+DROP EXTENSION bm25_native;

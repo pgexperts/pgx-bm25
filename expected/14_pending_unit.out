@@ -1,0 +1,42 @@
+CREATE EXTENSION bm25_native;
+CREATE TABLE docs (id int primary key, body text);
+CREATE INDEX docs_bm25 ON docs USING bm25_native (body);
+-- append three docs to the pending list directly, then seal.
+SELECT bm25_debug_pending_append('docs_bm25', 'the quick brown fox');
+ bm25_debug_pending_append 
+---------------------------
+ 
+(1 row)
+
+SELECT bm25_debug_pending_append('docs_bm25', 'the lazy brown dog');
+ bm25_debug_pending_append 
+---------------------------
+ 
+(1 row)
+
+SELECT bm25_debug_pending_append('docs_bm25', 'quick quick fox');
+ bm25_debug_pending_append 
+---------------------------
+ 
+(1 row)
+
+SELECT nsegs, pending_ndocs FROM bm25_stats('docs_bm25');
+ nsegs | pending_ndocs 
+-------+---------------
+     0 |             3
+(1 row)
+
+SELECT bm25_seal('docs_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT nsegs, ndocs, pending_ndocs FROM bm25_stats('docs_bm25');
+ nsegs | ndocs | pending_ndocs 
+-------+-------+---------------
+     1 |     3 |             0
+(1 row)
+
+DROP TABLE docs;
+DROP EXTENSION bm25_native;

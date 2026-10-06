@@ -1,0 +1,284 @@
+-- 95_segment_pointer_bounds: the #143 trust-boundary sweep.
+--
+-- Every check here guards a value that is read off an index page and then used as a
+-- ReadBuffer argument, a page-relative offset, or an arithmetic operand. The values
+-- live inside segment headers, DICT entries, posting-block headers and SEGCAT
+-- entries -- none of which any debug lever can write -- so, following the convention
+-- established by 69_decode_boundary / 78_trust_boundary_bounds / 79_page_content_bounds,
+-- the validators are extracted and driven directly as pure functions.
+--
+-- WHAT THIS SUITE DOES AND DOES NOT PROVE. A pure-function assertion shows a validator
+-- REJECTS the right values; it cannot show the validator is CALLED. Only one of the
+-- guards below has a corruption lever able to reach it through a real read path
+-- (bm25_segheader_span_validate, via bm25_debug_stamp_seg_field_count -- see the
+-- wiring section at the bottom). For the block-pointer, page-offset and last_docid
+-- guards there is no lever that can write a corrupt root, offset or block header, so
+-- their call-site wiring is NOT asserted here and deleting a call would leave this
+-- suite green. That is a real gap, stated rather than papered over; closing it needs
+-- corruption levers those structures do not have.
+CREATE EXTENSION bm25_native;
+
+-- ------------------------------------------------------------ block pointers
+-- InvalidBlockNumber is the value that matters. P_NEW IS InvalidBlockNumber, so an
+-- unchecked corrupt segment root or chain link does not fail the read -- it EXTENDS
+-- the relation, from a read-only scan, and hands back a freshly zeroed page. That
+-- page then fails the gen half of the page-kind check, which raises a RETRYABLE
+-- error that bm25_scan_build_ranking catches up to three times: one corrupt value,
+-- three silent relation extensions, then a misleading error.
+\set VERBOSITY terse
+SELECT bm25_debug_seg_blkno_validate(4294967295);   -- InvalidBlockNumber / P_NEW
+SELECT bm25_debug_seg_blkno_validate(0);            -- the metapage is never a segment page
+\set VERBOSITY default
+
+-- Ordinary block numbers pass through unchanged. Block 1 is the lowest a segment
+-- page can occupy (block 0 is the metapage) and 4294967294 is one below Invalid,
+-- i.e. the largest value that is still a real block number.
+SELECT bm25_debug_seg_blkno_validate(1) AS lowest_ok;
+SELECT bm25_debug_seg_blkno_validate(4294967294) AS highest_ok;
+
+-- Deliberately NOT tested here: a block number past the end of the relation. THIS
+-- validator does not check that, for redundancy and cost rather than correctness --
+-- ReadBuffer already raises a loud short-read error past EOF, and
+-- RelationGetNumberOfBlocks lseeks on every call in a normal backend, which would put
+-- a syscall in the innermost loop of every ranked scan. See bm25_seg_blkno_validate's
+-- header comment and docs/adr/0071.
+--
+-- The chain WALKERS are a different question and are tested, at the bottom of this
+-- suite: they pay for nblocks once per walk rather than once per pointer, so the cost
+-- objection does not reach them, and what they get for it is an error that names the
+-- chain instead of a short read that names a file.
+
+-- ------------------------------------------------------------ page offsets
+-- post_off / pos_post_off are uint16s taken from a DICT entry and added straight to
+-- a page pointer. bm25_dictentry_validate bounds the entry header and the term span
+-- but never these, so an unbounded value forms a pointer up to 65535 bytes into an
+-- 8 KB object -- undefined on formation, before any dereference.
+\set VERBOSITY terse
+SELECT bm25_debug_seg_page_off_validate(65535, 8000);   -- far past the content
+SELECT bm25_debug_seg_page_off_validate(8001, 8000);    -- one byte past
+\set VERBOSITY default
+
+-- Exactly at the content end is accepted: that is a legal one-past-the-end pointer,
+-- and the callers' own "does a block header still fit" guards handle the empty tail.
+-- A real df > 0 offset is always <= pagebytes - sizeof(BM25BlockHeader), so `>=` would
+-- not have false-positived either; `>` is chosen because it is the weakest test that
+-- still prevents forming an out-of-range pointer, which is the actual defect.
+SELECT bm25_debug_seg_page_off_validate(8000, 8000) AS at_end_ok;
+SELECT bm25_debug_seg_page_off_validate(0, 8000) AS at_start_ok;
+
+-- ------------------------------------------------------------ block last_docid
+-- The one BM25BlockHeader field no reader validated. next_geq picks a landing block
+-- because the peeked last_docid >= target, then scans while docids[pos] < target: if
+-- last_docid OVERSTATES the run, pos walks off docids[], which at a full block
+-- aliases tfs[0] and at a short one yields a stale docid from the previously decoded
+-- block. If it UNDERSTATES, the block-max deep check's skip_target stops exceeding
+-- the pivot, nothing advances, and the driver loop spins.
+\set VERBOSITY terse
+SELECT bm25_debug_block_last_docid_validate(100, 42);   -- header overstates the run
+SELECT bm25_debug_block_last_docid_validate(10, 42);    -- header understates the run
+\set VERBOSITY default
+SELECT bm25_debug_block_last_docid_validate(42, 42) AS agrees;
+
+-- ------------------------------------------------------------ tombstone fraction
+-- ndocs - live_ndocs is unsigned subtraction on two unvalidated SEGCAT fields. With
+-- live_ndocs > ndocs the difference wraps to near 2^64, the fraction lands far above
+-- the threshold, and the segment is selected for rewrite on every check -- a
+-- self-sustaining merge loop driven by a catalog entry that is already wrong.
+SELECT bm25_debug_merge_tombstone_trigger(100, 200) AS underflow_now_false;
+SELECT bm25_debug_merge_tombstone_trigger(0, 0)     AS empty_false;
+SELECT bm25_debug_merge_tombstone_trigger(100, 100) AS none_dead_false;
+-- The threshold itself still works: 100 docs with 10 live is 90% dead.
+SELECT bm25_debug_merge_tombstone_trigger(100, 10)  AS mostly_dead_true;
+-- Boundary: live_ndocs == ndocs is "nothing dead", not "everything dead".
+SELECT bm25_debug_merge_tombstone_trigger(1, 1)     AS single_live_false;
+
+-- ------------------------------------------------------------ keymap tag, write side
+-- The pending drain copies an on-page key_type into the KEYMAP header of the segment
+-- it is sealing. bm25_accum_set_keymeta checks key_size only, so an unrecognized tag
+-- was written through to disk and rejected later, by a reader, as corruption nobody
+-- wrote deliberately. bm25_seg_keymeta_validate is now called on that write path;
+-- these drive the identical function the drain now runs through.
+\set VERBOSITY terse
+SELECT bm25_debug_keymeta_validate(99, 4);   -- unknown tag
+SELECT bm25_debug_keymeta_validate(1, 7);    -- known tag, wrong width for it
+\set VERBOSITY default
+
+-- ------------------------------------------------------------ real index still works
+-- The guards above sit on the ordinary read path, so the point of this section is
+-- that adding them changed nothing for a well-formed index: build, seal, merge and a
+-- ranked query all still work, and the ranked answer is unchanged.
+CREATE TABLE ptr_docs (id int primary key, body text);
+INSERT INTO ptr_docs SELECT g, 'alpha beta gamma doc' || g FROM generate_series(1, 40) g;
+CREATE INDEX ptr_bm ON ptr_docs USING bm25_native (body);
+
+-- Pending path as well as the sealed one: these rows go through the drain, which is
+-- where the keymap tag check now runs.
+INSERT INTO ptr_docs SELECT g, 'alpha delta doc' || g FROM generate_series(41, 60) g;
+SELECT bm25_seal('ptr_bm');
+SELECT bm25_merge('ptr_bm');
+
+SET enable_seqscan = off;
+SELECT count(*) AS alpha_hits FROM ptr_docs WHERE body @@@ 'alpha';
+SELECT id FROM ptr_docs WHERE body @@@ 'delta' ORDER BY body &@@ 'delta' LIMIT 3;
+SELECT ndocs FROM bm25_debug_global_stats('ptr_bm');
+RESET enable_seqscan;
+
+DROP TABLE ptr_docs;
+
+-- ------------------------------------------------------------ call-site wiring
+-- The one guard whose wiring IS assertable. bm25_debug_stamp_seg_field_count writes a
+-- chosen field_count onto a real segment header page, so the value reaches
+-- bm25_segheader_read_lenfields through the ordinary read path rather than a probe.
+--
+-- 32 is chosen deliberately: it is BM25_MAX_FIELDS, so it PASSES bm25_segheader_validate
+-- and the read proceeds to the arrays. A single-field segment's page carries the struct
+-- plus one 8-byte array; field_count 32 makes the reader demand the struct plus two
+-- 32-entry arrays (64 + 512 bytes), which the page does not have. Before this change
+-- that read returned page slack as per-field sumdoclen and N_field -- the numbers that
+-- feed avgdl, and therefore every score. It now errors.
+--
+-- If someone deletes the bm25_segheader_span_validate call from
+-- bm25_segheader_read_lenfields, this assertion goes green-to-garbage and the suite
+-- fails. That is the property the pure-function assertions above cannot provide.
+CREATE TABLE wire_docs (id int primary key, body text);
+INSERT INTO wire_docs SELECT g, 'alpha beta doc' || g FROM generate_series(1, 20) g;
+CREATE INDEX wire_bm ON wire_docs USING bm25_native (body);
+SELECT field_id, total_len > 0 AS len_positive FROM bm25_debug_seg_lenfields('wire_bm', 0);
+
+SELECT bm25_debug_stamp_seg_field_count('wire_bm', 0, 32);
+\set VERBOSITY terse
+SELECT field_id, total_len FROM bm25_debug_seg_lenfields('wire_bm', 0);
+\set VERBOSITY default
+
+-- The lever leaves that segment permanently unreadable by construction.
+DROP TABLE wire_docs;
+
+-- ------------------------------------- chain-walk extent bounds (SEGREAD-11, #154)
+-- The second guard whose wiring IS assertable, and the one this suite's header said
+-- could not be: "for the block-pointer ... guards there is no lever that can write a
+-- corrupt root". bm25_debug_seg_chain_extent is that lever, without writing anything.
+-- It reads a real segment header into a private copy, substitutes the caller's chain
+-- root, and hands the copy to a walker -- so an out-of-extent pointer takes exactly
+-- the path a corrupt on-page root would, through real ReadBuffers on a real index.
+--
+-- WHAT CHANGED. All four walkers below reached ReadBuffer with an unbounded chain
+-- pointer. Out-of-extent was already loud, but as the buffer manager's
+-- "could not read block N in file ..." (ERRCODE_DATA_CORRUPTED): correct, and useless
+-- for triage, because it names a file and a block and nothing about which bm25
+-- structure aimed there. It now raises ERRCODE_INDEX_CORRUPTED naming the chain,
+-- which is what the SEGCAT walkers, the POS cursor, the LIVEDOCS locator and the
+-- wildcard DICT walk already did. The value of the bound is the attribution; the
+-- reason it belongs in every walker is consistency, so a corrupt link does not report
+-- itself differently depending on which reader happened to follow it.
+--
+-- FOUR walkers, not three, and the fourth is the point of the list: the bound landed
+-- at four call sites drawing nblocks from three different places, and `chain` and
+-- `chain_cursor` are the two arms of the same `if` inside chain_read_at. Driving only
+-- the cursor-less arm would leave a regression in the cursor arm green.
+CREATE TABLE chain_docs (id int primary key, body text);
+INSERT INTO chain_docs SELECT g, 'alpha beta term' || g || ' gamma'
+  FROM generate_series(1, 400) g;
+CREATE INDEX chain_bm ON chain_docs USING bm25_native (body);
+SELECT bm25_seal('chain_bm');
+
+-- Negative control FIRST, so a bound that rejected everything could not masquerade as
+-- a pass below. root = -1 means "walk the segment's own root": every one of these
+-- crosses real pages (dict_iter drains the whole DICT chain, so mid-chain links are
+-- covered too) and must complete untouched.
+SELECT bm25_debug_seg_chain_extent('chain_bm', 0, 'dict_lookup',  -1) AS healthy_dict_lookup;
+SELECT bm25_debug_seg_chain_extent('chain_bm', 0, 'dict_iter',    -1) AS healthy_dict_iter;
+SELECT bm25_debug_seg_chain_extent('chain_bm', 0, 'chain',        -1) AS healthy_chain;
+SELECT bm25_debug_seg_chain_extent('chain_bm', 0, 'chain_cursor', -1) AS healthy_chain_cursor;
+
+-- SQLSTATE is pinned alongside the message, because "some corruption error" is exactly
+-- what the pre-fix behaviour also produced -- the whole change is WHICH error. The
+-- block numbers are stripped: they depend on BLCKSZ and on how many pages this
+-- machine's build happened to write.
+CREATE FUNCTION chain_extent_probe(walker text, root bigint) RETURNS text AS $$
+BEGIN
+    PERFORM bm25_debug_seg_chain_extent('chain_bm', 0, walker, root);
+    RETURN 'NO ERROR RAISED';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' ' || regexp_replace(SQLERRM, 'block [0-9]+', 'block N');
+END; $$ LANGUAGE plpgsql;
+
+-- 4294967294 is one below InvalidBlockNumber: the largest value that is still a real
+-- block number, so bm25_seg_blkno_validate's two clauses cannot fire instead and what
+-- answers is unambiguously the extent bound.
+SELECT chain_extent_probe('dict_lookup',  4294967294) AS dict_lookup_past_extent;
+SELECT chain_extent_probe('dict_iter',    4294967294) AS dict_iter_past_extent;
+SELECT chain_extent_probe('chain',        4294967294) AS chain_past_extent;
+SELECT chain_extent_probe('chain_cursor', 4294967294) AS chain_cursor_past_extent;
+
+-- One past the last real page: the smallest rejected value, which proves the bound is
+-- `>=` against the live extent and not a comparison against some constant. npages is
+-- read from the index itself so this does not hard-code a layout.
+SELECT chain_extent_probe('chain', bm25_debug_npages('chain_bm')) AS chain_one_past_end;
+SELECT chain_extent_probe('dict_iter', bm25_debug_npages('chain_bm')) AS dict_iter_one_past_end;
+
+-- ----------------------------------- POST-chain walk bounds (SEGREAD-11, #154)
+-- bm25_seg_scan_postings is the FIFTH walker, and it is the one the four above could
+-- not stand in for. It was bounded only by `emitted < df` -- a posting counter, which
+-- constrains nothing about where the chain points -- and ADR 0071's per-pointer gate
+-- sits in wand_cursor_load_block, so it protected WAND's POST walk and not this one,
+-- which is the walk the exhaustive ranked path, @@@, the phrase pass and the merge all
+-- use.
+--
+-- WHY THIS PROBE COUNTS INSTEAD OF RETURNING A BOOL. The other four walkers' defect was
+-- the WRONG error; this one's was NO error. With post_root == InvalidBlockNumber the
+-- while-loop's own guard ends the walk before its first iteration, so a term the
+-- dictionary says occurs in df documents matched none of them, silently, on every one
+-- of those paths -- and a probe asserting only "did not raise" would have passed the
+-- broken build. Counting the postings makes the silence itself the assertion.
+--
+-- The negative control is stronger here for the same reason: it is not "> 0" but
+-- "== the df the dictionary records for that same term", read back through
+-- bm25_debug_segterms, so a walk that emitted SOME postings and then lost the rest
+-- would fail it too. Both sides name the segment's FIRST dict entry: the probe takes it
+-- through the real iterator, and segterms emits in stored order.
+SELECT bm25_debug_seg_postings_count('chain_bm', 0, -1)
+         = (SELECT df FROM bm25_debug_segterms('chain_bm') LIMIT 1)
+       AS healthy_postings_count_equals_df;
+
+CREATE FUNCTION postings_probe(root bigint) RETURNS text AS $$
+DECLARE
+    n bigint;
+BEGIN
+    n := bm25_debug_seg_postings_count('chain_bm', 0, root);
+    RETURN 'NO ERROR RAISED, emitted ' || n;
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' ' || regexp_replace(SQLERRM, 'block [0-9]+', 'block N');
+END; $$ LANGUAGE plpgsql;
+
+-- The silent hole. 4294967295 IS InvalidBlockNumber -- the builder's legitimate "this
+-- term wrote no blocks" sentinel, which pairs with df == 0; on a df > 0 entry it is
+-- corruption. Pre-fix this returned 'NO ERROR RAISED, emitted 0'.
+SELECT postings_probe(4294967295) AS postings_invalid_root;
+
+-- Past the extent: 4294967294 is one below InvalidBlockNumber, so the entry guard
+-- cannot answer instead of the chain bound, and bm25_debug_npages() is one past the
+-- last real page -- the smallest rejected value, proving the bound is `>=` against the
+-- live extent. Pre-fix both reached ReadBuffer and surfaced the buffer manager's own
+-- short-read error, which names a file and a block and no bm25 structure.
+SELECT postings_probe(4294967294) AS postings_past_extent;
+SELECT postings_probe(bm25_debug_npages('chain_bm')) AS postings_one_past_end;
+
+-- The probe validates its own arguments (97_debug_probe_arguments' rule).
+\set VERBOSITY terse
+SELECT bm25_debug_seg_chain_extent('chain_bm', 0, 'no_such_walker', -1);
+SELECT bm25_debug_seg_chain_extent('chain_bm', 0, 'chain', -2);
+SELECT bm25_debug_seg_chain_extent('chain_bm', 0, 'chain', 4294967296);
+SELECT bm25_debug_seg_chain_extent('chain_bm', 9, 'chain', -1);
+SELECT bm25_debug_seg_postings_count('chain_bm', 0, -2);
+SELECT bm25_debug_seg_postings_count('chain_bm', 9, -1);
+\set VERBOSITY default
+
+-- The index is untouched by all of that -- nothing above wrote a page.
+SET enable_seqscan = off;
+SELECT count(*) AS alpha_still_matches FROM chain_docs WHERE body @@@ 'alpha';
+RESET enable_seqscan;
+DROP FUNCTION chain_extent_probe(text, bigint);
+DROP FUNCTION postings_probe(bigint);
+DROP TABLE chain_docs;
+
+DROP EXTENSION bm25_native;

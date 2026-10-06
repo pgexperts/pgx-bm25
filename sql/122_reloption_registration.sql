@@ -1,0 +1,51 @@
+-- 122_reloption_registration: verify that a failed reloption registration
+-- does not poison the backend for later registration attempts.
+--
+-- The bm25_options function registers reloptions lazily, once per backend.
+-- If any add_* call raises (e.g., bm25_validate_language's pg_ts_dict
+-- lookup timing out), the static bm25_relopt_kind stayed non-zero with only
+-- partial options registered. This caused all stored options except 'analyzer'
+-- to be silently dropped, resulting in wrong analyzer and k1/b values on
+-- scans and inserts.
+--
+-- The fix is to register into a local relopt_kind variable and assign to
+-- the static only after all add_* calls succeed.
+
+CREATE EXTENSION bm25_native;
+CREATE TABLE g(id int, body text);
+INSERT INTO g VALUES (1, 'die Häuser der Kinder');
+CREATE INDEX g_i ON g USING bm25_native(body) WITH (language='german', k1=2.0, b=0.5);
+
+-- Trigger the poisoning: rename english_stem to make the first registration
+-- in the fresh backend fail.
+\c
+ALTER TEXT SEARCH DICTIONARY pg_catalog.english_stem RENAME TO english_stem_x;
+
+-- This should fail with an error about english_stem not found.
+\set VERBOSITY terse
+SELECT id FROM g WHERE body @@@ 'Häuser';
+\set VERBOSITY default
+
+-- Restore the dictionary name so later operations work.
+ALTER TEXT SEARCH DICTIONARY pg_catalog.english_stem_x RENAME TO english_stem;
+
+-- Now in the same session (still-poisoned backend if the bug exists),
+-- force the index path with enable_seqscan off. Without the fix, this would:
+-- - Return 0 rows (because the german index defaults to english)
+-- - Emit a mismatch WARNING (because require_analyzer_match=false makes it not error)
+-- With the fix, the second call should re-register successfully and work:
+-- - Return id=1 (correct result)
+-- - No WARNING (options parsed correctly this time)
+SET enable_seqscan = off;
+SELECT array_agg(id ORDER BY id) FROM g WHERE body @@@ 'Häuser';
+RESET enable_seqscan;
+
+-- Verify that INSERTs also work (should not produce a mismatch warning).
+INSERT INTO g VALUES (2, 'die Häuser der Kinder');
+
+-- Verify that CREATE INDEX with a stored option works (should not error
+-- on "unrecognized parameter" that would occur with partial registration).
+CREATE INDEX g_j ON g USING bm25_native(body) WITH (stopwords='none');
+
+DROP TABLE g;
+DROP EXTENSION bm25_native;

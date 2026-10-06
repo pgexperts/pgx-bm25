@@ -1,0 +1,118 @@
+CREATE EXTENSION bm25_native;
+CREATE TABLE od (id int, body text);
+-- doclen DECREASES as id increases -> BM25('cat') INCREASES with id
+-- => true score-desc rank = {5,4,3,2,1} (the REVERSE of id, so a collapse to id-order is visible).
+INSERT INTO od VALUES
+ (1,'cat a b c d e f g h'),(2,'cat a b c d e f'),(3,'cat a b c d'),(4,'cat a b'),(5,'cat');
+CREATE INDEX od_bm25 ON od USING bm25_native (body);
+SELECT bm25_seal('od_bm25');
+SET enable_seqscan=off;
+
+-- (1) HEADLINE: secondary-key ordering is now CORRECT (was collapsing to {1,2,3,4,5}).
+-- TEXT operator:
+SELECT array_agg(id) FROM (SELECT id FROM od WHERE body @@@ 'cat' ORDER BY body &@@ 'cat', id) s;
+-- expect {5,4,3,2,1}
+-- JSONB operator (M6):
+SELECT array_agg(id) FROM (SELECT id FROM od WHERE body @@@ bm25_term('body','cat')
+  ORDER BY body &@@ bm25_term('body','cat'), id) s;   -- expect {5,4,3,2,1}
+
+-- (2) &@@ projects the REAL distance (= -score), finite & monotonic, matching -bm25_score(ctid).
+SELECT id, (body &@@ 'cat') = -bm25_score(ctid) AS dist_is_neg_score
+FROM od WHERE body @@@ 'cat' ORDER BY body &@@ 'cat';   -- expect all t, ids 5,4,3,2,1
+
+-- (3) single-key unchanged: true order {5,4,3,2,1}.
+SELECT array_agg(id) FROM (SELECT id FROM od WHERE body @@@ 'cat' ORDER BY body &@@ 'cat') s;  -- {5,4,3,2,1}
+
+-- (5) seqscan degradation unchanged: no active scored scan -> +inf, no error.
+SET enable_seqscan=on;
+SELECT DISTINCT (body &@@ 'cat') = 'Infinity'::float8 AS inf_off_index FROM od;   -- expect t
+RESET enable_seqscan;
+
+-- ==========================================================================
+-- Cross-scan-path stash verification (anti-silent-wrong gate).
+--
+-- The fix above rests on ONE invariant: bm25_distance is only ever evaluated
+-- while projecting the tuple bm25_gettuple most recently returned (a strict
+-- 1:1 gettuple -> project pairing per scan opaque). The headline cases above
+-- only exercise the plain single-segment, non-WAND, never-rescanned scan. A
+-- stash that is stale on some OTHER AM scan path would be a NEW silent
+-- mis-ordering, invisible to those cases. Each block below repeats the same
+-- assertion shape -- a DISTINCT-score fixture whose true score-desc order is
+-- NOT id order, checked via `ORDER BY ... &@@ ..., id` -- on a path the
+-- headline cases don't reach. (Every expected sequence here was hand-checked
+-- against bm25_score(ctid) before being written down; see task-2-report.md.)
+-- ==========================================================================
+
+-- (A) Multi-segment + pending (read-your-writes): 2 sealed segments plus an
+-- unsealed pending list, so gettuple is driven by the multi-source union, not
+-- a single segment. Every body is just 'cat' repeated, so tf == doclen and
+-- BM25 score is strictly increasing in tf; true score-desc order is
+-- {1,3,5,6,2,4} -- neither id order nor reverse-id order, so either a
+-- per-segment collapse or an id collapse would be visible.
+CREATE TABLE msp (id int, body text) WITH (autovacuum_enabled=off);
+INSERT INTO msp VALUES (1, repeat('cat ', 8)), (2, repeat('cat ', 2));  -- seg0
+CREATE INDEX msp_bm25 ON msp USING bm25_native (body);
+SELECT bm25_seal('msp_bm25');
+INSERT INTO msp VALUES (3, repeat('cat ', 5)), (4, 'cat');              -- seg1
+SELECT bm25_seal('msp_bm25');
+INSERT INTO msp VALUES (5, repeat('cat ', 4)), (6, repeat('cat ', 3));  -- pending (unsealed)
+SET enable_seqscan = off;
+SELECT array_agg(id) FROM (SELECT id FROM msp WHERE body @@@ 'cat'
+  ORDER BY body &@@ 'cat', id) s;   -- expect {1,3,5,6,2,4}
+DROP TABLE msp;
+
+-- (B)/(C) share one fixture: tf = g+1 for doc g, so true score-desc order is
+-- the exact reverse of id, {10,9,...,1}.
+CREATE TABLE wtk (id int, body text) WITH (autovacuum_enabled=off);
+INSERT INTO wtk SELECT g, 'cat ' || repeat('cat ', g) FROM generate_series(1,10) g;
+CREATE INDEX wtk_bm25 ON wtk USING bm25_native (body);
+SELECT bm25_seal('wtk_bm25');
+
+-- (B) Block-max WAND top-k: wand_top_k forced small (3) so the capped WAND
+-- build -- not the exhaustive scorer -- drives; LIMIT matches the cap exactly
+-- (no over-pull). The top-3 must be BY SCORE, not the first 3 ids.
+SET bm25_native.wand_top_k = 3;
+SELECT array_agg(id) FROM (SELECT id FROM wtk WHERE body @@@ 'cat'
+  ORDER BY body &@@ 'cat', id LIMIT 3) s;   -- expect {10,9,8}
+
+-- (C) Over-pull tail: same wand_top_k=3 cap, but pull PAST it -- once via a
+-- LIMIT above the cap, once with no LIMIT at all -- forcing bm25_gettuple's
+-- lazy exhaustive tail-rebuild to run. The full sequence must stay correct
+-- across the k-boundary, not just within the first wand_top_k rows.
+SELECT array_agg(id) FROM (SELECT id FROM wtk WHERE body @@@ 'cat'
+  ORDER BY body &@@ 'cat', id LIMIT 8) s;   -- expect {10,9,8,7,6,5,4,3}
+SELECT array_agg(id) FROM (SELECT id FROM wtk WHERE body @@@ 'cat'
+  ORDER BY body &@@ 'cat', id) s;   -- expect {10,9,8,7,6,5,4,3,2,1}
+RESET bm25_native.wand_top_k;
+DROP TABLE wtk;
+
+-- (D) Rescan (re-emit) path: a correlated subquery, one per outer "grp" row,
+-- forces the SAME Index Scan plan node to be rescanned (a SubPlan, not
+-- pulled up, because of the grp correlation) -- bm25_rescan resets the
+-- stash to +inf each time, so this checks the reset-then-restash sequence
+-- fires cleanly on every iteration, not just once at scan start. Each group's
+-- true top scorer is NOT its lowest id ({2,5,9}, not {1,4,6} nor {3,6,9}), so
+-- an id-order or cross-group-contaminated result is visible.
+--
+-- Note on mark/restore (mergejoin): bm25_handler.c sets ammarkpos/amrestrpos
+-- to NULL (amcanmarkpos false), so the planner can never place a bm25_native Index
+-- Scan as a mergejoin side needing its own mark/restore -- confirmed via
+-- EXPLAIN on a self-join with enable_hashjoin/enable_nestloop/enable_material
+-- all off, which still interposes an explicit Sort (mark/restore-capable in
+-- its own right) between the Merge Join and each Index Scan. That path is
+-- structurally unreachable, not merely untested; this correlated-subquery
+-- rescan is the real re-emit case per the task brief's own fallback.
+CREATE TABLE resc (id int, grp int, body text) WITH (autovacuum_enabled=off);
+INSERT INTO resc VALUES
+ (1,1,'cat'),(2,1,repeat('cat ',3)),(3,1,repeat('cat ',2)),
+ (4,2,repeat('cat ',2)),(5,2,repeat('cat ',5)),(6,2,'cat'),
+ (7,3,repeat('cat ',4)),(8,3,'cat'),(9,3,repeat('cat ',6));
+CREATE INDEX resc_bm25 ON resc USING bm25_native (body);
+SELECT bm25_seal('resc_bm25');
+SELECT g.grp, (SELECT r.id FROM resc r WHERE r.grp = g.grp AND r.body @@@ 'cat'
+  ORDER BY r.body &@@ 'cat', r.id LIMIT 1) AS top_id
+FROM (VALUES (1),(2),(3)) g(grp) ORDER BY g.grp;   -- expect (1,2),(2,5),(3,9)
+DROP TABLE resc;
+
+RESET enable_seqscan;
+DROP TABLE od; DROP EXTENSION bm25_native;

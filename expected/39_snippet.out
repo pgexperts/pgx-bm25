@@ -1,0 +1,196 @@
+-- 39_snippet.sql — bm25_snippet() query-term highlighter (M4 C-SNIPPET, D8/D10/D11).
+--
+-- bm25_snippet(field, start_tag='<mark>', end_tag='</mark>', max_num_chars=300) returns a
+-- highlighted excerpt of the PASSED field VALUE around the current scored scan's query
+-- terms. It RE-ANALYZES the passed text (D8 — the stored POS chain is NOT read) and maps
+-- query terms onto it via each token's original-text byte span (D10 src_off/src_len). The
+-- query terms + analyzer config come from the ACTIVE scored scan slot (D11), exactly like
+-- bm25_score(ctid) — so every highlighting query must run inside a bm25_native INDEX scan. We
+-- force that by pairing the @@@ boolean key with the &@@ order-by on the SAME literal (the
+-- M5/M4 idiom: a bare @@@ can fall to bm25_match, which sets no scan slot -> NULL snippet).
+--
+-- Discriminating assertions: (a) ORIGINAL casing preserved in the mark ('Delta' not
+-- 'delta'); (b) a scan-returned row whose snippet field lacks the term -> SQL NULL;
+-- (c) the excerpt's ORIGINAL-text length (tags + ellipses excluded) stays <= max_num_chars;
+-- (d) a UTF-8 field with multibyte context around the hit is never split mid-character
+-- (the D10 mb-guard — the key safety test); (e) max_num_chars <= 0 is a trust-boundary
+-- ERROR; (f) custom tags. Distinct stem-stable NATO tokens so hits/positions are
+-- hand-predictable and there are no score ties to perturb ordering across PG majors.
+CREATE EXTENSION bm25_native;
+SET enable_seqscan = off;
+-- ============================================================================
+-- Part 1 — a match highlights the term with ORIGINAL casing; a short field is
+-- returned whole (no ellipsis).
+-- ============================================================================
+CREATE TABLE sn (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO sn VALUES
+    (1, 'The Delta Report was filed about the delta wing'),  -- 'Delta' + 'delta' both hit
+    (2, 'alpha bravo charlie signal');                       -- no delta -> not a candidate
+CREATE INDEX sn_bm25 ON sn USING bm25_native (body) WITH (language = 'english');
+-- 'delta' stems to itself; BOTH occurrences are wrapped, each preserving its own casing
+-- ('Delta' and 'delta'). The field is < 300 chars so it is returned whole, no ellipsis.
+SELECT id, bm25_snippet(body) AS snip
+  FROM sn WHERE body @@@ 'delta' ORDER BY body &@@ 'delta';
+ id |                                   snip                                    
+----+---------------------------------------------------------------------------
+  1 | The <mark>Delta</mark> Report was filed about the <mark>delta</mark> wing
+(1 row)
+
+-- (f) custom tags compose the same way.
+SELECT id, bm25_snippet(body, '<b>', '</b>') AS snip
+  FROM sn WHERE body @@@ 'delta' ORDER BY body &@@ 'delta';
+ id |                             snip                              
+----+---------------------------------------------------------------
+  1 | The <b>Delta</b> Report was filed about the <b>delta</b> wing
+(1 row)
+
+-- ============================================================================
+-- Part 2 — a scan-returned row whose SNIPPET FIELD lacks the term -> SQL NULL.
+-- Multi-field index: the query matches on `title`, but bm25_snippet(body) finds no hit
+-- in `body` for a row where only the title carried the term -> NULL (callers drop it).
+-- ============================================================================
+CREATE TABLE mf (id int PRIMARY KEY, title text, body text) WITH (autovacuum_enabled = off);
+INSERT INTO mf VALUES
+    -- title lengths DIFFER (2 vs 6 tokens) so the two title:echo BM25F scores are DISTINCT
+    -- (shorter field -> higher length-normalized score): the index scan orders row 1 before
+    -- row 2 deterministically with NO secondary sort key (a `, id` tiebreak would let PG16
+    -- satisfy @@@ off-index -> no active scan slot -> NULL snippet, the CI failure we fix).
+    (1, 'echo report',
+        'the aircraft flew north today'),                        -- title echo; body LACKS echo
+    (2, 'echo summary of the quarterly field',
+        'this body mentions echo directly');                     -- title echo; body HAS echo
+CREATE INDEX mf_bm25 ON mf USING bm25_native (title, body) WITH (language = 'english');
+-- Both titles carry 'echo' so title:echo returns BOTH rows; bm25_snippet(body) then
+-- discriminates by BODY content: row 1's body lacks echo -> SQL NULL (zero-hit rule),
+-- row 2's body has echo -> highlighted. Order by title &@@ ALONE (the 38_phrase idiom):
+-- distinct scores fix the row order without a secondary key, and the bare &@@ shape forces
+-- the bm25_native ordered INDEX scan on every PG major (the scan slot the snippet reads).
+SELECT id, bm25_snippet(body) AS body_snip, bm25_snippet(body) IS NULL AS body_null
+  FROM mf WHERE title @@@ 'title:echo' ORDER BY title &@@ 'title:echo';
+ id |                   body_snip                   | body_null 
+----+-----------------------------------------------+-----------
+  1 |                                               | t
+  2 | this body mentions <mark>echo</mark> directly | f
+(2 rows)
+
+-- ============================================================================
+-- Part 3 — excerpt length is bounded by max_num_chars (tags + ellipses excluded).
+-- A long field with one hit in the middle: the excerpt is a window around the hit, and
+-- its ORIGINAL-text length (strip the <mark></mark> tags and the '…' ellipses) never
+-- exceeds the budget.
+-- ============================================================================
+CREATE TABLE lng (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO lng VALUES
+    (1, 'lorem ipsum dolor sit amet consectetur adipiscing elit sed do '
+        || 'eiusmod tempor incididunt foxtrot ut labore et dolore magna aliqua ut '
+        || 'enim ad minim veniam quis nostrud exercitation ullamco laboris nisi');
+CREATE INDEX lng_bm25 ON lng USING bm25_native (body) WITH (language = 'english');
+-- Strip tags + ellipses, then assert the remaining ORIGINAL text is <= 40 chars. (The
+-- window is centred on 'foxtrot'; only original bytes count toward the budget, D11.)
+SELECT id,
+       length(replace(replace(replace(bm25_snippet(body, '<m>', '</m>', 40),
+                                       '<m>', ''), '</m>', ''), '…', '')) <= 40 AS within_budget
+  FROM lng WHERE body @@@ 'foxtrot' ORDER BY body &@@ 'foxtrot';
+ id | within_budget 
+----+---------------
+  1 | t
+(1 row)
+
+-- ============================================================================
+-- Part 4 — UTF-8 boundary safety (the D10 mb-guard, the key safety test). Multibyte
+-- context (3-byte CJK, 4-byte emoji) sits directly around the ASCII hit, so ANY excerpt
+-- edge that ignored char boundaries would split a UTF-8 sequence. Under several tight
+-- budgets the result must (1) never error, (2) stay valid UTF-8 — asserted by comparing
+-- the snippet to its own UTF-8 round-trip (a split sequence would not round-trip).
+-- ============================================================================
+CREATE TABLE mb (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO mb VALUES
+    (1, '😀😀😀 中文文字 golf 中文文字 😀😀😀');
+CREATE INDEX mb_bm25 ON mb USING bm25_native (body) WITH (language = 'english');
+-- The hit 'golf' is wrapped; edges land on whole characters for every budget (a mid-char
+-- cut would make utf8_ok false). One single-budget query PER budget, each the bare 38_phrase
+-- shape (@@@ key + &@@ order-by on the same literal, NO secondary sort key, NO cross join),
+-- UNION ALL'd. A CROSS JOIN over a VALUES budget list plus a `, v.b` tiebreak let PG16 satisfy
+-- @@@ off the bm25_native index -> no active scan slot -> NULL snippet; running each budget inside its
+-- own scored index scan forces the slot on every PG major. The single-doc corpus makes each
+-- subquery's one row deterministic; the outer `ORDER BY budget` sorts the 6 collected rows.
+SELECT budget, utf8_ok FROM (
+  SELECT  7 AS budget, bm25_snippet(body, '<', '>',  7) = convert_from(convert_to(bm25_snippet(body, '<', '>',  7), 'UTF8'), 'UTF8') AS utf8_ok
+    FROM mb WHERE body @@@ 'golf' ORDER BY body &@@ 'golf'
+) s7
+UNION ALL SELECT budget, utf8_ok FROM (
+  SELECT 10 AS budget, bm25_snippet(body, '<', '>', 10) = convert_from(convert_to(bm25_snippet(body, '<', '>', 10), 'UTF8'), 'UTF8') AS utf8_ok
+    FROM mb WHERE body @@@ 'golf' ORDER BY body &@@ 'golf'
+) s10
+UNION ALL SELECT budget, utf8_ok FROM (
+  SELECT 12 AS budget, bm25_snippet(body, '<', '>', 12) = convert_from(convert_to(bm25_snippet(body, '<', '>', 12), 'UTF8'), 'UTF8') AS utf8_ok
+    FROM mb WHERE body @@@ 'golf' ORDER BY body &@@ 'golf'
+) s12
+UNION ALL SELECT budget, utf8_ok FROM (
+  SELECT 14 AS budget, bm25_snippet(body, '<', '>', 14) = convert_from(convert_to(bm25_snippet(body, '<', '>', 14), 'UTF8'), 'UTF8') AS utf8_ok
+    FROM mb WHERE body @@@ 'golf' ORDER BY body &@@ 'golf'
+) s14
+UNION ALL SELECT budget, utf8_ok FROM (
+  SELECT 20 AS budget, bm25_snippet(body, '<', '>', 20) = convert_from(convert_to(bm25_snippet(body, '<', '>', 20), 'UTF8'), 'UTF8') AS utf8_ok
+    FROM mb WHERE body @@@ 'golf' ORDER BY body &@@ 'golf'
+) s20
+UNION ALL SELECT budget, utf8_ok FROM (
+  SELECT 30 AS budget, bm25_snippet(body, '<', '>', 30) = convert_from(convert_to(bm25_snippet(body, '<', '>', 30), 'UTF8'), 'UTF8') AS utf8_ok
+    FROM mb WHERE body @@@ 'golf' ORDER BY body &@@ 'golf'
+) s30
+ORDER BY budget;
+ budget | utf8_ok 
+--------+---------
+      7 | t
+     10 | t
+     12 | t
+     14 | t
+     20 | t
+     30 | t
+(6 rows)
+
+-- ============================================================================
+-- Part 5 — trust boundary: max_num_chars <= 0 ERRORs. This is a pure argument check that
+-- fires regardless of scan state, so it is exercised in a plain SELECT (no active scan) —
+-- which also documents that the budget is validated before the scan-slot / hit logic.
+-- ============================================================================
+SELECT bm25_snippet('the delta report', '<mark>', '</mark>', 0);   -- expect ERROR (0)
+ERROR:  bm25: "max_num_chars" must be positive (got 0)
+SELECT bm25_snippet('the delta report', '<mark>', '</mark>', -1);  -- expect ERROR (-1)
+ERROR:  bm25: "max_num_chars" must be positive (got -1)
+-- ============================================================================
+-- Part 6 — no active bm25_native scored scan -> SQL NULL (same limitation as bm25_score). A
+-- plain SELECT sets no scan slot, so there are no query terms to highlight.
+-- ============================================================================
+SELECT bm25_snippet('the delta report was filed today') IS NULL AS no_scan_null;
+ no_scan_null 
+--------------
+ t
+(1 row)
+
+-- ============================================================================
+-- Part 7 — a leading hit yields no leading ellipsis; a trailing-truncated excerpt gets a
+-- trailing '…'. Uses a field long enough to truncate on the right only.
+-- ============================================================================
+CREATE TABLE lead (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO lead VALUES
+    (1, 'hotel india juliett kilo lima mike november oscar papa quebec romeo');
+CREATE INDEX lead_bm25 ON lead USING bm25_native (body) WITH (language = 'english');
+-- 'hotel' is at position 0: the excerpt begins with the mark (NO leading '…') and, with a
+-- tight budget, ends with a trailing '…'. starts_with_mark discriminates the no-leading-
+-- ellipsis rule; ends_with_ellipsis the right-truncation rule.
+SELECT id,
+       left(bm25_snippet(body, '<m>', '</m>', 20), 3)  = '<m>' AS starts_with_mark,
+       right(bm25_snippet(body, '<m>', '</m>', 20), 1) = '…'   AS ends_with_ellipsis
+  FROM lead WHERE body @@@ 'hotel' ORDER BY body &@@ 'hotel';
+ id | starts_with_mark | ends_with_ellipsis 
+----+------------------+--------------------
+  1 | t                | t
+(1 row)
+
+DROP TABLE lead;
+DROP TABLE mb;
+DROP TABLE lng;
+DROP TABLE mf;
+DROP TABLE sn;
+DROP EXTENSION bm25_native;

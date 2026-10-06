@@ -1,0 +1,155 @@
+-- H4 (issue #44): the wildcard guardrails were PGC_USERSET, so the users they
+-- exist to constrain could switch them off.
+--
+--     SET bm25_native.wildcard_min_prefix     = 0;
+--     SET bm25_native.wildcard_max_expansions = 1000000;
+--     SELECT ... WHERE body @@@ bm25_wildcard('body', '*') ...
+--
+-- expands to a million dictionary terms with no bound. A limit that must not be
+-- lowered by the user belongs at PGC_SUSET, which is where both now sit.
+--
+-- The distinction being asserted: seal_threshold, wand_top_k and (since #62.5)
+-- max_match_memory stay PGC_USERSET because moving them only trades performance
+-- or the session's own memory. These two decide whether a query is allowed to run
+-- at all, so they are the administrator's to set.
+--
+-- bm25_native.debug_budget (#146) is PGC_SUSET on a THIRD ground, distinct from
+-- both: it changes the physical layout of shared on-disk state, since a lowered
+-- maintenance budget makes the next seal or merge publish more, smaller segments
+-- that every other session then scans. It is a test lever, not a knob --
+-- maintenance_work_mem is the contract -- and the census below is what will fail
+-- if it is ever widened to `user`.
+--
+-- bm25_native.debug_pause (#239) is a second test lever, PGC_SUSET for a reason of
+-- its own: it parks a VACUUM or merge at a named step while that backend holds the
+-- index's seal/merge singleton, so whoever can set it can stall every seal, merge
+-- and (behind a queued waiter) insert on the index. It also parks an INSERT in its
+-- key-config check (#270), holding no singleton. t/020 and t/022 drive it.
+--
+-- bm25_native.debug_count_slicing (#289) is the third, PGC_SUSET on debug_budget's
+-- ground: it makes the segment writer lay out posting blocks the old way, in which
+-- one document's postings can straddle two blocks, so that sql/122 can still test
+-- the WAND reader on that layout. That is shared on-disk state other sessions scan.
+--
+-- bm25_native.debug_cancel_at (#305) is the fourth, PGC_SUSET with debug_pause: it
+-- takes the same point names and cancels the setting backend's own query at them,
+-- so sql/148 can show where a cancel takes effect in a single session.
+-- bm25_native.debug_cancel_after is the fifth, PGC_SUSET with it: a work-unit
+-- threshold that holds such a cancel back so it lands mid-loop (sql/66, sql/80).
+--
+-- The census below is the point of this section, not scenery: it is the only place
+-- that fails when a new bm25_native.* GUC lands at the wrong context, which is
+-- exactly how max_match_memory's `user` context got asserted at all.
+--
+-- enable_seqscan=off throughout, for the reason 47_m6_wildcard gives: a seqscan
+-- hits the inert bm25_match recheck instead of the index wildcard expander, so
+-- the guardrail would never be reached and the test would pass vacuously.
+CREATE EXTENSION bm25_native;
+
+CREATE TABLE wgp (id int PRIMARY KEY, body text);
+INSERT INTO wgp VALUES (1, 'alpha judgment'), (2, 'judge beta'), (3, 'judicial alpine');
+CREATE INDEX wgp_bm25 ON wgp USING bm25_native (body);
+SELECT bm25_seal('wgp_bm25');
+SET enable_seqscan = off;
+
+-- ------------------------------------------------------------ context
+SELECT name, setting, context
+  FROM pg_settings
+ WHERE name LIKE 'bm25\_native.%'
+ ORDER BY name;
+
+CREATE ROLE bm25_h4_user NOLOGIN;
+GRANT USAGE ON SCHEMA public TO bm25_h4_user;
+GRANT SELECT ON wgp TO bm25_h4_user;
+
+-- Baseline: a compliant wildcard works, and the guardrail rejects a short prefix.
+SELECT array_agg(id ORDER BY id) AS judg_star
+  FROM wgp WHERE body @@@ bm25_wildcard('body', 'judg*');
+SELECT id FROM wgp WHERE body @@@ bm25_wildcard('body', 'a*');
+
+-- ------------------------------------------------------------ the guardrails
+-- A non-superuser cannot weaken either limit...
+SET ROLE bm25_h4_user;
+SET bm25_native.wildcard_min_prefix = 0;
+SET bm25_native.wildcard_max_expansions = 1000000;
+
+-- ...so both guards still fire for that role.
+SELECT id FROM wgp WHERE body @@@ bm25_wildcard('body', 'a*');
+SELECT array_agg(id ORDER BY id) FROM wgp WHERE body @@@ bm25_wildcard('body', 'judg*');
+
+-- The performance knobs remain the user's to set: this must NOT have become a
+-- blanket lockdown of the bm25_native.* namespace.
+SET bm25_native.wand_top_k = 5;
+SET bm25_native.seal_threshold = 128;
+SHOW bm25_native.wand_top_k;
+RESET bm25_native.wand_top_k;
+RESET bm25_native.seal_threshold;
+RESET ROLE;
+
+-- ------------------------------------------------------------ superuser
+-- The administrator can still move them, so the knob is not merely dead: at
+-- min_prefix = 1 the previously-rejected 'a*' is allowed and matches.
+SET bm25_native.wildcard_min_prefix = 1;
+SELECT array_agg(id ORDER BY id) AS a_star_allowed
+  FROM wgp WHERE body @@@ bm25_wildcard('body', 'a*');
+RESET bm25_native.wildcard_min_prefix;
+
+-- And the expansion cap still bites for a superuser who lowers it.
+SET bm25_native.wildcard_max_expansions = 1;
+SELECT id FROM wgp WHERE body @@@ bm25_wildcard('body', 'judg*');
+RESET bm25_native.wildcard_max_expansions;
+
+-- ------------------------------------------------------------ pattern length / star count
+-- Maintenance-interrupts pass: two more guardrails on the SAME PGC_SUSET footing.
+-- bm25_glob_match is O(pattern * term), so an oversized pattern or an excessive
+-- star count is unbounded work regardless of min_prefix/max_expansions.
+SET bm25_native.wildcard_max_pattern_length = 4;
+SELECT id FROM wgp WHERE body @@@ bm25_wildcard('body', 'judg*');
+RESET bm25_native.wildcard_max_pattern_length;
+
+SET bm25_native.wildcard_max_stars = 1;
+SELECT id FROM wgp WHERE body @@@ bm25_wildcard('body', 'jud*g*e*');
+RESET bm25_native.wildcard_max_stars;
+
+-- A non-superuser cannot weaken either new limit either...
+SET ROLE bm25_h4_user;
+SET bm25_native.wildcard_max_pattern_length = 1000000;
+SET bm25_native.wildcard_max_stars = 1000000;
+RESET ROLE;
+
+-- ...and the administrator can still move them: raising max_pattern_length lets a
+-- previously-rejected long pattern through, same "knob is not merely dead" shape
+-- as the min_prefix section above.
+SET bm25_native.wildcard_max_pattern_length = 4;
+SELECT id FROM wgp WHERE body @@@ bm25_wildcard('body', 'judg*');
+SET bm25_native.wildcard_max_pattern_length = 8192;
+SELECT array_agg(id ORDER BY id) AS long_pattern_allowed
+  FROM wgp WHERE body @@@ bm25_wildcard('body', 'judg*');
+RESET bm25_native.wildcard_max_pattern_length;
+
+SET bm25_native.wildcard_max_stars = 1;
+SELECT id FROM wgp WHERE body @@@ bm25_wildcard('body', 'jud*g*e*');
+SET bm25_native.wildcard_max_stars = 3;
+SELECT id FROM wgp WHERE body @@@ bm25_wildcard('body', 'jud*g*e*');
+RESET bm25_native.wildcard_max_stars;
+
+-- ------------------------------------------------------------ delegation
+-- GRANT SET ON PARAMETER (PG 15+) is the supported way to hand a SUSET knob to a
+-- role without superuser. Asserted so the documented escape hatch stays real.
+GRANT SET ON PARAMETER bm25_native.wildcard_min_prefix TO bm25_h4_user;
+SET ROLE bm25_h4_user;
+SET bm25_native.wildcard_min_prefix = 1;
+SELECT array_agg(id ORDER BY id) AS a_star_delegated
+  FROM wgp WHERE body @@@ bm25_wildcard('body', 'a*');
+RESET bm25_native.wildcard_min_prefix;
+-- Still not the other one: the grant is per-parameter.
+SET bm25_native.wildcard_max_expansions = 1000000;
+RESET ROLE;
+REVOKE SET ON PARAMETER bm25_native.wildcard_min_prefix FROM bm25_h4_user;
+
+RESET enable_seqscan;
+REVOKE SELECT ON wgp FROM bm25_h4_user;
+REVOKE USAGE ON SCHEMA public FROM bm25_h4_user;
+DROP ROLE bm25_h4_user;
+DROP TABLE wgp;
+DROP EXTENSION bm25_native;

@@ -1,0 +1,153 @@
+-- H4 (issue #135): a drained pending page was recycled with NO XID horizon.
+--
+-- bm25_pending_truncate stamped each detached page BM25_PAGE_DELETED +
+-- InvalidFullTransactionId -- "reusable now, a detached pending page has no live
+-- references" -- and bm25_reclaim_orphans did the same for the drained chain
+-- whenever the truncate was skipped (crash, error, or a lost opportunistic
+-- ConditionalLockPage race) and VACUUM found it as an orphan.
+--
+-- The premise was false. A scanner holds only AccessShareLock and takes no part in
+-- the seal singleton: bm25_scan_snapshot captures pending_head under ONE metapage
+-- SHARE lock, releases it, and walks the chain LATER, page by page. So an
+-- INSERT that crosses the seal threshold can free a block a running scan is about
+-- to read; bm25_page_alloc accepts it immediately (its horizon test
+-- short-circuits on an invalid retire_xid); the next writer FPI-re-inits it as a
+-- DICT or POST page -- and the scan then decodes a dictionary page as a stream of
+-- BM25PendingDocHeaders. Segment pages survive that race on their per-page
+-- seg_gen; bm25_page_init leaves seg_gen = 0 on pending pages, so
+-- bm25_seg_page_validate is a documented no-op for exactly this chain and nothing
+-- detects the substitution. Result: garbage TIDs and garbage doclen folded into
+-- corpus stats, or a spurious ERRCODE_INDEX_CORRUPTED on a healthy index.
+--
+-- Both stamp sites now write ReadNextFullTransactionId(), so reuse waits on
+-- GlobalVisCheckRemovableFullXid exactly as a retired segment's pages do.
+--
+-- WHAT THIS SUITE PINS, and why it needs no VACUUM cycle and no timing. The cost
+-- model in the issue ("one extra VACUUM cycle before the pages return") is wrong:
+-- GlobalVisTestIsRemovableFullXid self-updates its boundary, so on a quiet cluster
+-- the stamp clears after roughly one completed transaction. The assertion below is
+-- exact instead of timed because bm25_page_mark_deleted ORs the DELETED bit in and
+-- leaves BM25_PAGE_PENDING set: a drained pending page stays identifiable as
+-- (DELETED | PENDING) for as long as it is unreused, and every such page must be
+-- horizon-gated. Pre-fix f, post-fix t.
+CREATE EXTENSION bm25_native;
+CREATE TABLE prh (id int, body text);
+CREATE INDEX prh_idx ON prh USING bm25_native (body);
+-- Enough documents for a multi-page pending chain, small enough not to depend on
+-- where the seal threshold falls (an opportunistic auto-seal mid-INSERT would
+-- drain and stamp by the same code path, so either outcome pins the same thing).
+INSERT INTO prh SELECT g, 'horizon token alpha beta ' || (g % 97) FROM generate_series(1, 1200) g;
+-- Sanity: the probe discriminates. A LIVE pending page (PENDING, not DELETED) is
+-- not a recycle candidate and carries no horizon, and neither does the metapage.
+-- IS NOT TRUE rather than = false so an empty match (an auto-seal having just
+-- drained the chain) reads t instead of NULL -- this is a sanity check on the
+-- probe, not on how many pending pages happen to be live at this instant.
+SELECT bool_or(bm25_debug_page_retire_xid_valid('prh_idx', b)) IS NOT TRUE AS live_pending_ungated
+  FROM generate_series(1, bm25_debug_npages('prh_idx')::int - 1) b
+ WHERE (bm25_debug_page_flags('prh_idx', b) & (512 | 2)) = 2;    -- PENDING, not DELETED
+ live_pending_ungated 
+----------------------
+ t
+(1 row)
+
+SELECT bm25_debug_page_retire_xid_valid('prh_idx', 0) AS metapage_gated;
+ metapage_gated 
+----------------
+ f
+(1 row)
+
+SELECT bm25_seal('prh_idx');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+-- ------------------------------------------------- the assertion (truncate path)
+-- Every page the seal drained and recycled must be horizon-gated. (512 | 2) is
+-- BM25_PAGE_DELETED | BM25_PAGE_PENDING: DELETED is ORed in over the surviving
+-- PENDING bit, so this selects exactly the recycled pending pages and nothing
+-- else. count(*) > 0 guards against the query silently matching nothing, which
+-- would make bool_and NULL rather than false.
+SELECT bool_and(bm25_debug_page_retire_xid_valid('prh_idx', b)) AS pending_pages_horizon_gated,
+       count(*) > 0 AS drained_pending_pages_found
+  FROM generate_series(1, bm25_debug_npages('prh_idx')::int - 1) b
+ WHERE (bm25_debug_page_flags('prh_idx', b) & (512 | 2)) = (512 | 2);
+ pending_pages_horizon_gated | drained_pending_pages_found 
+-----------------------------+-----------------------------
+ t                           | t
+(1 row)
+
+-- The index is still correct and complete after the seal, i.e. the horizon stamp
+-- did not cost any pending document.
+SET enable_seqscan = off;
+SELECT count(*) AS rows_matching_after_seal FROM prh WHERE body @@@ 'horizon';
+ rows_matching_after_seal 
+--------------------------
+                     1200
+(1 row)
+
+RESET enable_seqscan;
+-- ------------------------------------------------------- the VACUUM (sweep) path
+-- bm25_reclaim_orphans is the SECOND route a drained chain takes to the FSM: the
+-- truncate above is opportunistic and is skipped whenever the seal crashes,
+-- errors, or loses the ConditionalLockPage race, leaving the detached chain as an
+-- orphan for VACUUM. Its sweep now stamps a real horizon for BM25_PAGE_PENDING
+-- orphans and keeps immediate reuse for every other kind (those are gen-validated).
+-- The orphan arrival itself needs a crash (t/004_crash_orphan.pl); what is testable
+-- here is the other half of the contract -- a VACUUM must not DOWNGRADE an
+-- already-gated page. The sweep skips the stamp on an already-DELETED page, so the
+-- horizon written above has to survive. The sweep is gated (issue #300), so the
+-- counter pins that this VACUUM really swept, or the check below is vacuous.
+SELECT bm25_debug_orphan_sweeps() AS sweeps_before \gset
+VACUUM prh;
+SELECT bm25_debug_orphan_sweeps() - :sweeps_before AS horizon_vacuum_swept;
+ horizon_vacuum_swept 
+----------------------
+                    1
+(1 row)
+
+SELECT bool_and(bm25_debug_page_retire_xid_valid('prh_idx', b)) AS still_gated_after_vacuum,
+       count(*) > 0 AS drained_pending_pages_still_present
+  FROM generate_series(1, bm25_debug_npages('prh_idx')::int - 1) b
+ WHERE (bm25_debug_page_flags('prh_idx', b) & (512 | 2)) = (512 | 2);
+ still_gated_after_vacuum | drained_pending_pages_still_present 
+--------------------------+-------------------------------------
+ t                        | t
+(1 row)
+
+-- ------------------------------------------------------------------ still usable
+-- The gate defers reuse; it must not break it. A second insert + seal cycle
+-- succeeds and the index answers both generations of documents. (This does not
+-- assert a page count: the deferral is a timing property of the cluster horizon,
+-- and 18_vacuum_reclaim owns the reuse-footprint assertions.)
+INSERT INTO prh SELECT g, 'horizon second cycle ' || (g % 89) FROM generate_series(1201, 2400) g;
+SELECT bm25_seal('prh_idx');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SET enable_seqscan = off;
+SELECT count(*) AS rows_matching_after_second_seal FROM prh WHERE body @@@ 'horizon';
+ rows_matching_after_second_seal 
+---------------------------------
+                            2400
+(1 row)
+
+SELECT count(*) AS second_cycle_rows FROM prh WHERE body @@@ 'cycle';
+ second_cycle_rows 
+-------------------
+              1200
+(1 row)
+
+RESET enable_seqscan;
+SELECT bool_and(bm25_debug_page_retire_xid_valid('prh_idx', b)) AS second_cycle_pages_gated
+  FROM generate_series(1, bm25_debug_npages('prh_idx')::int - 1) b
+ WHERE (bm25_debug_page_flags('prh_idx', b) & (512 | 2)) = (512 | 2);
+ second_cycle_pages_gated 
+--------------------------
+ t
+(1 row)
+
+DROP TABLE prh;
+DROP EXTENSION bm25_native;

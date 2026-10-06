@@ -1,0 +1,174 @@
+-- #136 (H5): the pending append used to budget every on-page record against two
+-- things that are not the page -- the compile-time PENDING_PAGE_CAPACITY and the
+-- metapage's CACHED pending_tail_free counter -- and then write at the locked tail
+-- page's pd_lower without ever consulting its pd_upper. Counter and page were kept in
+-- lockstep by convention alone (`pending_tail_free -= runneed` mirroring
+-- `pd_lower += runneed`), so a metapage whose counter overstated its tail page -- torn,
+-- hostile, or simply stale after the page was recycled and re-inited as something else
+-- -- made the append's memcpy loop an unbounded write.
+--
+-- Where it lands matters: `dst` points into the REGISTERED GenericXLog scratch copy,
+-- and GenericXLogState starts with a contiguous array of page images with the tail page
+-- registered FIRST and the metapage SECOND, so the first casualty of an overrun is the
+-- metapage's own about-to-be-WAL-logged image, in the same record. pd_lower is then
+-- stored back as a uint16, so an offset of 8192..16336 survives intact and > BLCKSZ,
+-- and Generic WAL's delta computation bounds its fixed BLCKSZ-sized delta buffer with
+-- nothing but an Assert -- a second overrun, invisible in a production build.
+--
+-- The fix is in two pieces, because one check cannot cover both failures:
+--   (a) BEFORE the ReadBuffer (and before the allocate/link branch, which ReadBuffers
+--       the old tail as well): reject a pending_tail of BM25_METAPAGE_BLKNO. That value
+--       makes ReadBuffer return the metapage buffer the appender ALREADY holds
+--       exclusive, and the LockBuffer after it self-acquires the same content LWLock --
+--       LWLockAcquire has no reentrancy assertion and calls HOLD_INTERRUPTS() before it
+--       waits, so the backend wedges unkillably and no check placed after that
+--       LockBuffer ever runs.
+--   (b) AFTER the LockBuffer and BEFORE GenericXLogStart (so no WAL window is open when
+--       it ereports): bm25_pending_tail_space_check, on the page itself.
+--
+-- Same reasoning as 69_decode_boundary, 78_trust_boundary_bounds and
+-- 79_page_content_bounds: a regression suite cannot produce a metapage whose counter
+-- lies about its tail page -- every bm25_debug_* function was enumerated: the two that
+-- poke the metapage directly (bm25_debug_stamp_version,
+-- bm25_debug_write_optional_region) never touch the pending fields, and the two that
+-- reach it through production code (bm25_debug_pending_append,
+-- bm25_debug_seal_unpublished) keep it consistent -- so the check is
+-- exposed as a probe over caller-supplied values and tested directly, with a positive
+-- control at the end for the direction that actually matters in production.
+CREATE EXTENSION bm25_native;
+
+-- ------------------------------------------------------- bm25_pending_tail_space_check
+-- Operand order is the point of this guard, so read the cases in that light:
+-- bm25_page_content_bytes runs FIRST and ERRORs on a malformed header, which is the
+-- only reason the raw `pd_upper - pd_lower` in the second operand is safe -- that is an
+-- int subtraction of two uint16s, and a (Size) cast of a negative result would be a
+-- huge positive that satisfies any runneed silently.
+--
+-- On this platform/build SizeOfPageHeaderData is 24 and BLCKSZ is 8192, so a freshly
+-- initialized pending page is pd_lower = 24, pd_upper = 8192 - MAXALIGN(BM25PageOpaque)
+-- = 8168, and PENDING_PAGE_CAPACITY is 8168 - 24 = 8144.
+
+-- THE case an over-strict guard would break: a full-page record on a fresh page, exact
+-- fit. Every insert large enough to fill a page reaches this boundary, so this MUST NOT
+-- error -- it is the reason the comparison is `<` on the free bytes and not `<=`.
+SELECT bm25_debug_pending_tail_space(24, 8168, 8144, 8144) AS fresh_page_exact_fit;
+-- Partially filled page, record fits with room to spare: the ordinary case.
+SELECT bm25_debug_pending_tail_space(1024, 8168, 100, 7144) AS partial_page_fits;
+-- Zero-byte record on a completely full page: 0 free, needs 0. Not an overrun.
+SELECT bm25_debug_pending_tail_space(8168, 8168, 0, 0) AS full_page_zero_need;
+
+-- One byte over the exact fit: the first byte that would land on the special area.
+SELECT bm25_debug_pending_tail_space(24, 8168, 8145, 8145);
+-- The shape the fix exists for: the counter claims a full page's worth of free space on
+-- a page that is nearly full. Before the fix this wrote ~8 KB past pd_lower.
+SELECT bm25_debug_pending_tail_space(8100, 8168, 4096, 8144);
+-- Inverted header (pd_lower > pd_upper). Caught by bm25_page_content_bytes, the FIRST
+-- operand -- had the raw subtraction been evaluated first, (Size) (8168 - 8188) is
+-- ~1.8e19 and every runneed would have "fit".
+SELECT bm25_debug_pending_tail_space(8188, 8168, 16, 16);
+-- Underflow: pd_lower below SizeOfPageHeaderData, down to PageIsEmpty's own 0. This is
+-- bm25_page_content_bytes's own message ("invalid content boundary"), not the space
+-- check's -- the guard never gets to compare anything.
+SELECT bm25_debug_pending_tail_space(0, 8168, 16, 8144);
+SELECT bm25_debug_pending_tail_space(10, 8168, 16, 8144);
+-- Content past where a pending page's special area starts. pd_lower = 8180 with
+-- pd_upper = 8192 is a WELL-FORMED core page header (pd_lower <= pd_upper <= BLCKSZ, so
+-- bm25_page_content_bytes returns happily), but its 8156 content bytes exceed
+-- PENDING_PAGE_CAPACITY's 8144: the content has already run into where BM25PageOpaque
+-- lives, which means this is not a pending page at all. Only the capacity operand
+-- catches this one -- there are 12 free bytes by the raw subtraction.
+SELECT bm25_debug_pending_tail_space(8180, 8192, 8, 8);
+-- The same page with no room demanded at all still fails: it is the page that is wrong,
+-- not the request.
+SELECT bm25_debug_pending_tail_space(8180, 8192, 0, 0);
+
+-- Argument-boundary cases. These carry their own messages, distinct from the guard's,
+-- so a failure here reads as "the argument never reached the C guard" rather than "the
+-- guard fired" (79_page_content_bounds' rationale).
+SELECT bm25_debug_pending_tail_space(-1, 8168, 16, 16);       -- pd_lower out of uint16 range
+SELECT bm25_debug_pending_tail_space(24, 70000, 16, 16);      -- pd_upper out of uint16 range
+SELECT bm25_debug_pending_tail_space(24, 8168, -1, 16);       -- runneed out of uint32 range
+SELECT bm25_debug_pending_tail_space(24, 8168, 16, -1);       -- claimed_free out of uint32 range
+SELECT bm25_debug_pending_tail_space(24, 8168, 4294967296, 16); -- runneed past uint32
+
+-- ------------------------------------------------------------------- positive control
+-- The direction that would break production if the guard were over-strict: a real index
+-- taking real inserts through bm25_pending_append_multi, which now runs the check on
+-- EVERY part of EVERY document -- including a part landing on a page allocated by the
+-- previous iteration, and including the exact-fit boundary above whenever a document
+-- fills a page. The rows below seal (bm25_seal drains the pending chain), then more
+-- inserts refill it, so both the fresh-page and partially-filled-page paths run.
+CREATE TABLE pts (id int PRIMARY KEY, title text, body text);
+CREATE INDEX pts_idx ON pts USING bm25_native (title, body) WITH (store_positions = true);
+INSERT INTO pts SELECT g, 'title ' || g, 'alpha beta gamma ' || g FROM generate_series(1, 200) g;
+SELECT bm25_seal('pts_idx');
+-- Refill the pending list after the drain: these appends start on a fresh tail page.
+INSERT INTO pts SELECT g, 'title ' || g, 'delta epsilon ' || g FROM generate_series(201, 400) g;
+
+-- A document large enough to span several pending pages, so the multi-part write loop
+-- runs the check once per part -- the case a check placed outside the loop would miss.
+-- ~4000 distinct terms is well past one page's worth of term entries.
+INSERT INTO pts
+SELECT 9999, 'title spanning',
+       string_agg('term' || g, ' ') FROM generate_series(1, 4000) g;
+
+SET enable_seqscan = off;
+SELECT count(*) AS alpha_matches FROM pts WHERE body @@@ 'alpha';
+SELECT count(*) AS delta_matches FROM pts WHERE body @@@ 'delta';
+SELECT id AS spanning_doc FROM pts WHERE body @@@ 'term3999';
+SELECT bm25_seal('pts_idx');
+SELECT count(*) AS alpha_after_seal FROM pts WHERE body @@@ 'alpha';
+SELECT id AS spanning_doc_after_seal FROM pts WHERE body @@@ 'term3999';
+
+RESET enable_seqscan;
+DROP TABLE pts;
+-- ------------------------------------------- the format gate on the WRITE path
+-- bm25_meta_read_locked used to check only `magic`; its two callers were expected
+-- to follow up with bm25_meta_validate, and the seal path did while the pending
+-- appender never had. So aminsert -- the one path that WRITES without first
+-- reading a validated metapage -- reached the pending list with no version gate.
+--
+-- WHAT THE OBSERVABLE DEFECT ACTUALLY IS, corrected after an adversarial review
+-- caught the first version of this test asserting the wrong thing. The INSERT
+-- STATEMENT already failed before this fix: bm25_insert calls
+-- bm25_pending_should_seal unconditionally after the append, and that runs the
+-- full gate -- so both builds raise 0A000 and a SQLSTATE assertion here
+-- discriminates NOTHING.
+--
+-- The defect is that pre-fix the gate fired only AFTER GenericXLogFinish had made
+-- the pending record durable. The statement aborted, the heap row went away, and
+-- the index record STAYED: a physical Generic WAL write survives the abort. So the
+-- signal is the pending list itself, read once a readable floor is restored.
+--   pre-fix:  pending_ndocs 1 -> 2   (orphan record left behind by a failed INSERT)
+--   post-fix: pending_ndocs 1 -> 1   (refused before any page is touched)
+--
+-- BLAST RADIUS, deliberate and unchanged: an index whose min_read_version exceeds
+-- this binary refuses DML. What this fix changes is that the refusal is now atomic.
+CREATE TABLE gate (id int PRIMARY KEY, body text);
+CREATE INDEX gate_idx ON gate USING bm25_native (body);
+INSERT INTO gate VALUES (1, 'alpha beta');
+SELECT pending_ndocs AS pending_before FROM bm25_stats('gate_idx');
+
+-- Floor one past this build's BM25_FORMAT_VERSION: the forward gate must refuse. The
+-- literals track BM25_FORMAT_VERSION and must be bumped with it -- a stamped floor that
+-- is no longer ONE PAST this build passes the gate, and the case silently stops
+-- testing anything (the same trap sql/55 records for its own (C)/(D) literals).
+SELECT bm25_debug_stamp_version('gate_idx', 8, 9, 0);
+DO $$
+BEGIN
+    INSERT INTO gate VALUES (2, 'gamma delta');
+    RAISE EXCEPTION 'INSERT was not refused on a too-new index';
+EXCEPTION WHEN feature_not_supported THEN
+    RAISE NOTICE 'INSERT refused, as expected';
+END $$;
+
+-- Restore a readable floor so the pending list can be read back. THIS is the
+-- assertion: unchanged means the refusal happened before any write.
+SELECT bm25_debug_stamp_version('gate_idx', 8, 5, 0);
+SELECT pending_ndocs AS pending_after_refused_insert FROM bm25_stats('gate_idx');
+-- ...and an ordinary insert still works once the floor is readable.
+INSERT INTO gate VALUES (3, 'epsilon zeta');
+SELECT pending_ndocs AS pending_after_ordinary_insert FROM bm25_stats('gate_idx');
+DROP TABLE gate;
+
+DROP EXTENSION bm25_native;

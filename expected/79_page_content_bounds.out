@@ -1,0 +1,261 @@
+-- Trust-boundary review (2026-08): closes the layer BELOW both ADR 0027 (H6, the
+-- posting-block decode) and ADR 0039 (the metapage/DICT/KEYMAP/accumulator/retired-
+-- list bounds) -- the page content LENGTH every one of those validators measures
+-- an `end`/`pend`/`pagebytes` against in the first place.
+--
+-- Every one of those validators (and every DICT/SEGCAT/fieldcfg/retired-list walker
+-- besides) derived its `end` the same unchecked way: `pd_lower - SizeOfPageHeaderData`.
+-- PageIsVerifiedExtended bounds pd_lower from ABOVE ONLY -- pd_lower <= pd_upper <=
+-- pd_special <= BLCKSZ (see storage/bufpage.h) -- and never from below. PageIsEmpty and
+-- an uninitialized page are BOTH `pd_lower <= SizeOfPageHeaderData` by design, down to
+-- and including 0, so a torn or hostile page can carry a pd_lower small enough to
+-- underflow that subtraction to just under SIZE_MAX. Every downstream length/offset
+-- comparison then reads "plenty of room" instead of corruption -- a bound is only as
+-- trustworthy as the value it is measured against, and until this fix that value was
+-- itself unchecked.
+--
+-- The fix is one function, bm25_page_content_bytes, now the single read-side
+-- derivation of a page's content byte count for every chain reader, DICT/SEGCAT/
+-- fieldcfg walker, retired-list walker, and POST-block reader in the tree (the write-
+-- side chain/page builders are deliberately NOT routed through it -- they read back
+-- only pages they themselves just initialized, not an on-disk trust boundary; see the
+-- function's header comment in bm25_seg_read.c for the exhaustive caller list and both
+-- exceptions). This suite also covers three narrower fixes that shipped in the same
+-- pass: bm25_pending_term_entry_span (the pending-list analogue of ADR 0027's
+-- bm25_dictentry_validate), the varbyte width bound now applied to the POS chain's
+-- own varbyte cursor, and chain_read_at's memcpy SPAN check (the start-offset bound
+-- alone was already there; this adds the length check past it).
+--
+-- Same reasoning as 69_decode_boundary and 78_trust_boundary_bounds: "a regression
+-- suite cannot produce a corrupt page", so each validator below is exposed as a
+-- bm25_debug_* probe over CALLER-SUPPLIED values and tested directly. The positive
+-- direction -- that no guard rejects what the writer emits -- is covered by the other
+-- 79 suites, every one of which decodes real pages through these paths; a short
+-- positive control closes this suite too.
+CREATE EXTENSION bm25_native;
+-- ------------------------------------------------------------ bm25_page_content_bytes
+-- The decode boundary itself: pd_lower must be in [SizeOfPageHeaderData, pd_upper],
+-- and pd_upper must not exceed BLCKSZ. SizeOfPageHeaderData is 24 bytes and BLCKSZ is
+-- 8192 on this platform/build. Only pd_lower/pd_upper are examined -- the probe builds
+-- a synthetic page header on the stack and leaves the rest zeroed.
+SELECT bm25_debug_page_content_bytes(100, 200)  AS well_formed;         -- 200-24=176 room, 100-24 content
+ well_formed 
+-------------
+          76
+(1 row)
+
+SELECT bm25_debug_page_content_bytes(24, 24)    AS freshly_initialized; -- pd_lower==SizeOfPageHeaderData: MUST NOT error
+ freshly_initialized 
+---------------------
+                   0
+(1 row)
+
+SELECT bm25_debug_page_content_bytes(8000, 8192) AS full_page;          -- pd_upper at exactly BLCKSZ is fine
+ full_page 
+-----------
+      7976
+(1 row)
+
+-- The underflow case this fix exists for: pd_lower below SizeOfPageHeaderData, all the
+-- way down to 0 (PageIsEmpty's own definition), would otherwise wrap the subtraction.
+SELECT bm25_debug_page_content_bytes(0, 8192);                          -- pd_lower 0: the underflow case
+ERROR:  bm25: segment page has an invalid content boundary
+DETAIL:  The page has pd_lower 0 and pd_upper 8192; its header needs 24 bytes.
+SELECT bm25_debug_page_content_bytes(10, 8192);                         -- pd_lower < SizeOfPageHeaderData, not zero
+ERROR:  bm25: segment page has an invalid content boundary
+DETAIL:  The page has pd_lower 10 and pd_upper 8192; its header needs 24 bytes.
+SELECT bm25_debug_page_content_bytes(200, 100);                         -- pd_lower > pd_upper
+ERROR:  bm25: segment page has an invalid content boundary
+DETAIL:  The page has pd_lower 200 and pd_upper 100; its header needs 24 bytes.
+SELECT bm25_debug_page_content_bytes(100, 9000);                        -- pd_upper > BLCKSZ
+ERROR:  bm25: segment page has an invalid content boundary
+DETAIL:  The page has pd_lower 100 and pd_upper 9000; its header needs 24 bytes.
+SELECT bm25_debug_page_content_bytes(-1, 100);                          -- out of uint16 range at the SQL boundary
+ERROR:  bm25_debug_page_content_bytes: pd_lower out of uint16 range
+SELECT bm25_debug_page_content_bytes(100, 70000);                       -- out of uint16 range at the SQL boundary
+ERROR:  bm25_debug_page_content_bytes: pd_upper out of uint16 range
+-- ------------------------------------------------------------ bm25_pending_term_entry_span
+-- The pending-list analogue of bm25_dictentry_validate (ADR 0027): bounds a pending
+-- term entry's fixed header, then its MAXALIGN'd (header + termlen + pos_bytes) span,
+-- against `end` before either raw on-page uint16 is trusted as a memcpy length or a
+-- cursor stride. sizeof(BM25PendingTermEntry) is 8 bytes on this platform (four
+-- uint16s, no padding) and already a multiple of MAXALIGN's 8-byte stride, unlike
+-- BM25DictEntry's 20 -> 24 -- so here the raw header size and its MAXALIGN'd form
+-- coincide at termlen=pos_bytes=0, and a non-zero termlen is needed to see the two
+-- checks (header fit, then span fit) diverge.
+SELECT bm25_debug_pending_term_entry_span(0, 0, 8)   AS empty_entry_exact_fit;      -- MAXALIGN(8+0+0)=8
+ empty_entry_exact_fit 
+-----------------------
+                     8
+(1 row)
+
+SELECT bm25_debug_pending_term_entry_span(5, 3, 16)  AS termlen_posbytes_exact_fit; -- MAXALIGN(8+5+3)=16
+ termlen_posbytes_exact_fit 
+----------------------------
+                         16
+(1 row)
+
+SELECT bm25_debug_pending_term_entry_span(0, 0, 7);   -- one byte short of the header (8)
+ERROR:  bm25: pending term entry header overruns the page
+SELECT bm25_debug_pending_term_entry_span(1, 0, 8);   -- header exactly fits, but MAXALIGN(8+1)=16 does not
+ERROR:  bm25: pending term entry of length 16 overruns the page
+SELECT bm25_debug_pending_term_entry_span(5, 3, 15);  -- one byte short of MAXALIGN(8+5+3)=16
+ERROR:  bm25: pending term entry of length 16 overruns the page
+SELECT bm25_debug_pending_term_entry_span(70000, 0, 1000); -- termlen out of uint16 range
+ERROR:  bm25_debug_pending_term_entry_span: termlen out of uint16 range
+SELECT bm25_debug_pending_term_entry_span(0, 70000, 1000); -- pos_bytes out of uint16 range
+ERROR:  bm25_debug_pending_term_entry_span: pos_bytes out of uint16 range
+-- ------------------------------------------------------------ pos_cursor_varbyte width bound
+-- NOT independently probed here, deliberately. pos_cursor_varbyte decodes a LEB128
+-- varbyte off a PosCursor (pc->cur/pc->end), which only ever advance by reading real
+-- buffers through pos_cursor_open/pos_cursor_next_page -- there is no caller-supplied-
+-- bytes entry point the way bm25_varbyte_decode has via bm25_debug_varbyte_decode_bytes,
+-- because a PosCursor cannot be pointed at a plain byte buffer; it is always tied to a
+-- real relation and a real POS chain. Reaching the bound with a corrupt byte stream
+-- would require an actual corrupt on-disk POS page, which is exactly the case this
+-- whole suite family declines to fabricate.
+--
+-- What IS covered: pos_cursor_varbyte's loop body -- accumulate 7 bits per byte,
+-- continue while the high bit is set, error at BM25_VARBYTE_MAX_BYTES (5) bytes -- is
+-- textually identical to bm25_varbyte_decode's, sharing the same constant and the same
+-- shift-past-31-bits UB hazard the bound exists to prevent. That arithmetic is already
+-- exercised in both directions by 69_decode_boundary.sql's varbyte probes, in
+-- particular the six-continuation-byte case
+-- (`bm25_debug_varbyte_decode_bytes('\x808080808080'::bytea)`), which is the same
+-- "shift reached 35" case pos_cursor_varbyte's bound guards against, just reached via a
+-- cursor instead of a raw pointer. What is genuinely untested is only the WIRING of
+-- that bound into the page-crossing cursor, not the bound's own arithmetic.
+-- ------------------------------------------------------------ bm25_field_rle_decode's symmetric tail
+-- bm25_debug_field_rle_roundtrip (30_field_postings.sql) always encodes an array of n
+-- ids and then decodes with that SAME n, so it can only ever exercise the well-formed
+-- round trip -- it cannot construct a mismatch between the encoded stream and the
+-- decode target, which is exactly what the symmetric tail check (`p != end || idx !=
+-- n`) exists to catch. bm25_debug_field_rle_decode_bytes decouples the two: it decodes
+-- caller-supplied raw (field_id, run_length) varbyte-pair bytes against a caller-chosen
+-- `n`, so a hand-built stream can undershoot or overshoot it directly, the same way
+-- bm25_debug_varbyte_decode_bytes and bm25_debug_impact_decode_bytes decode
+-- caller-supplied bytes rather than round-tripping their own encoder.
+--
+-- Well-formed: one run, field 0 repeated 3 times -- varbyte(0)=0x00, varbyte(3)=0x03.
+SELECT bm25_debug_field_rle_decode_bytes('\x0003'::bytea, 3) AS one_run_exact;
+ one_run_exact 
+---------------
+ {0,0,0}
+(1 row)
+
+-- Well-formed: two runs -- field 0 x3, field 1 x2 -- summing to exactly n=5.
+SELECT bm25_debug_field_rle_decode_bytes('\x00030102'::bytea, 5) AS two_runs_exact;
+ two_runs_exact 
+----------------
+ {0,0,0,1,1}
+(1 row)
+
+-- Undershoot: the SAME one-run stream (sums to 3), decoded against n=5. The stream
+-- runs out (p reaches end) with idx=3, never reaching n -- caught by `idx != n`.
+SELECT bm25_debug_field_rle_decode_bytes('\x0003'::bytea, 5);
+ERROR:  bm25: posting block field-id run-length encoding produced 3 of 5 ids
+-- Overshoot: the two-run stream (sums to 5), decoded against n=3. The first run alone
+-- (field 0 x3) already reaches idx=n=3, so the outer loop stops with the second pair
+-- (field 1 x2) still unconsumed -- caught by `p != end`, not `idx != n` (idx DOES equal
+-- n here; the trailing bytes are the tell).
+SELECT bm25_debug_field_rle_decode_bytes('\x00030102'::bytea, 3);
+ERROR:  bm25: posting block field-id run-length encoding produced 3 of 3 ids
+-- n=0 with a non-empty stream: p never advances (the loop's `idx < n` guard is false
+-- from the start), so `p != end` fires immediately -- corruption with a declared-empty
+-- block that still carries a run-length payload.
+SELECT bm25_debug_field_rle_decode_bytes('\x0003'::bytea, 0);
+ERROR:  bm25: posting block field-id run-length encoding produced 0 of 0 ids
+-- n=0 with an empty stream is the legitimate single-field-block shape (encoder never
+-- emits RLE bytes when field_count == 1) and must not error.
+SELECT bm25_debug_field_rle_decode_bytes('\x'::bytea, 0) AS zero_fields_empty_stream;
+ zero_fields_empty_stream 
+--------------------------
+ {}
+(1 row)
+
+-- ------------------------------------------------------------ chain_read_at's span check
+-- The memcpy span check chain_read_at runs immediately before trusting a bounded read:
+-- `local_off` (the record's byte offset WITHIN the page, i.e. off - seen) plus `len`
+-- must not exceed `pagebytes` (the page's already-validated content length). The
+-- START-offset bound (`off < seen + pagebytes`, chain_read_at's `here` branch) was
+-- already in place; this is the LENGTH check past that point, catching a page whose
+-- content was truncated mid-record.
+SELECT bm25_debug_chain_span_validate(10, 5, 15) AS exactly_fits;    -- 10+5 == 15
+ exactly_fits 
+--------------
+           10
+(1 row)
+
+SELECT bm25_debug_chain_span_validate(0, 15, 15) AS whole_page;      -- offset 0, length == pagebytes
+ whole_page 
+------------
+          0
+(1 row)
+
+SELECT bm25_debug_chain_span_validate(15, 0, 15) AS zero_length_at_end; -- len 0 at the very end: not an overrun
+ zero_length_at_end 
+--------------------
+                 15
+(1 row)
+
+SELECT bm25_debug_chain_span_validate(10, 6, 15);   -- 10+6 == 16 > 15: one byte past
+ERROR:  bm25: segment chain read overruns its page
+DETAIL:  The read starts at offset 10 with length 6; the page holds 15.
+SELECT bm25_debug_chain_span_validate(16, 0, 15);   -- local_off already past pagebytes, even with len 0
+ERROR:  bm25: segment chain read overruns its page
+DETAIL:  The read starts at offset 16 with length 0; the page holds 15.
+SELECT bm25_debug_chain_span_validate(-1, 5, 15);   -- local_off must be non-negative at the SQL boundary
+ERROR:  bm25_debug_chain_span_validate: local_off must be non-negative
+-- ------------------------------------------------------------ still decodes
+-- Positive control: a real index still builds, inserts, seals and ranks through every
+-- validator exercised above. bm25_pending_term_entry_span runs on every seal (the
+-- pending iterator walks every doc's term entries before draining them);
+-- chain_read_at runs on every ranked query (LIVEDOCS/NORMS/DOCMAP lookups per
+-- candidate); bm25_page_content_bytes underlies both, plus every DICT/POST page this
+-- query touches. If any guard were too strict this would fail rather than the negative
+-- cases above passing.
+CREATE TABLE pcb (id int PRIMARY KEY, title text, body text);
+INSERT INTO pcb SELECT g, 'title ' || g, 'alpha beta gamma ' || g FROM generate_series(1, 300) g;
+-- One unambiguously top-ranked row, so the assertion below does not depend on how
+-- equal-scoring rows tie-break.
+INSERT INTO pcb VALUES (999, 'title top', 'alpha alpha alpha alpha alpha');
+CREATE INDEX pcb_idx ON pcb USING bm25_native (title, body) WITH (store_positions = true);
+SELECT bm25_seal('pcb_idx');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SET enable_seqscan = off;
+SELECT count(*) AS alpha_matches FROM pcb WHERE title @@@ 'alpha';
+ alpha_matches 
+---------------
+           301
+(1 row)
+
+SELECT id AS top_ranked FROM pcb WHERE title @@@ 'alpha' ORDER BY title &@@ 'alpha' LIMIT 1;
+ top_ranked 
+------------
+        999
+(1 row)
+
+-- A post-build DELETE + a second INSERT exercises the LIVEDOCS chain_read_at path
+-- (mark-dead) and drains a fresh pending doc through bm25_pending_term_entry_span
+-- again on the next seal.
+DELETE FROM pcb WHERE id = 1;
+INSERT INTO pcb VALUES (1000, 'title new', 'alpha delta epsilon');
+SELECT bm25_seal('pcb_idx');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT count(*) AS alpha_matches_after_churn FROM pcb WHERE title @@@ 'alpha';
+ alpha_matches_after_churn 
+---------------------------
+                       301
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE pcb;
+DROP EXTENSION bm25_native;

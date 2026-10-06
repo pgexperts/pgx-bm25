@@ -1,0 +1,265 @@
+-- 45_m2b_acceptance: end-to-end M2b (block-max WAND) acceptance (ROADMAP
+-- parity lens).
+-- The milestone's user-facing gate: WAND must be a pure ACCELERATION of the exhaustive
+-- ranked scan, never a different answer. One realistic multi-field corpus (title +
+-- body, title-heavy 5.0/1.0 boost per ROADMAP §1a) of 6000 docs -- big enough that each
+-- query term spans many 128-posting blocks, so the comparisons below exercise genuine
+-- block-max pruning, not a corpus too small to ever skip anything (a "WAND" that just
+-- decodes every block would also pass on a tiny corpus; see 44_wand_skip's own framing).
+--
+-- Four query shapes, each compared bit-for-bit between bm25_native.wand_top_k=100 (WAND on,
+-- the shipped default) and =0 (exhaustive, forced): single-term, multi-term (implicit
+-- OR), field-scoped (title:term), and a BM25F multi-field multi-term query where a term
+-- co-occurs in BOTH boosted fields of the same docs (forces the per-field summation the
+-- WAND driver must fold in identical order to the exhaustive scorer -- 43_wand_parity's
+-- trap #2). The GUC-disable bar (wand_top_k=0 reproduces pre-M2b behavior) is the same
+-- comparison read the other way: =0 IS "WAND disabled", so every WAND-vs-exhaustive
+-- equality below doubles as that gate. Over-pull (a LIMIT past a small wand_top_k, and no
+-- LIMIT at all) proves the executor's tail-fallback rebuild is exact, not just the
+-- initial capped top-k.
+--
+-- Every assertion compares the FULL ordered id list (array_agg over a LIMIT-bearing
+-- subquery, per the 40_m4_acceptance/44_wand_skip idiom), never a bare count -- a dropped
+-- or reordered doc at the wand_top_k boundary must fail the gate, not slip through as an
+-- unchanged row count. Bit-identity alone is not enough to prove the milestone, though:
+-- WAND is correct regardless of whether it actually prunes anything, so EACH of the four
+-- shapes carries its OWN follow-up "pruned" assertion (deep_check_skips > 0 OR
+-- blocks_skipped > 0 from bm25_wand_stats, at the same k) right after its equality check.
+-- A corpus that prunes on three shapes and silently fails to on a fourth must fail the
+-- suite, not slip through because only one shape's stats were ever sampled.
+CREATE EXTENSION bm25_native;
+-- The corpus: 6000 realistic multi-field docs, title (boost 5.0) + body (boost 1.0), a small
+-- shared vocabulary distributed by modulus so each term's postings span many blocks:
+--   title:  'negligence' every 40th doc (150), 'liability' every 25th (240),
+--           'contract' every 10th (600, SAME rows as body's 'contract' below --
+--           the multi-field co-occurrence the BM25F query needs), always 'brief',
+--           plus a 'filler' run sized by g%13 (a modulus distinct from every other
+--           pad/filler below) purely to vary title LENGTH doc-to-doc.
+--   body:   'liability' every 4th doc (1500), 'negligence' every 15th (400),
+--           'damages' every 3rd (2000), 'contract' every 10th (600), plus a
+--           'pad' run sized by g%11 so doc lengths vary realistically.
+-- The first 100 docs are "landmark" briefs -- a handful that discuss every term
+-- heavily in BOTH title and body, as a real corpus has a few central documents and a
+-- long tail of merely-adjacent ones. Being the LOWEST docids, they land in the first
+-- block(s) of every term's posting list, so they fill the top-k heap and raise theta
+-- almost immediately; the long uniform "peripheral" tail behind them is where the
+-- block-max deep check (bm25_wand.c's bsum < theta shallow-skip -- the milestone's
+-- headline mechanism) then gets real work to do, rather than a corpus whose scores are
+-- too uniform for any block's upper bound to ever fall below theta.
+--
+-- Landmark enrichment covers BOTH fields, and each field's repeat count is keyed off
+-- g by its own small modulus (distinct per term/field) rather than one fixed template,
+-- for two reasons verified empirically while authoring this suite:
+--   (a) a landmark corpus enriched ONLY in body concentrates high scorers for
+--       body-touching queries, but the title boost (5.0x) dominates an unscoped
+--       single-term or title-scoped query, so its top scorers were smeared across the
+--       WHOLE 6000-doc range instead of clustering at the first 100 ids, and pruning
+--       never engaged (deep_check_skips stayed 0 or negligible on those shapes even
+--       though other shapes pruned fine);
+--   (b) giving every landmark the exact SAME title+body text (one fixed template) ties
+--       the entire top-k at one identical score -- every WAND==exhaustive equality
+--       still passes (WAND is correct whether or not it prunes), but the block-max
+--       bound has nothing left to discriminate on. Per-doc tf variety breaks that tie
+--       without needing 100 distinct templates.
+CREATE TABLE briefs (id int PRIMARY KEY, title text, body text)
+    WITH (autovacuum_enabled = off);
+INSERT INTO briefs SELECT g,
+  CASE WHEN g <= 100 THEN
+      concat_ws(' ', repeat('liability ', 3 + (g % 6)), repeat('negligence ', 2 + (g % 5)),
+                      repeat('contract ', 3 + (g % 7)), 'brief', repeat('filler ', g % 4))
+    ELSE
+      concat_ws(' ',
+        CASE WHEN g % 40 = 0 THEN 'negligence' END,
+        CASE WHEN g % 25 = 0 THEN 'liability' END,
+        CASE WHEN g % 10 = 0 THEN 'contract' END,
+        'brief',
+        repeat('filler ', g % 13))
+  END,
+  CASE WHEN g <= 100 THEN
+      concat_ws(' ', repeat('liability ', 8 + (g % 9)), repeat('damages ', 8 + (g % 7)),
+                      repeat('contract ', 8 + (g % 11)), repeat('negligence ', 4 + (g % 6)),
+                      repeat('pad ', g % 13))
+    ELSE
+      concat_ws(' ',
+        CASE WHEN g % 4  = 0 THEN 'liability' END,
+        CASE WHEN g % 15 = 0 THEN 'negligence' END,
+        CASE WHEN g % 3  = 0 THEN 'damages' END,
+        CASE WHEN g % 10 = 0 THEN 'contract' END,
+        repeat('pad ', g % 11))
+  END
+FROM generate_series(1, 6000) g;
+CREATE INDEX briefs_bm25 ON briefs USING bm25_native (title, body) INCLUDE (id)
+    WITH (key_field = 'id', boost_title = '5.0', boost_body = '1.0');
+SELECT bm25_seal('briefs_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SET enable_seqscan = off;
+-- Sanity: this corpus is not a WAND-parity toy -- the block-max deep check's own
+-- shallow-skip (deep_check_skips; see 44_wand_skip's Gate 1b framing of it as the
+-- milestone's headline mechanism, distinct from plain pivot-alignment skipping) really
+-- does fire at the shipped default (wand_top_k=100). Each of the four shapes below gets
+-- its OWN "pruned" assertion right after its WAND==exhaustive equality (not just one
+-- representative query up front) -- see the per-shape comments for why that matters.
+-- ============================================================================
+-- (1) Single-term query: 'liability' (title every 25th + body every 4th doc).
+-- ============================================================================
+SET bm25_native.wand_top_k = 100;
+WITH w AS (SELECT id FROM briefs WHERE title @@@ 'liability'
+             ORDER BY title &@@ 'liability' LIMIT 25)
+SELECT array_agg(id) AS ids FROM w \gset single_wand_
+SET bm25_native.wand_top_k = 0;
+WITH e AS (SELECT id FROM briefs WHERE title @@@ 'liability'
+             ORDER BY title &@@ 'liability' LIMIT 25)
+SELECT array_agg(id) AS ids FROM e \gset single_exh_
+SELECT :'single_wand_ids'::int[] = :'single_exh_ids'::int[] AS single_term_wand_eq_exhaustive;
+ single_term_wand_eq_exhaustive 
+--------------------------------
+ t
+(1 row)
+
+-- Genuine-pruning gate: bit-identity above is necessary but not sufficient -- WAND is
+-- correct whether or not it prunes anything, so confirm this shape ACTUALLY exercises
+-- the block-max shallow-skip (deep_check_skips) or the cross-block bypass
+-- (blocks_skipped) at the same k, rather than silently degrading to "decode every
+-- block" (which would also pass the equality above).
+SELECT (deep_check_skips > 0 OR blocks_skipped > 0) AS single_term_pruned
+FROM bm25_wand_stats('briefs_bm25', 'liability', 25);
+ single_term_pruned 
+--------------------
+ t
+(1 row)
+
+-- ============================================================================
+-- (2) Multi-term query (implicit OR across terms/fields): 'negligence liability'.
+-- ============================================================================
+SET bm25_native.wand_top_k = 100;
+WITH w AS (SELECT id FROM briefs WHERE title @@@ 'negligence liability'
+             ORDER BY title &@@ 'negligence liability' LIMIT 25)
+SELECT array_agg(id) AS ids FROM w \gset multi_wand_
+SET bm25_native.wand_top_k = 0;
+WITH e AS (SELECT id FROM briefs WHERE title @@@ 'negligence liability'
+             ORDER BY title &@@ 'negligence liability' LIMIT 25)
+SELECT array_agg(id) AS ids FROM e \gset multi_exh_
+SELECT :'multi_wand_ids'::int[] = :'multi_exh_ids'::int[] AS multi_term_wand_eq_exhaustive;
+ multi_term_wand_eq_exhaustive 
+-------------------------------
+ t
+(1 row)
+
+-- Genuine-pruning gate (see the single-term shape above for why this is needed
+-- alongside the bit-identity check).
+SELECT (deep_check_skips > 0 OR blocks_skipped > 0) AS multi_term_pruned
+FROM bm25_wand_stats('briefs_bm25', 'negligence liability', 25);
+ multi_term_pruned 
+-------------------
+ t
+(1 row)
+
+-- ============================================================================
+-- (3) Field-scoped query: 'title:negligence' -- ONLY the 150 title hits, never
+-- the 400 body-only 'negligence' docs (a scope bug would pull those in too).
+-- ============================================================================
+SET bm25_native.wand_top_k = 100;
+WITH w AS (SELECT id FROM briefs WHERE title @@@ 'title:negligence'
+             ORDER BY title &@@ 'title:negligence' LIMIT 25)
+SELECT array_agg(id) AS ids FROM w \gset field_wand_
+SET bm25_native.wand_top_k = 0;
+WITH e AS (SELECT id FROM briefs WHERE title @@@ 'title:negligence'
+             ORDER BY title &@@ 'title:negligence' LIMIT 25)
+SELECT array_agg(id) AS ids FROM e \gset field_exh_
+SELECT :'field_wand_ids'::int[] = :'field_exh_ids'::int[] AS field_scoped_wand_eq_exhaustive;
+ field_scoped_wand_eq_exhaustive 
+---------------------------------
+ t
+(1 row)
+
+-- Genuine-pruning gate (see the single-term shape above). This shape is the one that
+-- most needs it: a title-only query is where a body-only landmark enrichment (an
+-- earlier version of this corpus) failed to concentrate high scorers early, and where
+-- exact ties among same-tf title matches (also fixed above) left nothing for the
+-- block-max bound to discriminate on.
+SELECT (deep_check_skips > 0 OR blocks_skipped > 0) AS field_scoped_pruned
+FROM bm25_wand_stats('briefs_bm25', 'title:negligence', 25);
+ field_scoped_pruned 
+---------------------
+ t
+(1 row)
+
+-- ============================================================================
+-- (4) BM25F multi-field multi-term query: 'contract damages liability'. 'contract'
+-- co-occurs in BOTH the boosted title (5.0) and unboosted body (1.0) of the same
+-- 600 docs, forcing the driver to fold two field-postings for one term into a
+-- candidate's running score -- exactly the summation-order trap 43_wand_parity's
+-- BM25F case (B) isolates, now proven end to end over the acceptance corpus.
+-- ============================================================================
+SET bm25_native.wand_top_k = 100;
+WITH w AS (SELECT id FROM briefs WHERE title @@@ 'contract damages liability'
+             ORDER BY title &@@ 'contract damages liability' LIMIT 25)
+SELECT array_agg(id) AS ids FROM w \gset bm25f_wand_
+SET bm25_native.wand_top_k = 0;
+WITH e AS (SELECT id FROM briefs WHERE title @@@ 'contract damages liability'
+             ORDER BY title &@@ 'contract damages liability' LIMIT 25)
+SELECT array_agg(id) AS ids FROM e \gset bm25f_exh_
+SELECT :'bm25f_wand_ids'::int[] = :'bm25f_exh_ids'::int[] AS bm25f_wand_eq_exhaustive;
+ bm25f_wand_eq_exhaustive 
+--------------------------
+ t
+(1 row)
+
+-- Genuine-pruning gate (see the single-term shape above).
+SELECT (deep_check_skips > 0 OR blocks_skipped > 0) AS bm25f_pruned
+FROM bm25_wand_stats('briefs_bm25', 'contract damages liability', 25);
+ bm25f_pruned 
+--------------
+ t
+(1 row)
+
+-- ============================================================================
+-- Over-pull: force a small wand_top_k (5, far below any query's match count above)
+-- so the initial WAND build caps out well short of what's asked for, then confirm
+-- the executor's lazy exhaustive-tail rebuild (bm25_scan.c's force_exhaustive
+-- re-run once rcur reaches the capped nranked) recovers the FULL exact order --
+-- both with an explicit LIMIT past the cap and with no LIMIT at all (a plain
+-- count(*) over the ordered scan drains every ranked row).
+-- ============================================================================
+SET bm25_native.wand_top_k = 5;
+WITH w AS (SELECT id FROM briefs WHERE title @@@ 'liability'
+             ORDER BY title &@@ 'liability' LIMIT 50)
+SELECT array_agg(id) AS ids FROM w \gset overpull_wand_
+SET bm25_native.wand_top_k = 0;
+WITH e AS (SELECT id FROM briefs WHERE title @@@ 'liability'
+             ORDER BY title &@@ 'liability' LIMIT 50)
+SELECT array_agg(id) AS ids FROM e \gset overpull_exh_
+SELECT :'overpull_wand_ids'::int[] = :'overpull_exh_ids'::int[] AS overpull_limit50_matches_exhaustive;
+ overpull_limit50_matches_exhaustive 
+-------------------------------------
+ t
+(1 row)
+
+-- No LIMIT at all: the executor drains every ranked row well past wand_top_k=5.
+-- Compare full-drain COUNTS (an id-for-id array_agg here would just re-assert the
+-- LIMIT-50 prefix already pinned above, over thousands more rows for no extra
+-- discriminating power -- 40_m4_acceptance's tail block uses the identical count-only
+-- shape for its no-LIMIT case).
+SET bm25_native.wand_top_k = 5;
+SELECT count(*) AS n FROM (
+  SELECT id FROM briefs WHERE title @@@ 'liability' ORDER BY title &@@ 'liability'
+) w \gset overpull_all_wand_
+SET bm25_native.wand_top_k = 0;
+SELECT count(*) AS n FROM (
+  SELECT id FROM briefs WHERE title @@@ 'liability' ORDER BY title &@@ 'liability'
+) e \gset overpull_all_exh_
+SELECT :overpull_all_wand_n AS wand_full_count, :overpull_all_exh_n AS exhaustive_full_count,
+       (:overpull_all_wand_n = :overpull_all_exh_n) AS overpull_full_count_matches_exhaustive;
+ wand_full_count | exhaustive_full_count | overpull_full_count_matches_exhaustive 
+-----------------+-----------------------+----------------------------------------
+            1752 |                  1752 | t
+(1 row)
+
+RESET bm25_native.wand_top_k;
+RESET enable_seqscan;
+DROP TABLE briefs;
+DROP EXTENSION bm25_native;

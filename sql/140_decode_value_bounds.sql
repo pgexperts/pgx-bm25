@@ -1,0 +1,307 @@
+-- 140_decode_value_bounds -- in-range values the decode boundaries used to trust (issue
+-- #303 D, F, G, H, I). Each section forges one value with the raw page lever
+-- (bm25_debug_poke_page, aimed by bm25_debug_layout; see 136_page_lever) or with an
+-- existing stamp lever, shows the reader now raising ERRCODE_INDEX_CORRUPTED (XX002)
+-- where it used to answer, then puts the bytes back and shows the index healthy again.
+--
+-- Endian-independent: every value poked is either bytes read back off the page (a swap,
+-- a restore) or reads the same either way round (\xffffffff, \x07070707, \x00, \x0707).
+CREATE EXTENSION bm25_native;
+SET enable_seqscan = off;
+
+-- The query's single-value answer as text, or SQLSTATE + message. Block numbers are
+-- normalised away: they depend on BLCKSZ and the build's page order, not on the check.
+CREATE FUNCTION pg_temp.res_of(q text) RETURNS text AS $$
+DECLARE r text;
+BEGIN
+    EXECUTE q INTO r;
+    RETURN coalesce(r, '<null>');
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' ' || regexp_replace(SQLERRM, 'block \d+', 'block N', 'g');
+END; $$ LANGUAGE plpgsql;
+
+-- Read n bytes of a page through the lever: write a filler, then write back what it
+-- replaced. Two Generic WAL records and the page ends byte-identical but for pd_lsn.
+-- The filler must leave a header the lever accepts, which zeros in pd_lower do not.
+CREATE FUNCTION pg_temp.peek(i regclass, b bigint, o int, n int, fill text DEFAULT '00')
+RETURNS bytea AS $$
+DECLARE old bytea;
+BEGIN
+    old := bm25_debug_poke_page(i, b, o, decode(repeat(fill, n), 'hex'));
+    PERFORM bm25_debug_poke_page(i, b, o, old);
+    RETURN old;
+END; $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION pg_temp.lay(s text, f text) RETURNS int AS $$
+    SELECT off FROM bm25_debug_layout() WHERE struct = s AND field = f;
+$$ LANGUAGE sql;
+CREATE FUNCTION pg_temp.size_of(s text) RETURNS int AS $$
+    SELECT size FROM bm25_debug_layout() WHERE struct = s AND field = '*';
+$$ LANGUAGE sql;
+
+-- The first block of the index whose page kind has the given flag bit.
+CREATE FUNCTION pg_temp.blk_of(i regclass, kind int) RETURNS bigint AS $$
+    SELECT min(b) FROM generate_series(0, bm25_debug_npages(i) - 1) b
+     WHERE bm25_debug_page_flags(i, b::int) & kind <> 0;
+$$ LANGUAGE sql;
+
+-- pd_lower of a page, without assuming a byte order: on the nearly empty pages this
+-- suite reads it is below 256, so one of its two bytes is zero and exactly one reading
+-- of them is the smaller. The filler \x1818 (6168 either way round) is a pd_lower the
+-- lever accepts on such a page.
+CREATE FUNCTION pg_temp.pd_lower(i regclass, b bigint) RETURNS int AS $$
+    SELECT least(get_byte(x, 0) + 256 * get_byte(x, 1), 256 * get_byte(x, 0) + get_byte(x, 1))
+      FROM pg_temp.peek(i, b, pg_temp.lay('PageHeaderData', 'pd_lower'), 2, '18') AS x;
+$$ LANGUAGE sql;
+
+-- Page offset of the first pending record's entry for `term`, found by searching the
+-- head page's live bytes for the term rather than by computing the record's header
+-- region (whose doclen array the layout table does not describe).
+CREATE FUNCTION pg_temp.pending_term_off(i regclass, term text) RETURNS int AS $$
+    SELECT pg_temp.lay('page', 'contents') - 1
+           + position(convert_to(term, 'UTF8') IN
+                      pg_temp.peek(i, bm25_debug_pending_head(i), pg_temp.lay('page', 'contents'),
+                                   pg_temp.pd_lower(i, bm25_debug_pending_head(i))
+                                   - pg_temp.lay('page', 'contents')))
+           - pg_temp.size_of('BM25PendingTermEntry');
+$$ LANGUAGE sql;
+
+-- ======================================================= 1. fieldcfg field_id (#303.D)
+-- bm25_fieldcfg_read checked the page kind, field_count and the entry count, never that
+-- entry i carries field_id i. The scan resolves "field:" to fields[f].field_id raw and
+-- the phrase recheck indexes its stash by it with no bound of its own, so an id past
+-- field_count over-read the heap; 0xFFFFFFFF is BM25_FIELD_ALL as int32 and silently
+-- widened a scoped query to every field; two swapped ids answered one column's query
+-- from the other.
+CREATE TABLE fc (id int PRIMARY KEY, title text, body text);
+INSERT INTO fc VALUES (1, 'alpha', 'zulu'), (2, 'zulu', 'alpha beta'), (3, 'beta', 'gamma');
+CREATE INDEX fc_bm ON fc USING bm25_native (title, body);
+SELECT bm25_seal('fc_bm');
+
+CREATE FUNCTION pg_temp.fc_id_off(i int) RETURNS int AS $$
+    SELECT pg_temp.lay('page', 'contents') + pg_temp.size_of('BM25FieldConfigHeader')
+         + i * pg_temp.size_of('BM25FieldConfig') + pg_temp.lay('BM25FieldConfig', 'field_id');
+$$ LANGUAGE sql;
+CREATE TEMP TABLE fc_saved AS
+SELECT pg_temp.blk_of('fc_bm', 1024) AS blk,
+       pg_temp.peek('fc_bm', pg_temp.blk_of('fc_bm', 1024), pg_temp.fc_id_off(0), 4) AS id0,
+       pg_temp.peek('fc_bm', pg_temp.blk_of('fc_bm', 1024), pg_temp.fc_id_off(1), 4) AS id1;
+
+-- Healthy: each scope answers from its own column.
+SELECT pg_temp.res_of($q$SELECT array_agg(id ORDER BY id)::text FROM fc WHERE title @@@ 'body:alpha'$q$)
+       AS body_alpha;
+SELECT pg_temp.res_of($q$SELECT array_agg(id ORDER BY id)::text FROM fc WHERE title @@@ 'title:alpha'$q$)
+       AS title_alpha;
+
+-- Entry 1 carries BM25_FIELD_ALL: 'body:alpha' used to match title's alpha too.
+SELECT length(bm25_debug_poke_page('fc_bm', blk, pg_temp.fc_id_off(1), '\xffffffff')) FROM fc_saved;
+SELECT pg_temp.res_of($q$SELECT array_agg(id ORDER BY id)::text FROM fc WHERE title @@@ 'body:alpha'$q$)
+       AS field_all;
+SELECT pg_temp.res_of($q$SELECT count(*)::text FROM bm25_debug_fieldcfg('fc_bm')$q$)
+       AS field_all_debug_probe;
+
+-- Entry 1 carries an id far past field_count: 'body:alpha' used to match nothing.
+SELECT length(bm25_debug_poke_page('fc_bm', blk, pg_temp.fc_id_off(1), '\x07070707')) FROM fc_saved;
+SELECT pg_temp.res_of($q$SELECT array_agg(id ORDER BY id)::text FROM fc WHERE title @@@ 'body:alpha'$q$)
+       AS past_field_count;
+
+-- The two entries' ids swapped, both in range: 'body:alpha' used to answer from title.
+SELECT length(bm25_debug_poke_page('fc_bm', blk, pg_temp.fc_id_off(0), id1)),
+       length(bm25_debug_poke_page('fc_bm', blk, pg_temp.fc_id_off(1), id0)) FROM fc_saved;
+SELECT pg_temp.res_of($q$SELECT array_agg(id ORDER BY id)::text FROM fc WHERE title @@@ 'body:alpha'$q$)
+       AS swapped;
+
+-- Restored: the index answers as before.
+SELECT length(bm25_debug_poke_page('fc_bm', blk, pg_temp.fc_id_off(0), id0)),
+       length(bm25_debug_poke_page('fc_bm', blk, pg_temp.fc_id_off(1), id1)) FROM fc_saved;
+SELECT pg_temp.res_of($q$SELECT array_agg(id ORDER BY id)::text FROM fc WHERE title @@@ 'body:alpha'$q$)
+       AS restored;
+DROP TABLE fc;
+
+-- ======================================================= 2. sealed positions ascend (#303.F)
+-- One document, 'alpha alpha': the segment's whole POS chain is the one frame
+-- [tf=2][delta 0][delta 1]. Its last byte zeroed makes the list {0, 0}, which the
+-- decoder used to hand to the phrase matcher (whose slot assignment Asserts the
+-- order) and to the merge replay.
+CREATE TABLE pz (id int PRIMARY KEY, body text);
+INSERT INTO pz VALUES (1, 'alpha alpha');
+CREATE INDEX pz_bm ON pz USING bm25_native (body);
+SELECT bm25_seal('pz_bm');
+CREATE TEMP TABLE pz_saved AS
+SELECT pg_temp.blk_of('pz_bm', 4096) AS blk,
+       pg_temp.peek('pz_bm', pg_temp.blk_of('pz_bm', 4096), pg_temp.lay('page', 'contents'), 3)
+       AS frame;
+SELECT frame AS healthy_frame FROM pz_saved;
+SELECT pg_temp.res_of($q$SELECT string_agg(pos::text, ',' ORDER BY pos) FROM bm25_debug_seg_positions('pz_bm', 'alpha')$q$)
+       AS positions_before;
+SELECT pg_temp.res_of($q$SELECT array_agg(id)::text FROM pz WHERE body @@@ '"alpha alpha"'$q$)
+       AS phrase_before;
+
+SELECT length(bm25_debug_poke_page('pz_bm', blk, pg_temp.lay('page', 'contents') + 2, '\x00'))
+  FROM pz_saved;
+SELECT pg_temp.res_of($q$SELECT string_agg(pos::text, ',' ORDER BY pos) FROM bm25_debug_seg_positions('pz_bm', 'alpha')$q$)
+       AS zero_delta_positions;
+SELECT pg_temp.res_of($q$SELECT array_agg(id)::text FROM pz WHERE body @@@ '"alpha alpha"'$q$)
+       AS zero_delta_phrase;
+-- The first delta is pos[0] itself, so a zero there is legitimate and decodes.
+SELECT length(bm25_debug_poke_page('pz_bm', blk, pg_temp.lay('page', 'contents'), frame))
+  FROM pz_saved;
+SELECT pg_temp.res_of($q$SELECT array_agg(id)::text FROM pz WHERE body @@@ '"alpha alpha"'$q$)
+       AS restored_phrase;
+DROP TABLE pz;
+
+-- ======================================================= 3. pending positions ascend (#303.F)
+-- The same frame on a pending record: [delta 0][delta 1] after the term bytes. Zeroing
+-- the second delta used to reach the phrase stash unchecked and to seal silently into
+-- a segment; both now refuse. The refused seal leaves the record queued, so the bytes
+-- can be put back and the seal retried.
+CREATE TABLE pp (id int PRIMARY KEY, body text);
+CREATE INDEX pp_bm ON pp USING bm25_native (body);
+INSERT INTO pp VALUES (1, 'alpha alpha');
+CREATE TEMP TABLE pp_saved AS
+SELECT bm25_debug_pending_head('pp_bm') AS blk,
+       pg_temp.pending_term_off('pp_bm', 'alpha') AS te;
+-- The blob is pos_bytes long and follows the 5 term bytes.
+SELECT pg_temp.peek('pp_bm', blk, te + pg_temp.size_of('BM25PendingTermEntry') + 5, 2) AS healthy_blob
+  FROM pp_saved;
+SELECT pg_temp.res_of($q$SELECT array_agg(id)::text FROM pp WHERE body @@@ '"alpha alpha"'$q$)
+       AS pending_phrase_before;
+
+SELECT length(bm25_debug_poke_page('pp_bm', blk, te + pg_temp.size_of('BM25PendingTermEntry') + 6, '\x00'))
+  FROM pp_saved;
+SELECT pg_temp.res_of($q$SELECT array_agg(id)::text FROM pp WHERE body @@@ '"alpha alpha"'$q$)
+       AS pending_zero_delta_phrase;
+SELECT pg_temp.res_of($q$SELECT bm25_seal('pp_bm')::text$q$) AS pending_zero_delta_seal;
+
+SELECT length(bm25_debug_poke_page('pp_bm', blk, te + pg_temp.size_of('BM25PendingTermEntry') + 6, '\x01'))
+  FROM pp_saved;
+SELECT pg_temp.res_of($q$SELECT bm25_seal('pp_bm')::text$q$) AS restored_seal;
+SELECT pg_temp.res_of($q$SELECT string_agg(pos::text, ',' ORDER BY pos) FROM bm25_debug_seg_positions('pp_bm', 'alpha')$q$)
+       AS sealed_positions;
+DROP TABLE pp;
+
+-- ======================================================= 4. segment field_count (#303.G)
+-- bm25_field_corpus_stats zeroed the per-field sums up to the metapage's field_count
+-- and summed up to the segment header's. A header claiming fewer fields left field 1's
+-- N_field and sumdoclen at zero with no error -- the avgdl behind every BM25F score.
+-- bm25_debug_stamp_seg_field_count writes the header's field_count; writing the true
+-- value back restores the index.
+CREATE TABLE fs (id int PRIMARY KEY, title text, body text);
+INSERT INTO fs SELECT g, 'alpha ' || g, 'beta gamma ' || g FROM generate_series(1, 20) g;
+CREATE INDEX fs_bm ON fs USING bm25_native (title, body);
+SELECT bm25_seal('fs_bm');
+SELECT field_id, ndocs_field, total_len_field FROM bm25_debug_field_stats('fs_bm') ORDER BY field_id;
+
+SELECT bm25_debug_stamp_seg_field_count('fs_bm', 0, 1);
+SELECT pg_temp.res_of($q$SELECT string_agg(field_id || ':' || ndocs_field || ':' || total_len_field, ' ' ORDER BY field_id) FROM bm25_debug_field_stats('fs_bm')$q$)
+       AS fewer_fields_stats;
+SELECT pg_temp.res_of($q$SELECT count(*)::text FROM (SELECT id FROM fs WHERE title @@@ 'beta' ORDER BY title &@@ 'beta' LIMIT 5) s$q$)
+       AS fewer_fields_ranked;
+
+SELECT bm25_debug_stamp_seg_field_count('fs_bm', 0, 2);
+SELECT field_id, ndocs_field, total_len_field FROM bm25_debug_field_stats('fs_bm') ORDER BY field_id;
+DROP TABLE fs;
+
+-- ======================================================= 5. pending field_id (#303.H)
+-- The drain skipped a term entry whose field_id was past the index's field_count (an
+-- Assert(false) in a cassert build), sealing the document without those postings.
+-- It now refuses, as the merge path does on the same value; the record stays queued,
+-- so the bytes can be put back and the seal retried.
+CREATE TABLE pf (id int PRIMARY KEY, body text);
+CREATE INDEX pf_bm ON pf USING bm25_native (body);
+INSERT INTO pf VALUES (1, 'alpha beta');
+CREATE TEMP TABLE pf_saved AS
+SELECT bm25_debug_pending_head('pf_bm') AS blk,
+       pg_temp.pending_term_off('pf_bm', 'alpha')
+       + pg_temp.lay('BM25PendingTermEntry', 'field_id') AS fid;
+SELECT pg_temp.peek('pf_bm', blk, fid, 2) AS healthy_field_id FROM pf_saved;
+SELECT length(bm25_debug_poke_page('pf_bm', blk, fid, '\x0707')) FROM pf_saved;
+SELECT pg_temp.res_of($q$SELECT bm25_seal('pf_bm')::text$q$) AS field_id_past_field_count_seal;
+SELECT length(bm25_debug_poke_page('pf_bm', blk, fid, '\x0000')) FROM pf_saved;
+SELECT pg_temp.res_of($q$SELECT bm25_seal('pf_bm')::text$q$) AS restored_seal;
+SELECT pg_temp.res_of($q$SELECT array_agg(id)::text FROM pf WHERE body @@@ 'alpha'$q$) AS sealed_alpha;
+DROP TABLE pf;
+
+-- ======================================================= 6. key config from the stamp (#303.I)
+-- Both ranking builders learn the index's key config before projecting ranked-row
+-- keys. With no keyed segment they used to ask the pending records, so a keyless index
+-- walked and decoded its whole pending chain a second time on every ranked scan. A
+-- stamped index (#292, ADR 0112) now answers from the stamp; only an unstamped one
+-- still walks, to the end, because there a keyed record can follow keyless ones.
+--
+-- The witness is a pending record whose key tag is not a key type: the walk validates
+-- the tag and raises, the stamp path never reads it. That the stamped scans below
+-- answer over a corrupt tag is the point -- it shows they did not walk -- and the drain
+-- still refuses the record at the next seal. wand_top_k = 0 sends the same query
+-- through the exhaustive builder instead of WAND.
+CREATE TABLE kl (id int PRIMARY KEY, body text);
+CREATE INDEX kl_bm ON kl USING bm25_native (body);
+INSERT INTO kl VALUES (1, 'alpha beta'), (2, 'alpha gamma'), (3, 'beta gamma');
+SELECT stamped, key_type FROM bm25_debug_keystamp('kl_bm');
+-- The head page's first record starts at the page contents.
+CREATE TEMP TABLE kl_saved AS
+SELECT blk, kt, pg_temp.peek('kl_bm', blk, kt, 1) AS healthy
+  FROM (SELECT bm25_debug_pending_head('kl_bm') AS blk,
+               pg_temp.lay('page', 'contents') + pg_temp.lay('BM25PendingDocHeader', 'key_type')
+               AS kt) x;
+SELECT healthy AS healthy_key_type FROM kl_saved;
+SELECT length(bm25_debug_poke_page('kl_bm', blk, kt, '\x7f')) FROM kl_saved;
+
+SELECT pg_temp.res_of($q$SELECT array_agg(id ORDER BY id)::text FROM (SELECT id FROM kl WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha' LIMIT 5) s$q$)
+       AS stamped_wand;
+SET bm25_native.wand_top_k = 0;
+SELECT pg_temp.res_of($q$SELECT array_agg(id ORDER BY id)::text FROM (SELECT id FROM kl WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha' LIMIT 5) s$q$)
+       AS stamped_exhaustive;
+RESET bm25_native.wand_top_k;
+
+-- Unstamped (an index built before #292): the fallback walk meets the tag again.
+SELECT bm25_debug_clear_keystamp('kl_bm');
+SELECT pg_temp.res_of($q$SELECT array_agg(id ORDER BY id)::text FROM (SELECT id FROM kl WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha' LIMIT 5) s$q$)
+       AS unstamped_wand;
+SET bm25_native.wand_top_k = 0;
+SELECT pg_temp.res_of($q$SELECT array_agg(id ORDER BY id)::text FROM (SELECT id FROM kl WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha' LIMIT 5) s$q$)
+       AS unstamped_exhaustive;
+RESET bm25_native.wand_top_k;
+
+SELECT length(bm25_debug_poke_page('kl_bm', blk, kt, healthy)) FROM kl_saved;
+SELECT pg_temp.res_of($q$SELECT array_agg(id ORDER BY id)::text FROM (SELECT id FROM kl WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha' LIMIT 5) s$q$)
+       AS unstamped_restored;
+DROP TABLE kl;
+
+-- A stamped KEYED index whose whole corpus is pending (#204) still projects its keys:
+-- the stamp carries the type and width the walk used to find on the first record.
+CREATE TABLE kk (id int PRIMARY KEY, body text);
+CREATE INDEX kk_bm ON kk USING bm25_native (body) INCLUDE (id) WITH (key_field = 'id');
+INSERT INTO kk VALUES (1, 'alpha beta'), (2, 'alpha gamma'), (3, 'beta gamma');
+SELECT stamped, key_column FROM bm25_debug_keystamp('kk_bm');
+SELECT array_agg(id ORDER BY id) AS keyed_ids, bool_and(scored) AS every_key_scored
+  FROM (SELECT id, bm25_score_key(id) > 0 AS scored
+          FROM kk WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha' LIMIT 5) s;
+DROP TABLE kk;
+
+-- ------------------------------------------- the posting field-id gap, after #303.G
+-- 78_trust_boundary_bounds reached the posting-side field-id guard (an id in the
+-- field_count..BM25_MAX_FIELDS gap, which bm25_field_rle_decode admits) by stamping the
+-- header's field_count down. Section 4's cross-check now stops that first, so the gap
+-- is reachable only through a corrupt field RLE, with the header intact. One term in
+-- one field: the POST chain is one block whose RLE is the single pair (field 1, run 5),
+-- right after the 5 one-byte docid deltas and the 5 one-byte tfs. The query names the
+-- FIRST key column: an unscoped query matches every field whichever column it names,
+-- and naming the second one is not indexable, so the planner would take a seqscan.
+CREATE TABLE rl (id int PRIMARY KEY, title text, body text);
+INSERT INTO rl SELECT g, NULL, 'gamma' FROM generate_series(1, 5) g;
+CREATE INDEX rl_bm ON rl USING bm25_native (title, body);
+SELECT bm25_seal('rl_bm');
+CREATE TEMP TABLE rl_saved AS
+SELECT pg_temp.blk_of('rl_bm', 16) AS blk,
+       pg_temp.lay('page', 'contents') + pg_temp.size_of('BM25BlockHeader') + 2 * 5 AS rle;
+SELECT pg_temp.peek('rl_bm', blk, rle, 2) AS healthy_rle FROM rl_saved;
+SELECT pg_temp.res_of($q$SELECT count(*)::text FROM (SELECT id FROM rl WHERE title @@@ 'gamma' ORDER BY title &@@ 'gamma' LIMIT 5) s$q$)
+       AS gap_ranked_before;
+SELECT length(bm25_debug_poke_page('rl_bm', blk, rle, '\x05')) FROM rl_saved;
+SELECT pg_temp.res_of($q$SELECT count(*)::text FROM (SELECT id FROM rl WHERE title @@@ 'gamma' ORDER BY title &@@ 'gamma' LIMIT 5) s$q$)
+       AS gap_ranked;
+DROP TABLE rl;
+
+RESET enable_seqscan;
+DROP EXTENSION bm25_native;

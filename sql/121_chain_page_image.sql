@@ -1,0 +1,176 @@
+-- 121_chain_page_image -- the query readers' NORMS, DOCMAP and KEYMAP cursors serve a
+-- lookup on the page the previous one landed on from a copy of that page, not from
+-- the buffer (issue #267).
+--
+-- What the file pins down:
+--   * the copy returns the page's bytes: on a shape where nearly every lookup is a
+--     same-page one (a frequent term over one segment whose NORMS, DOCMAP and KEYMAP
+--     span several pages), every ranked path returns the same rows, scores and keys as
+--     an identical table whose documents are all still pending. Pending documents are
+--     scored without reading any segment chain, so that table is an oracle the copies
+--     cannot reach. A copy served for the wrong page (a lookup on the next page answered
+--     from the previous one) gives some rows another document's length, TID or key;
+--   * the saving, as buffer accesses per scored posting, which fails on the pre-change
+--     build, where every NORMS and DOCMAP lookup was a ReadBuffer.
+CREATE EXTENSION bm25_native;
+
+-- One sealed segment of 5,000 two-field documents, built by CREATE INDEX on the loaded
+-- table. Per document NORMS holds 8 bytes (two fields), DOCMAP 6 and the int4 KEYMAP 4,
+-- so the three chains span about 5, 4 and 3 pages. 'common' is in every body and in
+-- every third title; tf (1-3) and doclen (0-96 pads) vary so scores are nearly unique
+-- and not monotone in id.
+CREATE TABLE pi_seg (id int PRIMARY KEY, title text, body text) WITH (autovacuum_enabled = off);
+INSERT INTO pi_seg
+SELECT g,
+       CASE WHEN g % 3 = 0 THEN 'common head' ELSE 'head t' || (g % 7) END,
+       repeat('common ', 1 + g % 3) || repeat('pad ', (g * 7919) % 97) || 'x' || (g % 5)
+  FROM generate_series(1, 5000) g;
+CREATE INDEX pi_seg_bm ON pi_seg USING bm25_native (title, body) INCLUDE (id)
+    WITH (key_field = 'id', boost_title = '3.0', boost_body = '1.0');
+
+-- The same rows in the same heap order, left in the pending list.
+SET bm25_native.seal_threshold = '1GB';
+CREATE TABLE pi_pend (id int PRIMARY KEY, title text, body text) WITH (autovacuum_enabled = off);
+CREATE INDEX pi_pend_bm ON pi_pend USING bm25_native (title, body) INCLUDE (id)
+    WITH (key_field = 'id', boost_title = '3.0', boost_body = '1.0');
+INSERT INTO pi_pend SELECT * FROM pi_seg ORDER BY id;
+
+SELECT count(*) AS segs, sum(ndocs) AS ndocs FROM bm25_debug_segcat('pi_seg_bm');
+SELECT nsegs, pending_ndocs FROM bm25_stats('pi_pend_bm');
+SELECT count(*) AS keymap_entries, count(DISTINCT key_int4) AS distinct_keys
+  FROM bm25_debug_seg_keymap('pi_seg_bm', 0);
+
+-- Every query is run against both tables; a row of the result is (rank, id, score),
+-- with the score read back through bm25_score_key(id), which goes through the ranked
+-- row's KEYMAP key. Ties order by TID, and both heaps were filled in id order.
+CREATE FUNCTION pg_temp.ranked(tbl text, q text, n int) RETURNS TABLE (rnk bigint, id int, s float8) AS $$
+BEGIN
+  RETURN QUERY EXECUTE format(
+    'SELECT row_number() OVER (), id, bm25_score_key(id) FROM
+       (SELECT id FROM %I WHERE title @@@ %s ORDER BY title &@@ %s LIMIT %s) r', tbl, q, q, n);
+END
+$$ LANGUAGE plpgsql;
+
+CREATE TEMP TABLE q (name text PRIMARY KEY, expr text, n int);
+INSERT INTO q VALUES
+  ('frequent',      $$'common'$$, 2000),
+  ('two_terms',     $$'common x1'$$, 2000),
+  ('title_boosted', $$'head common'$$, 2000),
+  ('phrase',        $$'"common pad"'$$, 2000),
+  ('boolean',       $$bm25_boolean(must => ARRAY[bm25_term('body', 'common'),
+                                              bm25_term('body', 'x3')])$$, 1000);
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+
+-- WAND at k = 10, 100 and 1000, and the exhaustive scorer (wand_top_k = 0; the phrase
+-- and the boolean tree go there at any setting). Counts rows whose id or score differ
+-- from the pending table's at the same rank.
+CREATE FUNCTION pg_temp.diff(k int) RETURNS TABLE (name text, nrows bigint, wrong bigint) AS $$
+BEGIN
+  EXECUTE format('SET bm25_native.wand_top_k = %s', k);
+  RETURN QUERY
+  SELECT q.name, count(*),
+         count(*) FILTER (WHERE a.id IS DISTINCT FROM b.id OR a.s IS DISTINCT FROM b.s)
+    FROM q,
+         LATERAL pg_temp.ranked('pi_seg', q.expr, CASE WHEN k = 0 THEN q.n ELSE least(k, q.n) END) a
+         FULL JOIN LATERAL pg_temp.ranked('pi_pend', q.expr,
+                                          CASE WHEN k = 0 THEN q.n ELSE least(k, q.n) END) b
+                ON a.rnk = b.rnk
+   GROUP BY q.name ORDER BY q.name;
+END
+$$ LANGUAGE plpgsql;
+
+SELECT 'wand_10' AS mode, * FROM pg_temp.diff(10);
+SELECT 'wand_100' AS mode, * FROM pg_temp.diff(100);
+SELECT 'wand_1000' AS mode, * FROM pg_temp.diff(1000);
+SELECT 'exhaustive' AS mode, * FROM pg_temp.diff(0);
+
+-- The @@@ collector's TIDs, through the executor. (The index's first column carries
+-- the query for every field; a second-column @@@ is not an index qual.)
+SELECT (SELECT count(*) FROM pi_seg WHERE title @@@ 'x1') AS seg_rows,
+       (SELECT array_agg(id ORDER BY id) FROM pi_seg WHERE title @@@ 'x1')
+         = (SELECT array_agg(id ORDER BY id) FROM pi_pend WHERE title @@@ 'x1') AS same_ids;
+
+-- ------------------------------------------------------------------ the saving
+-- Buffer accesses of the top plan node; see 117 for why FORMAT JSON and why ratios.
+CREATE FUNCTION pg_temp.bufs(q text) RETURNS bigint AS $$
+DECLARE
+  plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF, FORMAT JSON) ' || q
+     INTO plan;
+  RETURN (plan -> 0 -> 'Plan' ->> 'Shared Hit Blocks')::bigint
+       + (plan -> 0 -> 'Plan' ->> 'Shared Read Blocks')::bigint;
+END
+$$ LANGUAGE plpgsql;
+
+-- Before the change a scored (term, document) pair cost one NORMS ReadBuffer per field
+-- posting and the candidate one DOCMAP ReadBuffer, and the exhaustive build and the
+-- @@@ collector likewise per posting (plus a KEYMAP read per ranked row). Measured on
+-- the pre-change build: WAND 11,996 accesses for 5,000 scored pairs, exhaustive 18,459,
+-- the @@@ filter 6,850 for 5,000 rows. With the page copies each chain costs about one
+-- access per page: 233, 130 and 185. The bound, a quarter access per pair or row, sits
+-- far from both.
+SET bm25_native.wand_top_k = 100;
+SELECT count(*) AS warmed FROM pg_temp.bufs(
+  $$SELECT id FROM pi_seg WHERE title @@@ 'common' ORDER BY title &@@ 'common' LIMIT 100$$);
+SELECT s.docs_scored > 1000 AS scored_many,
+       pg_temp.bufs($$SELECT id FROM pi_seg WHERE title @@@ 'common'
+                      ORDER BY title &@@ 'common' LIMIT 100$$) < s.docs_scored / 4 AS wand_reads_copies
+  FROM bm25_wand_stats('pi_seg_bm', 'common', 100) s;
+SET bm25_native.wand_top_k = 0;
+SELECT pg_temp.bufs($$SELECT id FROM pi_seg WHERE title @@@ 'common'
+                      ORDER BY title &@@ 'common' LIMIT 100$$) < 5000 / 4 AS exhaustive_reads_copies;
+SELECT pg_temp.bufs($$SELECT count(*) FROM pi_seg WHERE title @@@ 'common'$$) < 5000 / 4
+       AS filter_reads_copies;
+
+RESET bm25_native.wand_top_k;
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+RESET bm25_native.seal_threshold;
+-- Many segments (72 sealed segments of 60 documents, keyed), against the same rows
+-- held all-pending: the key cache crosses segments and reaches its 64-image cap (the
+-- last 8 readers fall back to per-lookup reads), and WAND's per-segment context is
+-- rebuilt per segment. Single-page chains cannot misfire on a block mismatch, so this
+-- adds coverage of the cross-segment paths, not discrimination; the one-segment
+-- cases above are the discriminating ones.
+SET bm25_native.seal_threshold = '1GB';
+CREATE TABLE ms (id int PRIMARY KEY, title text, body text) WITH (autovacuum_enabled = off);
+CREATE INDEX ms_bm ON ms USING bm25_native (title, body) INCLUDE (id)
+    WITH (key_field = 'id', boost_title = '3.0', boost_body = '1.0');
+DO $$ BEGIN
+  FOR b IN 0..71 LOOP
+    INSERT INTO ms SELECT g,
+       CASE WHEN g % 3 = 0 THEN 'common head' ELSE 'head t' || (g % 7) END,
+       repeat('common ', 1 + g % 3) || repeat('pad ', (g * 7919) % 97) || 'x' || (g % 5)
+      FROM generate_series(b*60+1, b*60+60) g;
+    PERFORM bm25_seal('ms_bm');
+  END LOOP; END $$;
+CREATE TABLE mp (LIKE ms INCLUDING ALL) WITH (autovacuum_enabled = off);
+CREATE INDEX mp_bm ON mp USING bm25_native (title, body) INCLUDE (id)
+    WITH (key_field = 'id', boost_title = '3.0', boost_body = '1.0');
+INSERT INTO mp SELECT * FROM ms ORDER BY id;
+SELECT count(*) AS segs FROM bm25_debug_segcat('ms_bm');
+SELECT nsegs, pending_ndocs FROM bm25_stats('mp_bm');
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+CREATE FUNCTION pg_temp.ms_ranked(tbl text, q text, n int) RETURNS TABLE (rnk bigint, id int, s float8) AS $f$
+BEGIN RETURN QUERY EXECUTE format(
+ 'SELECT row_number() OVER (), id, bm25_score_key(id) FROM (SELECT id FROM %I WHERE title @@@ %s ORDER BY title &@@ %s LIMIT %s) r', tbl, q, q, n);
+END $f$ LANGUAGE plpgsql;
+CREATE FUNCTION pg_temp.ms_cmp(k int, q text, n int) RETURNS TABLE (topk int, qry text, nrows bigint, wrong bigint) AS $f$
+BEGIN EXECUTE format('SET bm25_native.wand_top_k = %s', k);
+ RETURN QUERY SELECT k, q, count(*), count(*) FILTER (WHERE a.id IS DISTINCT FROM b.id OR a.s IS DISTINCT FROM b.s)
+  FROM pg_temp.ms_ranked('ms', q, n) a FULL JOIN pg_temp.ms_ranked('mp', q, n) b ON a.rnk = b.rnk;
+END $f$ LANGUAGE plpgsql;
+SELECT * FROM pg_temp.ms_cmp(0, $$'common'$$, 4320);
+SELECT * FROM pg_temp.ms_cmp(0, $$'common x1'$$, 4320);
+SELECT * FROM pg_temp.ms_cmp(0, $$'"common pad"'$$, 4320);
+SELECT * FROM pg_temp.ms_cmp(1000, $$'common'$$, 1000);
+SELECT * FROM pg_temp.ms_cmp(100, $$'head common'$$, 100);
+SELECT * FROM pg_temp.ms_cmp(10, $$'common x1'$$, 10);
+SELECT (SELECT array_agg(id ORDER BY id) FROM ms WHERE title @@@ 'x1') = (SELECT array_agg(id ORDER BY id) FROM mp WHERE title @@@ 'x1') AS same_ids;
+RESET bm25_native.wand_top_k;
+DROP TABLE ms, mp;
+DROP TABLE pi_seg, pi_pend;
+DROP EXTENSION bm25_native;

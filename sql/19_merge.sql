@@ -1,0 +1,130 @@
+CREATE EXTENSION bm25_native;
+
+-- Waits until no other backend in this database holds a snapshot, so the VACUUM
+-- below can tombstone doc 1 instead of finding it merely "recently dead". See
+-- docs/adr/0031-vacuum-tests-wait-for-xmin-horizon.md for the full rationale.
+CREATE FUNCTION pg_temp.wait_for_xmin_horizon() RETURNS void AS $$
+DECLARE
+  deadline timestamptz := clock_timestamp() + interval '30 seconds';
+BEGIN
+  LOOP
+    PERFORM pg_stat_clear_snapshot();
+    EXIT WHEN NOT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND backend_xmin IS NOT NULL);
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION
+        'xmin horizon still held by another backend after 30s; VACUUM cannot reclaim';
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+CREATE TABLE docs (id int primary key, body text);
+-- Seal four small same-size segments by inserting + sealing in batches. Each batch
+-- carries a DISTINCT high-idf term (alpha/beta/gamma/delta, df=50 each) on top of the
+-- shared low-idf 'database storage' (df=200). This makes a two-term query genuinely
+-- NON-UNIFORM: 'alpha database' scores the 50 alpha docs far above the 150 non-alpha
+-- docs (idf('alpha')≈1.38 dwarfs idf('database')≈0.003), so the top-k is a real ranked
+-- tier the merge must preserve — not the all-tied id-order a single shared term gives.
+INSERT INTO docs SELECT g, 'alpha database storage'  FROM generate_series(1,50)   g;
+CREATE INDEX docs_bm25 ON docs USING bm25_native (body);          -- segment 0 (build)
+INSERT INTO docs SELECT g, 'beta database storage'   FROM generate_series(51,100) g;
+SELECT bm25_seal('docs_bm25');                              -- segment 1
+INSERT INTO docs SELECT g, 'gamma database storage'  FROM generate_series(101,150) g;
+SELECT bm25_seal('docs_bm25');                              -- segment 2
+INSERT INTO docs SELECT g, 'delta database storage'  FROM generate_series(151,200) g;
+SELECT bm25_seal('docs_bm25');                              -- segment 3
+-- Four same-layer segments => policy proposes merging at least two of them.
+SELECT count(*) AS proposed FROM bm25_debug_merge_plan('docs_bm25') WHERE chosen;
+
+SET enable_seqscan = off;
+-- Capture the 4-segment state BEFORE any VACUUM. VACUUM now runs an opportunistic
+-- vacuum-cadence merge (bm25_vacuumcleanup -> bm25_merge_maybe), so the consolidating
+-- merge below is driven by the VACUUM, not a separate bm25_merge() call; nsegs_before
+-- must be read here while the four same-layer segments still exist.
+SELECT nsegs AS nsegs_before FROM bm25_stats('docs_bm25');
+-- 'alpha' is carried only by docs 1..50, so its posting count is the clean tombstone
+-- probe: 50 physical postings now, 49 after the merge rebuilds it from live docs only.
+SELECT count(*) AS alpha_postings_before FROM bm25_debug_postings('docs_bm25') WHERE term = 'alpha';
+-- Delete doc 1, then snapshot the ranking: MVCC already hides doc 1 from the result, so
+-- rank_before excludes it and matches the post-merge ranking (no spurious diff from the
+-- deletion itself). The alpha tier (live ids 2..50) scores far above the database-only
+-- docs, so top-5 is the five lowest live alpha ids.
+DELETE FROM docs WHERE id = 1;
+SELECT array_agg(id) AS rank_before
+FROM (SELECT id FROM docs WHERE body @@@ 'alpha database'
+        ORDER BY body &@@ 'alpha database', id LIMIT 5) s \gset
+-- VACUUM tombstones dead doc 1 (bulkdelete) and then the vacuum-cadence merge
+-- consolidates the four same-layer segments into one, physically dropping doc 1.
+-- alpha_postings_after (below) only reads 49 if THIS VACUUM's bulkdelete phase
+-- actually tombstoned doc 1, so wait for the horizon first.
+SELECT pg_temp.wait_for_xmin_horizon();
+-- The cleanup merges, retiring the inputs, and its orphan sweep then runs with those
+-- retired RANGE entries present: the merge's swap leaves the evidence that makes the
+-- gated sweep run (issue #300), and the counter pins that it did.
+SELECT bm25_debug_orphan_sweeps() AS sweeps_before \gset
+VACUUM docs;
+SELECT bm25_debug_orphan_sweeps() - :sweeps_before AS merge_vacuum_swept;
+SELECT nsegs AS nsegs_after FROM bm25_stats('docs_bm25');
+-- All live docs (199 = 200 - dropped doc 1) still match the shared term.
+SELECT count(*) AS still_matching FROM docs WHERE body @@@ 'database';
+-- The retired list holds one RANGE entry per merged-away segment (Task 24).
+SELECT bm25_debug_retired_count('docs_bm25') > 0 AS has_retired;
+-- Tombstone PHYSICALLY dropped: the merge rebuilt 'alpha' from live docs only, so its
+-- posting count falls 50 -> 49 (dead doc 1 gone, not merely hidden). If the merge's
+-- liveness skip (idmap[d] == UINT32_MAX) regressed, this would still read 50.
+SELECT count(*) AS alpha_postings_after FROM bm25_debug_postings('docs_bm25') WHERE term = 'alpha';
+-- Exact ranking unchanged: the post-merge top-5 for 'alpha database' is byte-identical
+-- to the pre-merge snapshot (the alpha tier survives the dense-docid reassignment).
+SELECT (array_agg(id) = :'rank_before'::int[]) AS ranking_unchanged
+FROM (SELECT id FROM docs WHERE body @@@ 'alpha database'
+        ORDER BY body &@@ 'alpha database', id LIMIT 5) s;
+-- Non-uniformity guard: every top-5 hit is an alpha doc (id <= 50). If the merge lost
+-- the 'alpha' postings, these docs would collapse into the database-only tier and the
+-- top-5 would no longer be all-alpha — so this is what makes ranking_unchanged a real
+-- relevance check rather than an id-order check.
+SELECT bool_and(id <= 50) AS top5_all_alpha
+FROM (SELECT id FROM docs WHERE body @@@ 'alpha database'
+        ORDER BY body &@@ 'alpha database', id LIMIT 5) s;
+-- Dropped doc 1 never reappears in a ranked result.
+SELECT count(*) AS doc1_present FROM docs WHERE body @@@ 'database' AND id = 1;
+-- VACUUM exercises bm25_reclaim_orphans with retired RANGE entries present (Fix 2):
+-- the merged-away segments' data pages are unreachable from the live catalog but must
+-- NOT be freed (they are retired, awaiting horizon reclamation). A query that still
+-- needs those pages must keep matching all 199 live docs; with the bug VACUUM would
+-- free them and the query could read recycled/garbage pages (or trip cassert). (The
+-- horizon-gated drain + reuse is gated discriminatingly by 20_merge_reclaim; here we
+-- only assert VACUUM-with-retired-present is non-destructive.) The orphan sweep is
+-- gated (issue #300): the sweep that ran with the RANGE entries present was the
+-- previous VACUUM's, right after its merge retired them (merge_vacuum_swept above);
+-- this one has no evidence and skips it, and must be just as non-destructive.
+VACUUM docs;
+SELECT count(*) AS still_matching_after_vacuum FROM docs WHERE body @@@ 'database';
+RESET enable_seqscan;
+DROP TABLE docs;
+
+-- v4: a MERGED segment must carry the same header fields a sealed segment does. The
+-- merge does NO header writing of its own; it routes through the shared
+-- bm25_segment_build_orphans writer, so this is a regression guard that the merge
+-- path keeps inheriting the v4 header. The only header field bm25_stats surfaces is
+-- field_count (asserted = 1 below); the reserved pos_root/keymap_root and the
+-- length-prefixed total_len_by_field have no SQL surface and are not asserted here.
+CREATE TABLE mfield(id int primary key, body text);
+INSERT INTO mfield SELECT g, 'storage engine term' || (g % 13) FROM generate_series(1, 1500) g;
+CREATE INDEX mfield_bm25 ON mfield USING bm25_native (body);
+INSERT INTO mfield SELECT g, 'storage extra alpha' FROM generate_series(1501, 2000) g;
+SELECT bm25_seal('mfield_bm25');
+INSERT INTO mfield SELECT g, 'storage extra beta' FROM generate_series(2001, 2500) g;
+SELECT bm25_seal('mfield_bm25');
+SELECT bm25_merge('mfield_bm25');
+-- field_count surfaced by bm25_stats stays 1 in M3 across the merge.
+SELECT field_count = 1 AS merged_field_count_ok FROM bm25_stats('mfield_bm25');
+-- All docs still match post-merge (header rebuilt, postings intact).
+SELECT count(*) = 2500 AS merged_all_match FROM mfield WHERE body @@@ 'storage';
+DROP TABLE mfield;
+
+DROP EXTENSION bm25_native;

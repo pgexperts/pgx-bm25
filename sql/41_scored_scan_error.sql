@@ -1,0 +1,55 @@
+-- 41_scored_scan_error.sql — a runtime error evaluated in the TARGET LIST of a
+-- scored (`&@@`) index scan must raise a CLEAN ERROR, not a backend FATAL.
+--
+-- Regression guard for a `return` inside a PG_TRY block in
+-- bm25_scan_build_ranking (the seg_gen-retry subtransaction wrapper). Returning
+-- out of PG_TRY skips PG_END_TRY, which is what restores PG_exception_stack; the
+-- wrapper thus left PG_exception_stack pointing at its now-dead sigjmp_buf, so the
+-- NEXT ereport in the same statement — a target-list `id/0` projected by the
+-- scored scan's output — longjmp'd into the reclaimed frame, re-entered the CATCH
+-- arm, and called RollbackAndReleaseCurrentSubTransaction on an already-released
+-- subxact => FATAL ("unexpected state ..."). Bug dates to M2a (the multi-source
+-- scored union); reproduces whenever the bm25_native ORDERED index scan is chosen.
+--
+-- Discrimination: with the bug, the first scored query below FATALs, the backend
+-- dies, and every statement after it (including the liveness SELECT) reports
+-- "server closed the connection" — a large expected-output diff. With the fix,
+-- each bad query errors cleanly and the backend keeps serving.
+
+CREATE EXTENSION bm25_native;
+
+CREATE TABLE sse (id int, body text);
+INSERT INTO sse SELECT g, 'alpha bravo charlie' FROM generate_series(1, 40) g;
+CREATE INDEX sse_bm25 ON sse USING bm25_native (body);
+-- Seal a real segment: the scored scan the wrapper wraps runs over sealed segments.
+SELECT bm25_seal('sse_bm25');
+
+-- Force the bm25_native ORDERED index scan (amcanorderbyop): that path runs
+-- bm25_scan_build_ranking (the wrapper). A seqscan+sort would bypass it entirely.
+SET enable_seqscan = off;
+
+-- (a) target-list division-by-zero, projected by the scored scan, implicit txn.
+SELECT id/0 FROM sse WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha' LIMIT 5;
+
+-- (b) same, inside an EXPLICIT transaction block (a different outer TBLOCK state).
+BEGIN;
+SELECT id/0 FROM sse WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha' LIMIT 5;
+ROLLBACK;
+
+-- (c) the same statement error twice in a row must still be clean (the retry loop /
+--     exception stack stays consistent across repeated scored scans in one session).
+SELECT id/0 FROM sse WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha' LIMIT 5;
+
+-- BACKEND SURVIVED: the session is still usable after the clean errors above.
+-- (With the bug this line — and everything above from statement (a) on — would show
+-- "server closed the connection".) Order-free count, so no score-tie nondeterminism.
+SELECT count(*) AS backend_alive FROM sse WHERE body @@@ 'alpha';
+
+-- And the scored scan itself still returns correct ranked rows post-error.
+SELECT count(*) AS scored_ok
+FROM (SELECT id FROM sse WHERE body @@@ 'alpha'
+      ORDER BY body &@@ 'alpha' LIMIT 100) s;
+
+RESET enable_seqscan;
+DROP TABLE sse;
+DROP EXTENSION bm25_native;

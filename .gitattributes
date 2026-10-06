@@ -1,0 +1,6 @@
+# Vendored third-party corpus data (see data/README.md): committed and
+# checked out byte-for-byte, no CRLF<->LF conversion. One upstream file
+# (scifact_qrels.data) genuinely ships CRLF-terminated; normalizing it would
+# silently break the documented md5/cmp byte-identity check against BEIR's
+# published zip on every future clone.
+data/*.data -text

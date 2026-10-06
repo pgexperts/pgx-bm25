@@ -1,0 +1,11 @@
+name: bm25_native
+package_basename: bm25-native
+version: "1.0"
+# 17+, not 16+: src/bm25.h has a HARD #error floor at PG_VERSION_NUM < 170000
+# (PG16's planner will not build an incremental-sort path over an
+# amcanorderbyop index). Advertising 16+ does not get a PG16 user a working
+# build -- it gets them a compile that dies on the #error, instead of a clean
+# refusal at package resolution. Keep in step with the #error and the CI matrix.
+pgversions: "17+"
+summary: BM25 index access method for PostgreSQL
+description: BM25-ranked full-text index extension for PostgreSQL, by PGX.

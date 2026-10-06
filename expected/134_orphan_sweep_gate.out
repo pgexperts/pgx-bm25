@@ -1,0 +1,248 @@
+-- 134_orphan_sweep_gate -- issue #300: VACUUM's orphan sweep runs only on evidence.
+--
+-- bm25_reclaim_orphans marks every live chain and visits every block of the index,
+-- throttled, and it used to do that on EVERY VACUUM while holding the seal/merge
+-- singleton that every document-adding INSERT needs. It now runs only when the
+-- metapage says an orphan, or a free page the FSM lost, can exist:
+--   - the index was never swept by a binary that keeps the evidence (a new index);
+--   - a maintenance op opened its orphan bracket and never closed it (it died, or it
+--     is a merge/upgrade swap, which orphans the old catalog chain by design);
+--   - the last completed sweep ran in an earlier server lifetime (crash epoch;
+--     t/029 covers that half, a regression suite cannot crash the server).
+--
+-- The skip is asserted BEHAVIOURALLY as well as through the counters: under a
+-- throttle that makes a sweep of this index take far longer than the statement
+-- timeout (about 12 s at 20 ms per page; measured 6 s at 10 ms), a VACUUM with no
+-- evidence must finish well inside it. Before the gate every VACUUM swept, and that
+-- statement ERRORs with a statement timeout. An unthrottled VACUUM goes first each
+-- time, so the heap is all-visible and VACUUM's own heap pass skips it; that VACUUM
+-- must not sweep either, and the counter says so.
+--
+-- bm25_debug_orphan_sweeps() counts sweeps THIS backend ran past the gate.
+CREATE EXTENSION bm25_native;
+CREATE TABLE og (id int, body text) WITH (autovacuum_enabled = off);
+INSERT INTO og
+SELECT g, (SELECT string_agg('w' || ((g * k) % 4999), ' ') FROM generate_series(1, 40) k)
+  FROM generate_series(1, 20000) g;
+CREATE INDEX og_bm25 ON og USING bm25_native (body);
+SELECT bm25_debug_npages('og_bm25') > 400 AS big_enough_to_be_slow;
+ big_enough_to_be_slow 
+-----------------------
+ t
+(1 row)
+
+-- A new index has never been swept: its first VACUUM sweeps, and records it.
+SELECT ops_begun, ops_done, swept_this_epoch FROM bm25_debug_sweep_evidence('og_bm25');
+ ops_begun | ops_done | swept_this_epoch 
+-----------+----------+------------------
+         0 |        0 | f
+(1 row)
+
+SELECT bm25_debug_orphan_sweeps() AS s0 \gset
+VACUUM og;
+SELECT bm25_debug_orphan_sweeps() - :s0 AS new_index_swept;
+ new_index_swept 
+-----------------
+               1
+(1 row)
+
+SELECT ops_begun, ops_done, swept_this_epoch FROM bm25_debug_sweep_evidence('og_bm25');
+ ops_begun | ops_done | swept_this_epoch 
+-----------+----------+------------------
+         0 |        0 | t
+(1 row)
+
+-- The throttled, timed VACUUM a sweep could not survive.
+\set throttle 'SET vacuum_cost_delay = 20; SET vacuum_cost_limit = 1; SET statement_timeout = ''5s'''
+\set unthrottle 'RESET vacuum_cost_delay; RESET vacuum_cost_limit; RESET statement_timeout'
+-- (1) Nothing happened since the sweep: no sweep, and the throttled VACUUM is fast.
+:throttle;
+VACUUM og;
+:unthrottle;
+SELECT bm25_debug_orphan_sweeps() - :s0 AS idle_vacuum_did_not_sweep;
+ idle_vacuum_did_not_sweep 
+---------------------------
+                         1
+(1 row)
+
+-- (2) A seal opens its bracket before it builds and closes it after its truncate,
+--     so a successful seal leaves no evidence and the next VACUUM does not sweep.
+INSERT INTO og SELECT g, 'sealed later ' || g FROM generate_series(20001, 20400) g;
+SELECT bm25_seal('og_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+SELECT ops_begun > 0 AS seal_bracketed, ops_begun = ops_done AS seal_closed
+  FROM bm25_debug_sweep_evidence('og_bm25');
+ seal_bracketed | seal_closed 
+----------------+-------------
+ t              | t
+(1 row)
+
+VACUUM og;
+:throttle;
+VACUUM og;
+:unthrottle;
+SELECT bm25_debug_orphan_sweeps() - :s0 AS seal_left_no_sweep;
+ seal_left_no_sweep 
+--------------------
+                  1
+(1 row)
+
+-- (3) A seal that dies after its build (the build's pages are orphans nothing links)
+--     leaves its bracket open; the next VACUUM sweeps and frees the orphan segment's
+--     header page (BM25_PAGE_DELETED = 512), and the sweep retires the evidence.
+INSERT INTO og SELECT g, 'orphaned build ' || g FROM generate_series(20401, 20500) g;
+SELECT bm25_debug_seal_unpublished('og_bm25') AS orphan_hdr \gset
+SELECT ops_begun > ops_done AS died_seal_left_evidence FROM bm25_debug_sweep_evidence('og_bm25');
+ died_seal_left_evidence 
+-------------------------
+ t
+(1 row)
+
+SELECT bm25_debug_page_flags('og_bm25', :orphan_hdr) & 512 AS orphan_deleted_before;
+ orphan_deleted_before 
+-----------------------
+                     0
+(1 row)
+
+VACUUM og;
+SELECT bm25_debug_orphan_sweeps() - :s0 AS died_seal_swept;
+ died_seal_swept 
+-----------------
+               2
+(1 row)
+
+SELECT bm25_debug_page_flags('og_bm25', :orphan_hdr) & 512 = 512 AS orphan_freed;
+ orphan_freed 
+--------------
+ t
+(1 row)
+
+SELECT ops_begun = ops_done AS evidence_retired, swept_this_epoch
+  FROM bm25_debug_sweep_evidence('og_bm25');
+ evidence_retired | swept_this_epoch 
+------------------+------------------
+ t                | t
+(1 row)
+
+-- (4) A merge SUCCEEDS and still leaves orphans: its swap rebuilds the catalog as a
+--     fresh chain and orphans the old one, which only the sweep frees. Its bracket is
+--     therefore never closed, and the next VACUUM must sweep and free the old catalog
+--     root. Four equal segments land in one size layer, so bm25_merge() merges them.
+CREATE TABLE om (id int, body text) WITH (autovacuum_enabled = off);
+CREATE INDEX om_bm25 ON om USING bm25_native (body);
+INSERT INTO om SELECT g, 'merge layer one ' || g FROM generate_series(1, 50) g;
+SELECT bm25_seal('om_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+INSERT INTO om SELECT g, 'merge layer two ' || g FROM generate_series(51, 100) g;
+SELECT bm25_seal('om_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+INSERT INTO om SELECT g, 'merge layer three ' || g FROM generate_series(101, 150) g;
+SELECT bm25_seal('om_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+-- The new index's first sweep, while three segments are still too few for VACUUM's
+-- own opportunistic merge; the evidence is clear afterwards.
+VACUUM om;
+SELECT ops_begun = ops_done AS clear_before_merge, swept_this_epoch
+  FROM bm25_debug_sweep_evidence('om_bm25');
+ clear_before_merge | swept_this_epoch 
+--------------------+------------------
+ t                  | t
+(1 row)
+
+INSERT INTO om SELECT g, 'merge layer four ' || g FROM generate_series(151, 200) g;
+SELECT bm25_seal('om_bm25');
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+-- The live catalog chain: SEGCAT-kind (4), not DELETED (512), seg_gen 0 (a segment
+-- header is SEGCAT-kind too, but carries its segment's generation).
+CREATE FUNCTION pg_temp.catalog_pages(idx regclass) RETURNS SETOF int LANGUAGE sql AS $$
+  SELECT b FROM generate_series(1, bm25_debug_npages(idx)::int - 1) b
+   WHERE (bm25_debug_page_flags(idx, b) & (4 | 512)) = 4
+     AND bm25_debug_page_seg_gen(idx, b) = 0 $$;
+SELECT count(*) AS catalog_pages_before FROM pg_temp.catalog_pages('om_bm25');
+ catalog_pages_before 
+----------------------
+                    1
+(1 row)
+
+SELECT min(b) AS old_root FROM pg_temp.catalog_pages('om_bm25') b \gset
+SELECT bm25_merge('om_bm25');
+ bm25_merge 
+------------
+ 
+(1 row)
+
+SELECT nsegs AS nsegs_after_merge FROM bm25_stats('om_bm25');
+ nsegs_after_merge 
+-------------------
+                 1
+(1 row)
+
+-- Two catalog-kind pages now: the new chain's, and the old root, orphaned but untouched.
+SELECT count(*) AS catalog_pages_after_merge FROM pg_temp.catalog_pages('om_bm25');
+ catalog_pages_after_merge 
+---------------------------
+                         2
+(1 row)
+
+SELECT ops_begun > ops_done AS merge_left_evidence FROM bm25_debug_sweep_evidence('om_bm25');
+ merge_left_evidence 
+---------------------
+ t
+(1 row)
+
+SELECT bm25_debug_page_flags('om_bm25', :old_root) & 512 AS old_root_deleted_before;
+ old_root_deleted_before 
+-------------------------
+                       0
+(1 row)
+
+SELECT bm25_debug_orphan_sweeps() AS s1 \gset
+VACUUM om;
+SELECT bm25_debug_orphan_sweeps() - :s1 AS merge_swept;
+ merge_swept 
+-------------
+           1
+(1 row)
+
+SELECT bm25_debug_page_flags('om_bm25', :old_root) & 512 = 512 AS old_catalog_root_freed;
+ old_catalog_root_freed 
+------------------------
+ t
+(1 row)
+
+SELECT ops_begun = ops_done AS merge_evidence_retired FROM bm25_debug_sweep_evidence('om_bm25');
+ merge_evidence_retired 
+------------------------
+ t
+(1 row)
+
+SET enable_seqscan = off;
+SELECT count(*) AS merged_rows_found FROM om WHERE body @@@ 'merge';
+ merged_rows_found 
+-------------------
+               200
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE og, om;
+DROP EXTENSION bm25_native;

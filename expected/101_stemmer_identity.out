@@ -1,0 +1,231 @@
+-- 101_stemmer_identity: the analyzer fingerprint's FIRST component identifies the
+-- stemming dictionary by its SCHEMA-QUALIFIED NAME and TEMPLATE, never by its OID
+-- (#62, ADR 0080).
+--
+-- Why this needs its own suite. Every other fingerprint suite (25_analyzer,
+-- 26_fingerprint_gate, 27_m3_acceptance) runs under pg_regress's default
+-- search_path with exactly one candidate dictionary in the database, where an
+-- OID-derived identity and a name-derived one are indistinguishable: both are
+-- constant within a session, both differ between two different dictionaries.
+-- Distinguishing them takes the two cases below, and nothing in the tree produced
+-- either.
+--
+--   (A) The SAME logical dictionary with a NEW OID -- what a pg_upgrade does, since it
+--       carries index files into a cluster whose initdb renumbered english_stem
+--       without rebuilding them. Under the old scheme the fingerprint moved and every
+--       index in the database failed the scan-start gate demanding a REINDEX that
+--       would have rebuilt byte-identical segments. (A logical dump/restore was never
+--       affected: pg_dump emits CREATE INDEX, so the restore re-stamps.)
+--   (B) The SAME OID under a DIFFERENT qualified name -- ALTER ... SET SCHEMA.
+--       Under the old scheme the fingerprint did NOT move, so the recorded identity
+--       said nothing about which dictionary a scan had actually reached.
+--
+-- What this suite does NOT claim. The old OID scheme detected a shadowing dictionary
+-- perfectly well -- pg_ts_dict.oid is unique, so two different dictionaries never
+-- shared one. The defect was one-directional: an OID cannot tell "a different
+-- dictionary" from "the same dictionary, renumbered", so it over-fired. Part 2 below
+-- asserts detection because it is the behavior worth pinning, not because it changed.
+--
+-- Operand coverage, stated so a future reader does not assume more than is here.
+-- bm25_stemmer_identity hashes four strings: dict schema, dict name, template schema,
+-- template name. Three are pinned -- delete any one of them from the hash and a named
+-- assertion below fails: dict schema by Part 3, template name by Part 4, template
+-- schema by Part 4b.
+--
+-- The dict NAME is the one operand no assertion pins, and that is a property of the
+-- lookup rather than an oversight: the resolved name is ALWAYS "<language>_stem", and
+-- `language` is separately hashed as fingerprint component 2, so isolating the dict
+-- name would take two dictionaries reachable by the same unqualified lookup -- which
+-- the catalog forbids.
+--
+-- The canary in Part 2 is load-bearing, in the sense sql/85_builder_search_path
+-- established: if the shadowing dictionary is not actually what "english_stem"
+-- resolves to, every assertion after it is vacuously true and would stay true after
+-- someone reverted the fix.
+CREATE EXTENSION bm25_native;
+-- ---------------------------------------------------------------- Part 1
+-- Baseline. Build under the ordinary path, so the index binds pg_catalog's
+-- english_stem. (It could not bind anything else: since PG17 CREATE INDEX and
+-- REINDEX run under a restricted "pg_catalog, pg_temp" search_path, so only the
+-- SCAN side follows the caller. That asymmetry is why the gate exists at all.)
+CREATE TABLE sid_docs (id int primary key, body text);
+INSERT INTO sid_docs VALUES (1, 'the negligent defendants'), (2, 'a quiet contract');
+CREATE INDEX sid_bm ON sid_docs USING bm25_native (body) WITH (language = 'english');
+SELECT (bm25_stats('sid_bm')).analyzer_fingerprint AS stored_fp \gset
+SELECT bm25_debug_analyzer_fingerprint('sid_bm') = :stored_fp AS build_eq_query;
+ build_eq_query 
+----------------
+ t
+(1 row)
+
+-- ---------------------------------------------------------------- Part 2
+-- A shadowing dictionary, and the canary that proves it is reachable.
+--
+-- pg_catalog is searched implicitly FIRST, so `SET search_path = sid, public` would
+-- still resolve english_stem in pg_catalog and this suite would test nothing.
+-- Listing pg_catalog explicitly LAST is what makes sid win.
+CREATE SCHEMA sid;
+CREATE SCHEMA sid2;
+CREATE TEXT SEARCH DICTIONARY sid.english_stem (TEMPLATE = snowball, Language = english);
+SET search_path = sid, public, pg_catalog;
+-- Expect "sid". Anything else and Parts 3-5 are vacuous.
+SELECT n.nspname AS english_stem_resolves_to
+FROM pg_ts_dict d JOIN pg_namespace n ON n.oid = d.dictnamespace
+WHERE d.oid = 'english_stem'::regdictionary;
+ english_stem_resolves_to 
+--------------------------
+ sid
+(1 row)
+
+-- The shadow is a DIFFERENT dictionary object, so it must carry a different identity.
+-- This held under the OID scheme too (distinct dictionaries, distinct OIDs); it is
+-- asserted because it must keep holding, not because it is new.
+SELECT bm25_debug_analyzer_fingerprint('sid_bm') AS shadow_fp \gset
+SELECT :shadow_fp <> :stored_fp AS shadow_changes_fingerprint;
+ shadow_changes_fingerprint 
+----------------------------
+ t
+(1 row)
+
+-- ---------------------------------------------------------------- Part 3
+-- Case (B): same OID, different qualified name. ALTER ... SET SCHEMA moves the
+-- dictionary without renumbering it, so an OID-derived identity is UNCHANGED here
+-- and this assertion is the one that fails against the unfixed build.
+ALTER TEXT SEARCH DICTIONARY sid.english_stem SET SCHEMA sid2;
+SET search_path = sid2, public, pg_catalog;
+SELECT bm25_debug_analyzer_fingerprint('sid_bm') <> :shadow_fp AS identity_tracks_schema;
+ identity_tracks_schema 
+------------------------
+ t
+(1 row)
+
+-- Round trip. Moving it back restores the identity exactly: the hash is over the
+-- names, so it is reversible, not merely sensitive.
+ALTER TEXT SEARCH DICTIONARY sid2.english_stem SET SCHEMA sid;
+SET search_path = sid, public, pg_catalog;
+SELECT bm25_debug_analyzer_fingerprint('sid_bm') = :shadow_fp AS identity_round_trips;
+ identity_round_trips 
+----------------------
+ t
+(1 row)
+
+-- ---------------------------------------------------------------- Part 4
+-- Case (A): identical redefinition, new OID. This is the pg_upgrade shape -- same
+-- dictionary by every attribute that decides behavior, different number. An
+-- OID-derived identity moves here; a name-derived one must not.
+DROP TEXT SEARCH DICTIONARY sid.english_stem;
+CREATE TEXT SEARCH DICTIONARY sid.english_stem (TEMPLATE = snowball, Language = english);
+SELECT bm25_debug_analyzer_fingerprint('sid_bm') = :shadow_fp AS identity_survives_recreate;
+ identity_survives_recreate 
+----------------------------
+ t
+(1 row)
+
+-- The other half of the same coin: stability must not cost sensitivity. Same
+-- qualified name, DIFFERENT template is a different analyzer, and the identity has
+-- to move for it -- which is why the template is hashed alongside the name.
+DROP TEXT SEARCH DICTIONARY sid.english_stem;
+CREATE TEXT SEARCH DICTIONARY sid.english_stem (TEMPLATE = simple);
+SELECT bm25_debug_analyzer_fingerprint('sid_bm') <> :shadow_fp AS identity_tracks_template;
+ identity_tracks_template 
+--------------------------
+ t
+(1 row)
+
+-- ---------------------------------------------------------------- Part 4b
+-- The template's SCHEMA is the fourth hash operand, and it needs its own case: Part 4
+-- above moves the template NAME (snowball -> simple) and would stay green with the
+-- template namespace deleted from the hash.
+--
+-- Isolating it takes a template that can MOVE, which pg_catalog.snowball cannot. So
+-- bind the shadow to a private template with snowball's own C entry points -- same
+-- behavior, different address -- and then relocate only that. Nothing else shifts:
+-- ALTER TEXT SEARCH TEMPLATE ... SET SCHEMA leaves the dictionary's OID, its schema
+-- and its name alone, and leaves the template's name alone; the template namespace is
+-- the single operand that moves. (CREATE TEXT SEARCH TEMPLATE is superuser-only, which
+-- pg_regress is. This is also a third independent A/B against the pre-fix build: the
+-- dictionary OID is untouched here, so an OID-derived identity cannot move at all.)
+CREATE SCHEMA tns1;
+CREATE SCHEMA tns2;
+CREATE TEXT SEARCH TEMPLATE tns1.snow (INIT = dsnowball_init, LEXIZE = dsnowball_lexize);
+DROP TEXT SEARCH DICTIONARY sid.english_stem;
+CREATE TEXT SEARCH DICTIONARY sid.english_stem (TEMPLATE = tns1.snow, Language = english);
+-- Canary: the dictionary really is the one being resolved, and it really is bound to
+-- the movable template. Expect (sid, tns1).
+SELECT n.nspname AS dict_schema, tn.nspname AS template_schema
+FROM pg_ts_dict d
+JOIN pg_namespace n    ON n.oid  = d.dictnamespace
+JOIN pg_ts_template tm ON tm.oid = d.dicttemplate
+JOIN pg_namespace tn   ON tn.oid = tm.tmplnamespace
+WHERE d.oid = 'english_stem'::regdictionary;
+ dict_schema | template_schema 
+-------------+-----------------
+ sid         | tns1
+(1 row)
+
+SELECT bm25_debug_analyzer_fingerprint('sid_bm') AS tmpl_fp \gset
+ALTER TEXT SEARCH TEMPLATE tns1.snow SET SCHEMA tns2;
+SELECT bm25_debug_analyzer_fingerprint('sid_bm') <> :tmpl_fp AS identity_tracks_template_schema;
+ identity_tracks_template_schema 
+---------------------------------
+ t
+(1 row)
+
+-- And back, for the same reason Part 3 round-trips: sensitive is not the same as
+-- reversible, and only a hash over the names gives both.
+ALTER TEXT SEARCH TEMPLATE tns2.snow SET SCHEMA tns1;
+SELECT bm25_debug_analyzer_fingerprint('sid_bm') = :tmpl_fp AS template_schema_round_trips;
+ template_schema_round_trips 
+-----------------------------
+ t
+(1 row)
+
+-- ---------------------------------------------------------------- Part 5
+-- What the identity is FOR: the scan-start gate. Tokenization still runs through
+-- the RESOLVED dictionary (bm25_analyze takes cfg->stem_dict_oid), so nothing here
+-- stops a shadowing session from tokenizing through sid.english_stem -- the gate
+-- stopping the scan first is the whole defence, and it must fire deterministically.
+--
+-- Wrapped because the message embeds two fingerprint integers that fold the database
+-- encoding and are not stable across environments. The handler still checks the
+-- message TEXT: SQLSTATE 0A000 alone would be satisfied by any unrelated
+-- feature_not_supported raised from this statement, which is the vacuity the Part 2
+-- canary exists to rule out and would be silly to reintroduce here.
+SET enable_seqscan = off;
+DO $$
+BEGIN
+  PERFORM id FROM public.sid_docs WHERE body @@@ 'negligent';
+  RAISE EXCEPTION 'gate did NOT fire under a shadowing search_path (unexpected)';
+EXCEPTION
+  WHEN feature_not_supported THEN
+    IF SQLERRM NOT LIKE '%analyzer fingerprint mismatch%' THEN
+      RAISE EXCEPTION 'wrong feature_not_supported: %', SQLERRM;
+    END IF;
+    RAISE NOTICE 'gate fired: analyzer fingerprint mismatch, as expected';
+END $$;
+NOTICE:  gate fired: analyzer fingerprint mismatch, as expected
+-- Not sticky: with the shadow off the path the same index scans normally. A gate
+-- that stayed tripped would be indistinguishable from one that fired for the wrong
+-- reason.
+-- array_agg(... ORDER BY id) is the house shape for a MEMBERSHIP assertion: it keeps
+-- the row order out of the plan's hands entirely, which a bare ORDER BY does not.
+SET search_path = public, pg_catalog;
+SELECT array_agg(id ORDER BY id) AS matches
+FROM sid_docs WHERE body @@@ 'negligent';   -- expect {1}
+ matches 
+---------
+ {1}
+(1 row)
+
+RESET enable_seqscan;
+RESET search_path;
+DROP TABLE sid_docs;
+SET client_min_messages = warning;   -- silence the CASCADE object lists
+DROP SCHEMA sid CASCADE;             -- takes the shadow dictionary with it
+DROP SCHEMA sid2 CASCADE;
+DROP SCHEMA tns1 CASCADE;            -- and the private template
+DROP SCHEMA tns2 CASCADE;
+RESET client_min_messages;
+-- pg_regress shares ONE database across suites: a suite that leaves the extension
+-- installed breaks whichever suite runs next on CREATE EXTENSION.
+DROP EXTENSION bm25_native;

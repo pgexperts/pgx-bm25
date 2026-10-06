@@ -1,0 +1,415 @@
+-- 36_positions.sql — the M4 position stream, write + read round-trip (C-POS-BUILD).
+--
+-- Covers the whole build path: analyzer positions -> accumulator -> the SEPARATE
+-- BM25_PAGE_POS chain -> the lockstep reader with the tf-count==tf self-check ->
+-- the bm25_debug_seg_positions SRF. Specifically:
+--   * single-field positions round-trip through a seal;
+--   * multi-field with the SAME term in TWO fields (the per-posting framing case D2);
+--   * a repeated term yields monotone (ascending) positions;
+--   * a bag-of-words &@@ / @@@ scan still returns the right rows (positions do not
+--     perturb the docid/tf decode — the POST stream is byte-identical to pre-M4);
+--   * store_positions_<col>=false writes NO frames for that field (empty in the SRF)
+--     while the on-field is populated;
+--   * a legacy-shaped (positions-default) index still reads correctly.
+--
+-- Distinct, non-stopword, non-stem-colliding tokens are used throughout so there are
+-- no score ties (the M5/CI portability lesson) and positions are hand-predictable.
+CREATE EXTENSION bm25_native;
+-- ===== Single-field position round-trip through a seal =====
+-- One doc (local docid 0), field 0, tokens at positions 0,1,2,3 (all kept, none
+-- stopword). Each term's single posting frames [tf=1][pos].
+CREATE TABLE sf (id int primary key, body text) WITH (autovacuum_enabled = off);
+INSERT INTO sf VALUES (1, 'alpha bravo gamma delta');
+CREATE INDEX sf_bm25 ON sf USING bm25_native (body);
+-- Positions come back per term. field_id is always 0 here.
+SELECT seg, local_docid, field_id, pos
+FROM bm25_debug_seg_positions('sf_bm25', 'alpha') ORDER BY seg, local_docid, pos;
+ seg | local_docid | field_id | pos 
+-----+-------------+----------+-----
+   0 |           0 |        0 |   0
+(1 row)
+
+SELECT pos FROM bm25_debug_seg_positions('sf_bm25', 'bravo');
+ pos 
+-----
+   1
+(1 row)
+
+SELECT pos FROM bm25_debug_seg_positions('sf_bm25', 'gamma');
+ pos 
+-----
+   2
+(1 row)
+
+SELECT pos FROM bm25_debug_seg_positions('sf_bm25', 'delta');
+ pos 
+-----
+   3
+(1 row)
+
+DROP TABLE sf;
+-- ===== Repeated term -> monotone (ascending, delta-encoded) positions =====
+-- doc0 body = 'alpha bravo alpha gamma alpha' -> 'alpha' at 0, 2, 4 (tf=3).
+-- The frame is [tf=3][Δ0=0][Δ2-0=2][Δ4-2=2]; the reader recovers 0,2,4 ascending.
+CREATE TABLE rep (id int primary key, body text) WITH (autovacuum_enabled = off);
+INSERT INTO rep VALUES (1, 'alpha bravo alpha gamma alpha');
+CREATE INDEX rep_bm25 ON rep USING bm25_native (body);
+SELECT pos FROM bm25_debug_seg_positions('rep_bm25', 'alpha')
+ORDER BY pos;                              -- expect 0,2,4 (monotone)
+ pos 
+-----
+   0
+   2
+   4
+(3 rows)
+
+SELECT pos FROM bm25_debug_seg_positions('rep_bm25', 'bravo');   -- 1
+ pos 
+-----
+   1
+(1 row)
+
+SELECT pos FROM bm25_debug_seg_positions('rep_bm25', 'gamma'); -- 3
+ pos 
+-----
+   3
+(1 row)
+
+DROP TABLE rep;
+-- ===== Multi-field: SAME term in TWO fields (D2 per-posting framing) =====
+-- doc0: title='alpha bravo'  body='gamma alpha delta'
+--   'alpha' has TWO postings: (field 0, pos 0) and (field 1, pos 1). Each posting
+--   gets its OWN frame; the reader must attach the right positions to each field.
+CREATE TABLE mf (id int primary key, title text, body text)
+  WITH (autovacuum_enabled = off);
+INSERT INTO mf VALUES (1, 'alpha bravo', 'gamma alpha delta');
+CREATE INDEX mf_bm25 ON mf USING bm25_native (title, body);
+-- 'alpha' -> field 0 pos 0 (in title) AND field 1 pos 1 (in body, after 'gamma').
+SELECT field_id, pos FROM bm25_debug_seg_positions('mf_bm25', 'alpha')
+ORDER BY field_id, pos;
+ field_id | pos 
+----------+-----
+        0 |   0
+        1 |   1
+(2 rows)
+
+-- 'bravo' only in title (field 0, pos 1); 'delta' only in body (field 1, pos 2).
+SELECT field_id, pos FROM bm25_debug_seg_positions('mf_bm25', 'bravo')
+ORDER BY field_id, pos;
+ field_id | pos 
+----------+-----
+        0 |   1
+(1 row)
+
+SELECT field_id, pos FROM bm25_debug_seg_positions('mf_bm25', 'delta')
+ORDER BY field_id, pos;
+ field_id | pos 
+----------+-----
+        1 |   2
+(1 row)
+
+-- Bag-of-words @@@/&@@ scan STILL returns correct rows on a position-bearing index
+-- (positions live in a separate chain and must not disturb the docid/tf decode).
+SET enable_seqscan = off;
+INSERT INTO mf VALUES (2, 'echo foxtrot', 'golf hotel');
+INSERT INTO mf VALUES (3, 'india juliet', 'kilo lima');
+-- Rebuild so all three rows are one built segment (positions + bag-of-words together).
+REINDEX INDEX mf_bm25;
+SELECT id FROM mf WHERE title @@@ 'alpha' ORDER BY title &@@ 'alpha';   -- only row 1
+ id 
+----
+  1
+(1 row)
+
+SELECT id FROM mf WHERE title @@@ 'echo'  ORDER BY title &@@ 'echo';    -- only row 2
+ id 
+----
+  2
+(1 row)
+
+SELECT id FROM mf WHERE title @@@ 'kilo'  ORDER BY title &@@ 'kilo';    -- only row 3 (body)
+ id 
+----
+  3
+(1 row)
+
+DROP TABLE mf;
+-- ===== store_positions_<col>=false: one field off, one field on =====
+-- title stores positions (default), body does NOT. The same term 'alpha' appears in
+-- both fields; the debug SRF must show ONLY the title posting's positions (field 0),
+-- and NO row for the body posting (field 1) — the off-field wrote no frame, and the
+-- reader gates on the per-field bit so the two streams stay in lockstep.
+CREATE TABLE sp (id int primary key, title text, body text)
+  WITH (autovacuum_enabled = off);
+INSERT INTO sp VALUES (1, 'alpha bravo', 'gamma alpha delta');
+CREATE INDEX sp_bm25 ON sp USING bm25_native (title, body)
+  WITH (store_positions_body = false);
+-- 'alpha': title (field 0) frame present; body (field 1) frame ABSENT.
+SELECT field_id, pos FROM bm25_debug_seg_positions('sp_bm25', 'alpha')
+ORDER BY field_id, pos;
+ field_id | pos 
+----------+-----
+        0 |   0
+(1 row)
+
+-- 'gamma' is ONLY in body (off) -> no positions at all.
+SELECT count(*) AS gamma_positions
+FROM bm25_debug_seg_positions('sp_bm25', 'gamma');
+ gamma_positions 
+-----------------
+               0
+(1 row)
+
+-- 'bravo' is only in title (on) -> its one position survives.
+SELECT field_id, pos FROM bm25_debug_seg_positions('sp_bm25', 'bravo')
+ORDER BY field_id, pos;
+ field_id | pos 
+----------+-----
+        0 |   1
+(1 row)
+
+-- The bag-of-words decode is unaffected by a mixed on/off index: 'gamma' (body,
+-- positions off) still matches its row via @@@.
+SET enable_seqscan = off;
+SELECT id FROM sp WHERE title @@@ 'gamma' ORDER BY title &@@ 'gamma';
+ id 
+----
+  1
+(1 row)
+
+DROP TABLE sp;
+-- ===== Index-wide store_positions=false: NO POS chain at all =====
+-- Every field off => the segment writes no POS frames (pos_root Invalid, the pre-M4
+-- shape). The debug SRF returns zero rows for every term, but the bag-of-words scan
+-- still works (this is the "legacy-shaped" read-correctly case).
+CREATE TABLE nopos (id int primary key, body text) WITH (autovacuum_enabled = off);
+INSERT INTO nopos VALUES (1, 'alpha bravo gamma');
+CREATE INDEX nopos_bm25 ON nopos USING bm25_native (body) WITH (store_positions = false);
+SELECT count(*) AS should_be_zero
+FROM bm25_debug_seg_positions('nopos_bm25', 'alpha');
+ should_be_zero 
+----------------
+              0
+(1 row)
+
+SET enable_seqscan = off;
+SELECT id FROM nopos WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha';  -- still matches
+ id 
+----
+  1
+(1 row)
+
+DROP TABLE nopos;
+-- ===== Page-spanning frames: a term with many positions (> one POS page) =====
+-- A single doc whose body repeats 'alpha' many thousands of times gives one posting
+-- with a huge tf; its frame [tf][Δpos × tf] is > 12000 bytes (each Δ=1 is 1 varbyte),
+-- well past one 8 KB page, so the writer/reader must stream it across POS page
+-- boundaries (following nextblk mid-frame). Assert the decoded count matches tf and
+-- the positions are the full ascending run 0..N-1.
+CREATE TABLE span (id int primary key, body text) WITH (autovacuum_enabled = off);
+INSERT INTO span
+  SELECT 1, string_agg('alpha', ' ') FROM generate_series(1, 12000);
+CREATE INDEX span_bm25 ON span USING bm25_native (body);
+-- 12000 positions, all field 0, ascending 0..11999 (the tf-count==tf self-check must
+-- hold across the page-spanning decode or this errors instead of returning a count).
+SELECT count(*) AS npos, min(pos) AS minpos, max(pos) AS maxpos,
+       bool_and(pos = rn) AS strictly_dense
+FROM (SELECT pos, row_number() OVER (ORDER BY pos) - 1 AS rn
+      FROM bm25_debug_seg_positions('span_bm25', 'alpha')) s;
+ npos  | minpos | maxpos | strictly_dense 
+-------+--------+--------+----------------
+ 12000 |      0 |  11999 | t
+(1 row)
+
+DROP TABLE span;
+-- ===== Writer-gate discrimination: OFF field sorts BEFORE an ON field (D12) =====
+-- The earlier `sp` case (title ON / body OFF) is NOT enough on its own: mutating out
+-- the WRITER's per-field gate (bm25_seg_build.c `if (!store_pos[fid]) continue;`)
+-- leaves output byte-identical, because the OFF frame is written LAST and the READER
+-- independently skips it. Here we flip it: field 0 (title) is OFF and field 1 (body)
+-- is ON, with 'alpha' present in BOTH fields of the same doc. Postings are emitted in
+-- field order, so a mutated writer would write field 0's spurious [tf=1][pos=0] frame
+-- FIRST, then field 1's real [tf=1][pos=1]. The reader, gating field 0 off, would then
+-- misread field 0's bytes as field 1's frame -> field 1 pos comes back 0 (or the
+-- tf-count==tf self-check errors). Asserting field 1's position is EXACTLY 1 fails
+-- under that mutation but holds for the correct gated writer.
+CREATE TABLE wg (id int primary key, title text, body text)
+  WITH (autovacuum_enabled = off);
+INSERT INTO wg VALUES (1, 'alpha bravo', 'charlie alpha delta');
+CREATE INDEX wg_bm25 ON wg USING bm25_native (title, body)
+  WITH (store_positions_title = false);
+-- 'alpha': title (field 0, OFF) contributes NO row; body (field 1, ON) -> pos 1.
+-- Exactly one row, {field_id=1, pos=1}. A writer that wrote field 0's frame anyway
+-- would desync the body decode here.
+SELECT field_id, pos FROM bm25_debug_seg_positions('wg_bm25', 'alpha')
+ORDER BY field_id, pos;
+ field_id | pos 
+----------+-----
+        1 |   1
+(1 row)
+
+-- The writer's own record: the segment DID build a POS chain (field 1 is on).
+SELECT has_positions FROM bm25_debug_segcat('wg_bm25');
+ has_positions 
+---------------
+ t
+(1 row)
+
+DROP TABLE wg;
+-- ===== Writer observability: has_positions reflects what the WRITER built =====
+-- Finding 3/4: read-back rows alone cannot distinguish "writer skipped the chain"
+-- from "reader gated the chain off", because the reader forces zero either way.
+-- bm25_debug_segcat.has_positions reads the segment header's pos_root directly, so it
+-- witnesses the WRITER's decision independent of the reader.
+CREATE TABLE obs (id int primary key, body text) WITH (autovacuum_enabled = off);
+INSERT INTO obs VALUES (1, 'alpha bravo gamma');
+-- positions ON (default) -> the writer builds a POS chain -> has_positions = true.
+CREATE INDEX obs_on ON obs USING bm25_native (body);
+SELECT has_positions AS on_has_positions FROM bm25_debug_segcat('obs_on');
+ on_has_positions 
+------------------
+ t
+(1 row)
+
+-- positions OFF index-wide -> the writer builds NO chain (pos_root Invalid, the pre-M4
+-- shape) -> has_positions = false. This is the Finding-4 fix: count(*)=0 held even when
+-- the writer built a full chain; has_positions asserts the chain was never built.
+CREATE INDEX obs_off ON obs USING bm25_native (body) WITH (store_positions = false);
+SELECT has_positions AS off_has_positions FROM bm25_debug_segcat('obs_off');
+ off_has_positions 
+-------------------
+ f
+(1 row)
+
+DROP TABLE obs;
+-- ===== Pending path: INSERT-then-seal carries TRUE positions (Finding 1/2) =====
+-- The suite above only exercises CREATE INDEX (the ambuild path). The INSERT ->
+-- pending-list -> drain -> seal path is a SEPARATE writer. Before the fix, the drain
+-- fabricated dict-order ordinals (pos = ntok), so 'alpha bravo alpha' sealed as
+-- alpha@{0,1}, bravo@{2} — a silent wrong answer for phrase search. With true
+-- positions carried through the pending entry's posblob, it seals as the real
+-- text order alpha@{0,2}, bravo@{1}. This assertion FAILS on the pre-fix synthetic code.
+CREATE TABLE pend (id int primary key, body text) WITH (autovacuum_enabled = off);
+CREATE INDEX pend_bm25 ON pend USING bm25_native (body);   -- built empty
+-- A doc with SEVERAL distinct term entries: reading the pending list correctly now
+-- requires striding past each entry's trailing position blob. A stale stride (term
+-- bytes only, ignoring pos_bytes) would misparse the 2nd..Nth entry on the page.
+-- Tokens are stem-stable (zulu/delta/echo do not stem) so the debug SRF's raw-term
+-- lookup matches the stored term without an analyzer round-trip.
+INSERT INTO pend VALUES (1, 'alpha bravo alpha zulu');   -- lands in the pending list
+INSERT INTO pend VALUES (2, 'delta echo');               -- second pending doc
+-- Read-your-writes BEFORE any seal: the scan reads the pending list in place. Each
+-- assertion needs the multi-entry stride to be right (posblob-aware) or the later
+-- entries on the page are read as garbage. All forced onto the index scan via &@@.
+SET enable_seqscan = off;
+SELECT id FROM pend WHERE body @@@ 'zulu'  ORDER BY body &@@ 'zulu';  -- row 1 (last entry on its page)
+ id 
+----
+  1
+(1 row)
+
+SELECT id FROM pend WHERE body @@@ 'echo'  ORDER BY body &@@ 'echo';  -- row 2 (2nd pending doc)
+ id 
+----
+  2
+(1 row)
+
+SELECT id FROM pend WHERE body @@@ 'alpha' ORDER BY body &@@ 'alpha'; -- row 1 (repeated term)
+ id 
+----
+  1
+(1 row)
+
+SELECT bm25_seal('pend_bm25');                      -- drain + seal from pending
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+-- TRUE text-order positions: 'alpha' at 0 and 2 (NOT the synthetic 0,1); 'bravo' at 1.
+SELECT pos FROM bm25_debug_seg_positions('pend_bm25', 'alpha') ORDER BY pos;  -- 0, 2
+ pos 
+-----
+   0
+   2
+(2 rows)
+
+SELECT pos FROM bm25_debug_seg_positions('pend_bm25', 'bravo') ORDER BY pos;  -- 1
+ pos 
+-----
+   1
+(1 row)
+
+SELECT pos FROM bm25_debug_seg_positions('pend_bm25', 'zulu') ORDER BY pos;   -- 3
+ pos 
+-----
+   3
+(1 row)
+
+-- The pending-sealed segment carries a real POS chain (writer observability).
+SELECT has_positions FROM bm25_debug_segcat('pend_bm25');
+ has_positions 
+---------------
+ t
+(1 row)
+
+DROP TABLE pend;
+-- ===== Pending drain honors the per-field OFF gate (drain gate discrimination) =====
+-- The `pend` case above uses a default-all-on index, so it does NOT exercise the
+-- drain's per-field gate: bm25_pending_drain reads store_positions_<col> off the
+-- field-config page and calls bm25_accum_set_store_positions so a sealed-from-pending
+-- segment writes POS frames on exactly the fields a CREATE INDEX would. Deleting that
+-- gate block leaves the drained accumulator's store_positions NULL == all-on, so an
+-- OFF field would wrongly get frames. This mirrors the `wg` writer-gate case but on
+-- the SEPARATE pending-drain writer: field 0 (title) OFF, field 1 (body) ON, 'alpha'
+-- in BOTH fields of one INSERTed (pending, not ambuild) doc. Postings emit in field
+-- order, so an ungated drain writes field 0's spurious [tf=1][pos=0] frame FIRST, then
+-- field 1's real [tf=1][pos=1]; the reader, gating field 0 off, then misreads field 0's
+-- bytes as field 1's frame -> field 1 pos comes back 0 (or the tf-count==tf self-check
+-- errors). Asserting field 1's 'alpha' is EXACTLY pos 1 fails if the drain fell back to
+-- all-on but holds for the correct gated drain.
+CREATE TABLE pgate (id int primary key, title text, body text)
+  WITH (autovacuum_enabled = off);
+CREATE INDEX pgate_bm25 ON pgate USING bm25_native (title, body)
+  WITH (store_positions_title = false);       -- built empty; drain path only
+INSERT INTO pgate VALUES (1, 'alpha bravo', 'charlie alpha delta');  -- lands in pending
+SELECT bm25_seal('pgate_bm25');               -- drain + seal: exercises the gate
+ bm25_seal 
+-----------
+ 
+(1 row)
+
+-- 'alpha': title (field 0, OFF) contributes NO row; body (field 1, ON) -> pos 1.
+-- Exactly one row, {field_id=1, pos=1}. An ungated drain would emit field 0's frame
+-- and desync the body decode here.
+SELECT field_id, pos FROM bm25_debug_seg_positions('pgate_bm25', 'alpha')
+ORDER BY field_id, pos;
+ field_id | pos 
+----------+-----
+        1 |   1
+(1 row)
+
+-- The OFF field (title) has no positions at all: 'bravo' is title-only -> zero rows.
+SELECT field_id, pos FROM bm25_debug_seg_positions('pgate_bm25', 'bravo')
+ORDER BY field_id, pos;
+ field_id | pos 
+----------+-----
+(0 rows)
+
+-- The ON field's other term stands: 'delta' is body-only (field 1, pos 2).
+SELECT field_id, pos FROM bm25_debug_seg_positions('pgate_bm25', 'delta')
+ORDER BY field_id, pos;
+ field_id | pos 
+----------+-----
+        1 |   2
+(1 row)
+
+-- The drained segment still built a POS chain (field 1 is on).
+SELECT has_positions FROM bm25_debug_segcat('pgate_bm25');
+ has_positions 
+---------------
+ t
+(1 row)
+
+DROP TABLE pgate;
+DROP EXTENSION bm25_native;

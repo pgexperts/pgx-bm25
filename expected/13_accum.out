@@ -1,0 +1,23 @@
+-- 13_accum: drive the accumulator from SQL; assert dense docids, per-term df,
+-- per-doc tf, and doclen accounting. ("quick quick fox" => tf(quick)=2.)
+CREATE EXTENSION bm25_native;
+SELECT * FROM bm25_debug_accum(ARRAY[
+  'the quick brown fox',
+  'the lazy brown dog',
+  'quick quick fox'
+]) ORDER BY term, local_docid;
+ term  | df | local_docid | tf | doclen 
+-------+----+-------------+----+--------
+ brown |  2 |           0 |  1 |      4
+ brown |  2 |           1 |  1 |      4
+ dog   |  1 |           1 |  1 |      4
+ fox   |  2 |           0 |  1 |      4
+ fox   |  2 |           2 |  1 |      3
+ lazy  |  1 |           1 |  1 |      4
+ quick |  2 |           0 |  1 |      4
+ quick |  2 |           2 |  2 |      3
+ the   |  2 |           0 |  1 |      4
+ the   |  2 |           1 |  1 |      4
+(10 rows)
+
+DROP EXTENSION bm25_native;

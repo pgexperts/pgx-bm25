@@ -1,0 +1,146 @@
+-- 84_snippet_escaping_and_char_budget.sql — bm25_snippet's output contract (PR-H,
+-- #67.10 / #67.9 / #66.15; ADRs 0048 and 0049).
+--
+-- Three defects in one surface, and they interact, so they are tested together:
+--
+--   (#67.10) The field text was copied VERBATIM into an excerpt whose own defaults are
+--            HTML tags, so markup stored in the indexed column reached the caller intact.
+--            Pre-fix, Part 1 returned `<m>tango</m> & <b>bold</b> ...` — the corpus's own
+--            <b> live in the output — which is exactly what Part 2 now asserts as the
+--            OPT-OUT. The two parts differ only in the `escape` argument, so they are each
+--            other's control: any change that escaped nothing would make them identical.
+--
+--   (#67.9)  max_num_chars was measured in BYTES. Part 4's Greek corpus is 2 bytes per
+--            character, so a budget of 24 bought ~6 characters pre-fix and buys ~24 now.
+--
+--   (#66.15) The trust-boundary errmsg named the reporting C function. Part 6 pins the
+--            house `bm25: ` form; 39_snippet Part 5 pins the same two messages in situ.
+--
+-- The interaction worth its own test (Part 3 and Part 5): the budget counts ORIGINAL
+-- characters, while escaping expands the OUTPUT. So `escape` must not change WHICH window
+-- is chosen — only how it renders. Part 5 states that as a round-trip identity, which is
+-- the assertion that would catch a "fix" that charged entity expansion to the budget and
+-- silently shrank every excerpt containing an ampersand.
+--
+-- Every query uses the house snippet idiom — the @@@ boolean key paired with the &@@
+-- order-by on the SAME literal, no secondary sort key — because only the genuine ranked
+-- index scan registers the scan slot bm25_snippet reads. Single-row corpora, so each
+-- result is deterministic without a tiebreak.
+--
+-- NEGATIVE CONTROL, run by reverting src/bm25_snippet.c alone and keeping the 5-argument
+-- SQL declaration, so the pre-fix C body still accepts every call below. What moved:
+--
+--   Part 1 escaped output, null_escapes, Part 3 escaped_overruns, BOTH Part 4 columns,
+--   and the Part 6 message all flip. Those are the discriminating assertions.
+--
+--   Part 2 and Part 5 do NOT move, and are not claimed to. Part 2 asserts the raw output,
+--   which IS the pre-fix output — it pins the opt-out, not the fix. Part 5 is a forward
+--   invariant: no shipped version ever charged escaping to the budget, so it guards a
+--   future regression rather than a past one. Recorded here rather than left to be
+--   rediscovered as a surprise by the next person to run the control.
+
+CREATE EXTENSION bm25_native;
+SET enable_seqscan = off;
+
+-- ============================================================================
+-- Part 1 — escaping is ON by default, and applies to the FIELD only.
+-- ============================================================================
+-- The body carries all five metacharacters (& < > " ') in stored markup. The excerpt is
+-- shorter than the default 300-character budget, so the whole field is returned and the
+-- assertion can be the literal output rather than a predicate over it.
+--
+-- Note the two different fates of an angle bracket in the expected row: the caller's <m>
+-- tags survive as markup, the corpus's <b> becomes &lt;b&gt;. That asymmetry IS the
+-- contract — tags are trusted by construction, field text never is.
+CREATE TABLE esc (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO esc VALUES
+    (1, 'tango & <b>bold</b> "quoted" ''apos'' text');
+CREATE INDEX esc_bm25 ON esc USING bm25_native (body) WITH (language = 'english');
+
+SELECT bm25_snippet(body, '<m>', '</m>') AS escaped
+  FROM esc WHERE body @@@ 'tango' ORDER BY body &@@ 'tango';
+
+-- ============================================================================
+-- Part 2 — escape => false restores byte-verbatim field text.
+-- ============================================================================
+-- Same row, same tags, same budget: the ONLY difference from Part 1 is the flag. This is
+-- both the documented opt-out for non-HTML consumers and the pre-fix output verbatim.
+SELECT bm25_snippet(body, '<m>', '</m>', 300, false) AS raw
+  FROM esc WHERE body @@@ 'tango' ORDER BY body &@@ 'tango';
+
+-- A NULL flag escapes, like an omitted one: not-saying-anything must select the safe
+-- direction, or a NULL leaking in from a caller's parameter silently disarms escaping.
+SELECT bm25_snippet(body, '<m>', '</m>', 300, NULL) LIKE '%&lt;b&gt;%' AS null_escapes
+  FROM esc WHERE body @@@ 'tango' ORDER BY body &@@ 'tango';
+
+-- ============================================================================
+-- Part 3 — escaping is not charged to the budget.
+-- ============================================================================
+-- An ampersand-dense body under a 20-character budget. The window is picked over ORIGINAL
+-- characters, so the raw excerpt fits the budget while the escaped rendering of that SAME
+-- window necessarily overruns it (each '&' emits five bytes for one character of budget).
+-- Empty tags keep the measurement to text; ellipses are stripped, as they never counted.
+--
+-- A budget-charging implementation would keep escaped_overruns false by shrinking the
+-- window instead — the failure this part exists to catch.
+CREATE TABLE amp (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO amp VALUES
+    (1, 'alpha & bravo & charlie & delta & echo & foxtrot & golf');
+CREATE INDEX amp_bm25 ON amp USING bm25_native (body) WITH (language = 'english');
+
+SELECT length(replace(bm25_snippet(body, '', '', 20, false), '…', '')) <= 20 AS raw_within_budget,
+       length(replace(bm25_snippet(body, '', '', 20, true),  '…', '')) > 20  AS escaped_overruns
+  FROM amp WHERE body @@@ 'delta' ORDER BY body &@@ 'delta';
+
+-- ============================================================================
+-- Part 4 — max_num_chars counts CHARACTERS (#67.9).
+-- ============================================================================
+-- Greek words, 2 bytes per character in UTF-8, spaced so that word-boundary snapping has
+-- somewhere to land (an unspaced CJK run is one enormous "word" to the analyzer, which
+-- would make the excerpt collapse to the hit for reasons unrelated to the budget).
+--
+-- Pre-fix the 24 was 24 BYTES: the excerpt came back as roughly ' kilo ', six characters.
+-- Post-fix it is 24 characters, which is necessarily MORE than 24 bytes of Greek — so the
+-- second column is the direct statement that the unit changed, not merely that the number
+-- grew. The range on the first column absorbs where word-snapping lands the edges while
+-- still excluding the pre-fix value by a wide margin.
+CREATE TABLE grk (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = off);
+INSERT INTO grk VALUES
+    (1, 'αβγδε ζηθικ λμνξο kilo πρστυ φχψωα βγδεζ');
+CREATE INDEX grk_bm25 ON grk USING bm25_native (body) WITH (language = 'english');
+
+SELECT length(win) BETWEEN 12 AND 24 AS budget_counts_characters,
+       octet_length(win) > 24         AS window_exceeds_24_bytes
+  FROM ( SELECT replace(bm25_snippet(body, '', '', 24), '…', '') AS win
+           FROM grk WHERE body @@@ 'kilo' ORDER BY body &@@ 'kilo' ) s;
+
+-- ============================================================================
+-- Part 5 — escaping changes the RENDERING, never the window.
+-- ============================================================================
+-- Decode the escaped excerpt and it must equal the raw one, character for character, at
+-- the same budget. This is the invariant that keeps `escape` from being a second, hidden
+-- length knob.
+--
+-- &amp; is decoded LAST on purpose: decoding it first would turn a literal '&amp;lt;'
+-- stored in the corpus into '&lt;' and then into '<', inventing markup the field never
+-- had. Same ordering rule every HTML unescaper follows.
+SELECT decoded = raw AS escape_preserves_window
+  FROM ( SELECT replace(replace(replace(replace(replace(
+                    bm25_snippet(body, '<m>', '</m>', 30, true),
+                    '&lt;', '<'), '&gt;', '>'), '&quot;', '"'), '&#39;', ''''),
+                    '&amp;', '&')                             AS decoded,
+                bm25_snippet(body, '<m>', '</m>', 30, false)  AS raw
+           FROM esc WHERE body @@@ 'tango' ORDER BY body &@@ 'tango' ) s;
+
+-- ============================================================================
+-- Part 6 — the trust-boundary message no longer names the reporting function (#66.15).
+-- ============================================================================
+-- terse verbosity: the SQLSTATE and context lines are not what this pins.
+\set VERBOSITY terse
+SELECT bm25_snippet('the tango report', '<m>', '</m>', 0);   -- expect ERROR
+\set VERBOSITY default
+
+DROP TABLE grk;
+DROP TABLE amp;
+DROP TABLE esc;
+DROP EXTENSION bm25_native;

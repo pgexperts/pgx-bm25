@@ -1,0 +1,146 @@
+-- C1 (issue #131): a zero-document drain freed the pending chain while the
+-- metapage still pointed at it.
+--
+-- The pending-anchor reset (pending_head / pending_tail / pending_tail_free /
+-- pending_npages / pending_ndocs) lived ONLY inside bm25_segment_build_and_commit's
+-- segment-publish WAL record, which runs only when the drain produced at least one
+-- live document.  The page recycle that follows it, bm25_pending_truncate, is gated
+-- on something else entirely: whether a chain was drained at all.  Those two
+-- conditions come apart exactly once -- when VACUUM's pending sweep has tombstoned
+-- every document in the chain.
+--
+--   INSERT (unsealed)  ->  pending_head/tail name real pages
+--   DELETE all         ->  heap tuples dead, pending records untouched
+--   VACUUM             ->  bm25_bulkdelete -> bm25_pending_mark_dead invalidates
+--                          every pending doc's TID, THEN bm25_vacuumcleanup ->
+--                          bm25_seal_index drains ... and the drain skips every
+--                          invalidated slot, so it yields ndocs == 0.
+--
+-- No segment is published, so the anchor is never reset -- but drained_head is a
+-- real block, so bm25_pending_truncate still hands the whole chain to the FSM.  The
+-- metapage is left naming FSM-free pages with pending_tail_free still nonzero, and
+-- the next INSERT writes pending-record bytes over a page the allocator may already
+-- have reissued as a dict/postings/segment page.  Nothing repairs the anchor, so
+-- the state LATCHES: every later insert keeps writing to reclaimed pages.
+--
+-- The fix makes the detach unconditional and orders it BEFORE the recycle: when a
+-- chain was drained but nothing was published, bm25_pending_reset_anchor writes the
+-- same five fields in its own metapage-only record.  A crash between that record and
+-- the truncate leaves ordinary orphans for VACUUM -- the same benign outcome the
+-- publish path already had.
+--
+-- WHY THE ASSERTION IS ON pending_head AND NOT ON pending_ndocs.  bm25_stats()
+-- reports pending_ndocs, but the sweep has already driven it to 0 before the
+-- defective seal runs, so it reads identically pre- and post-fix.  The anchor block
+-- number is the state that actually latches, hence bm25_debug_pending_head.
+-- Pre-fix the final read is a block number; post-fix it is NULL.
+--
+-- MEASURED A/B (reverting only the anchor-reset branch, keeping the probe):
+--   anchor_detached_after_zero_doc_drain   t -> f
+--   rows_matching_after_recovery         100 -> 64
+-- The second line is the one that matters: 36 of the 100 rows inserted after the
+-- zero-doc drain were silently lost, because the stale anchor steered the append
+-- onto pages bm25_page_alloc had already reissued.  A suite that only checked the
+-- anchor field would pass on a fix that repaired the field without repairing the
+-- data path, so both assertions stay.
+CREATE EXTENSION bm25_native;
+
+CREATE TABLE zdd (id int, body text);
+CREATE INDEX zdd_idx ON zdd USING bm25_native (body);
+
+-- Keep the pending list unsealed through the INSERT.  An opportunistic seal would
+-- publish a segment, take the ndocs > 0 branch, and reset the anchor via the publish
+-- record -- i.e. it would route around the very path under test.  The default is
+-- 4096 kB; this is far above anything 200 short rows can reach, but pin it rather
+-- than rely on the default staying where it is.
+SET bm25_native.seal_threshold = '1GB';
+
+INSERT INTO zdd SELECT g, 'zero drain token alpha beta ' || (g % 13) FROM generate_series(1, 200) g;
+
+-- The probe discriminates: an unsealed chain has a real anchor.  Reported as a
+-- boolean rather than the raw block number, which is allocation-order dependent.
+SELECT bm25_debug_pending_head('zdd_idx') IS NOT NULL AS anchor_set_before_delete;
+
+-- Every pending document becomes garbage for the sweep.
+DELETE FROM zdd;
+
+-- One VACUUM is the whole reproduction: bulkdelete tombstones the pending records,
+-- then vacuumcleanup seals and finds nothing live to publish.
+-- VACUUM hands bulkdelete only REMOVABLE tuples. Another backend in this database
+-- holding an older snapshot (in installcheck, an autovacuum worker's ANALYZE) leaves
+-- the rows deleted above "recently dead": bulkdelete never sees them and nothing is
+-- tombstoned. Each VACUUM that depends on reclaiming them waits for no other backend
+-- here to hold an xmin first; sql/17_delete documents the mechanism and why the wait
+-- is sufficient, not just a narrower race.
+CREATE FUNCTION pg_temp.wait_for_xmin_horizon() RETURNS void AS $$
+DECLARE
+  deadline timestamptz := clock_timestamp() + interval '30 seconds';
+BEGIN
+  LOOP
+    PERFORM pg_stat_clear_snapshot();   -- else pg_stat_activity is cached per xact
+    EXIT WHEN NOT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND backend_xmin IS NOT NULL);
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION
+        'xmin horizon still held by another backend after 30s; VACUUM cannot reclaim';
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+SELECT pg_temp.wait_for_xmin_horizon();
+VACUUM zdd;
+
+-- ------------------------------------------------------------------ the assertion
+-- The chain has been recycled to the FSM.  The anchor must not still name it.
+-- Pre-fix: a block number (and that block is now DELETED and free).  Post-fix: NULL.
+SELECT bm25_debug_pending_head('zdd_idx') IS NULL AS anchor_detached_after_zero_doc_drain;
+
+-- No pending page may remain live-and-anchored: the recycle stamps every drained
+-- page BM25_PAGE_DELETED over its surviving BM25_PAGE_PENDING bit (512 | 2), so a
+-- page that is still PENDING-but-not-DELETED after this VACUUM would mean the chain
+-- was detached without being recycled -- the opposite leak.  IS NOT TRUE so an empty
+-- match reads t rather than NULL.
+SELECT bool_or((bm25_debug_page_flags('zdd_idx', b) & (512 | 2)) = 2) IS NOT TRUE
+         AS no_live_pending_pages_left
+  FROM generate_series(1, bm25_debug_npages('zdd_idx')::int - 1) b;
+
+-- ------------------------------------------------------- the index is still usable
+-- The latch is what makes this defect critical, so the test has to show the index
+-- accepting new work correctly AFTER the zero-doc drain, not merely that one field
+-- reads NULL.  A fresh insert must land on a freshly allocated pending page, not on
+-- a reclaimed one.
+INSERT INTO zdd SELECT g, 'second cycle token gamma delta ' || (g % 7) FROM generate_series(1001, 1100) g;
+
+SELECT bm25_debug_pending_head('zdd_idx') IS NOT NULL AS anchor_reset_for_new_chain;
+
+-- The page the anchor now names must be a live pending page (PENDING set, DELETED
+-- clear).  This one does NOT discriminate pre-fix and is not expected to: measured
+-- against the reverted build, the stale anchor's page had already been reissued by
+-- bm25_page_alloc and re-inited as a fresh pending page, so it reads PENDING-only
+-- there too.  That reissue IS the corruption -- it is caught by the row counts
+-- below, not here.  Kept as a cheap standing invariant, not as the discriminator.
+SELECT (bm25_debug_page_flags('zdd_idx',
+                              bm25_debug_pending_head('zdd_idx')::int) & (512 | 2)) = 2
+         AS anchor_names_a_live_pending_page;
+
+SELECT bm25_seal('zdd_idx');
+
+SELECT bm25_debug_pending_head('zdd_idx') IS NULL AS anchor_detached_after_real_seal;
+
+SET enable_seqscan = off;
+SELECT count(*) AS rows_matching_after_recovery FROM zdd WHERE body @@@ 'gamma';
+SELECT count(*) AS deleted_rows_gone FROM zdd WHERE body @@@ 'alpha';
+RESET enable_seqscan;
+
+-- A second VACUUM over the now-sealed index must be a clean no-op, not a repeat of
+-- the same path (the pending list is already empty, so drained_head is Invalid and
+-- neither the reset nor the recycle runs).
+VACUUM zdd;
+SELECT bm25_debug_pending_head('zdd_idx') IS NULL AS anchor_still_detached_after_second_vacuum;
+
+DROP TABLE zdd;
+DROP EXTENSION bm25_native;

@@ -1,0 +1,182 @@
+-- 87_distance_scan_identity -- the &@@ distance projection resolves to the scan
+-- that OWNS the row, not to whichever scan registered most recently (#138).
+--
+-- The defect: bm25_distance read the active-scored-scan registry HEAD. The head
+-- is the most recently REGISTERED scan, and registration happens at load -- so
+-- under a correlated subquery the inner scan registers DURING the outer row's
+-- projection, and the outer's resjunk `&@@` returned the INNER scan's distance.
+-- Every outer row got one constant value; with a secondary sort key on that
+-- value the BM25 ranking collapsed to the tiebreak. This was not a cosmetic
+-- wrong number: it was a wrong ROW ORDER.
+--
+-- Why the fix is query identity and not something simpler:
+--   * recency-on-emit does NOT work -- in this shape the inner IS the most
+--     recent emitter. ADR 0007 rejected recency for exactly this reason.
+--   * row identity (how bm25_score resolves) is unavailable: bm25_distance's
+--     arguments are (document value, query), with no ctid, and fmgr gives a
+--     scalar function no handle on the slot being projected.
+--   * PostgreSQL's own xs_orderbyvals cannot carry it either -- core consumes
+--     that only inside IndexNextWithReorder, never for projection.
+-- So the resolver matches the projected expression's own RHS against the RHS
+-- each scoring scan stashed. See docs/adr/0061.
+--
+-- Fixture: six docs with DISTINCT scores, so any clobber is a wrong NUMBER and
+-- not merely a reordering of ties. Assertions are booleans and id arrays, never
+-- pinned floats or EXPLAIN text, so they are portable across PG 17/18.
+CREATE EXTENSION bm25_native;
+
+CREATE TABLE dsi (id int primary key, body text);
+INSERT INTO dsi VALUES
+ (1,'foo foo bar'),
+ (2,'foo bar bar'),
+ (3,'foo foo foo bar'),
+ (4,'foo bar'),
+ (5,'foo foo foo foo bar'),
+ (6,'foo bar bar bar');
+CREATE INDEX dsi_bm25 ON dsi USING bm25_native (body);
+SET enable_seqscan = off;
+
+-- Plan guard, in sql/53's shape. The whole suite is meaningless if the planner
+-- does not actually produce TWO live bm25 index scans, so count the scan NODES
+-- rather than pinning EXPLAIN text (cost and `Disabled:` lines vary by version).
+--
+-- Node count alone is NOT sufficient, which an A/B caught: every inner subquery
+-- below is deliberately CORRELATED (the `i.body <> (o.body || 'x')` term). An
+-- uncorrelated one still shows two scan nodes, but the planner hoists it to a
+-- One-Time InitPlan that runs ONCE before the outer scan -- so the outer is head
+-- for every projection, the bug cannot manifest, and the assertions pass against
+-- the BROKEN build too. Do not "simplify" that predicate away.
+--
+-- For the same reason every assertion below also SELECTs count(sub): an
+-- unreferenced subquery output is deleted by remove_unused_subquery_outputs,
+-- which removes the SubPlan altogether. A non-zero count is the evidence the
+-- second scan actually ran.
+CREATE FUNCTION dsi_plan(q text) RETURNS SETOF text LANGUAGE plpgsql AS
+$$ BEGIN RETURN QUERY EXECUTE 'EXPLAIN (COSTS OFF) ' || q; END $$;
+
+SELECT count(*) = 2 AS two_live_bm25_scans
+FROM dsi_plan(
+  $q$ SELECT o.id,
+             (SELECT i.id FROM dsi i WHERE i.body @@@ 'bar'
+                AND i.body <> (o.body || 'x')
+               ORDER BY i.body &@@ 'bar' LIMIT 1) AS sub,
+             o.body &@@ 'foo' AS d
+        FROM dsi o WHERE o.body @@@ 'foo' ORDER BY o.body &@@ 'foo' $q$) AS line
+WHERE line LIKE '%Index Scan using dsi_bm25%';
+
+-- (S1) THE REPORTED SHAPE: `&@@` projected AFTER a live correlated subplan.
+-- Head is the inner scan, live and positioned, so this is the case neither of
+-- the originally-proposed fixes repaired. Assert against the single-scan
+-- baseline rather than against bm25_score -- independent of that accessor's own
+-- documented residuals, so a failure here means THIS bug and not another.
+-- The baseline is materialised in its OWN statement, deliberately. Computing it
+-- as a sibling subquery would put TWO scans ranking the byte-identical query
+-- 'foo' in one statement -- which is the one residual this fix cannot close (see
+-- the same-text note below), so the comparison would measure that instead.
+CREATE TABLE dsi_base AS
+SELECT id, round((body &@@ 'foo')::numeric, 6) AS d
+  FROM dsi WHERE body @@@ 'foo' ORDER BY body &@@ 'foo';
+
+SELECT bool_and(b.d IS NOT DISTINCT FROM n.d) AS s1_matches_baseline,
+       count(n.sub) AS subplan_rows_seen
+FROM dsi_base b
+JOIN (SELECT o.id,
+             (SELECT i.id FROM dsi i WHERE i.body @@@ 'bar'
+                AND i.body <> (o.body || 'x')
+               ORDER BY i.body &@@ 'bar' LIMIT 1) AS sub,
+             round((o.body &@@ 'foo')::numeric, 6) AS d
+        FROM dsi o WHERE o.body @@@ 'foo' ORDER BY o.body &@@ 'foo') n USING (id);
+
+-- (S1b) The row-ORDER consequence, which is what makes this more than cosmetic.
+-- Sorting on the projected value must reproduce the true BM25 order. With the
+-- value clobbered to a constant every row ties and the output collapses to id
+-- order, so this is the discriminating form.
+SELECT array_agg(id ORDER BY d, id) AS s1_ranked_order, count(sub) AS subplan_rows_seen
+FROM (SELECT o.id,
+             (SELECT i.id FROM dsi i WHERE i.body @@@ 'bar'
+                AND i.body <> (o.body || 'x')
+               ORDER BY i.body &@@ 'bar' LIMIT 1) AS sub,
+             o.body &@@ 'foo' AS d
+        FROM dsi o WHERE o.body @@@ 'foo' ORDER BY o.body &@@ 'foo') s;
+
+-- (S2) `&@@` projected BEFORE the subplan in the target list. Target-list
+-- evaluation is front-to-back, so here the head is the inner scan left over
+-- from the PREVIOUS row -- a different interleaving, same wrong answer.
+SELECT bool_and(b.d IS NOT DISTINCT FROM n.d) AS s2_matches_baseline,
+       count(n.sub) AS subplan_rows_seen
+FROM dsi_base b
+JOIN (SELECT o.id,
+             round((o.body &@@ 'foo')::numeric, 6) AS d,
+             (SELECT i.id FROM dsi i WHERE i.body @@@ 'bar'
+                AND i.body <> (o.body || 'x')
+               ORDER BY i.body &@@ 'bar' LIMIT 1) AS sub
+        FROM dsi o WHERE o.body @@@ 'foo' ORDER BY o.body &@@ 'foo') n USING (id);
+
+-- (S4) NOTE: count(sub) is 0 here BY CONSTRUCTION (the inner matches nothing), so
+-- unlike the cases above it is not evidence the SubPlan survived planning -- only
+-- the correlation predicate protects this one. The assertion still discriminates
+-- (A/B: f pre-fix, t post-fix).
+--
+-- An inner scan that matches NOTHING registers at load having emitted no
+-- row, and its cur_orderby_dist is still the +inf initializer. Reading the head
+-- projected that +inf onto every outer row. The resolver skips any scan that is
+-- not positioned, so this is now structural rather than accidental.
+SELECT bool_and(d <> 'Infinity'::float8) AS s4_no_infinity_leak,
+       count(sub) AS subplan_rows_seen
+FROM (SELECT o.id,
+             (SELECT i.id FROM dsi i WHERE i.body @@@ 'zzzznomatch'
+                AND i.body <> o.body
+               ORDER BY i.body &@@ 'zzzznomatch' LIMIT 1) AS sub,
+             o.body &@@ 'foo' AS d
+        FROM dsi o WHERE o.body @@@ 'foo' ORDER BY o.body &@@ 'foo') s;
+
+-- jsonb RHS: the (text,jsonb) &@@ form has its OWN distance body in
+-- bm25_handler.c. It read the head too, and an earlier fix in this area missed
+-- it -- which is why both now call one shared resolver. Same nested shape.
+CREATE TABLE dsi_base_jsonb AS
+SELECT id, round((body &@@ bm25_term('body','foo'))::numeric, 6) AS d
+  FROM dsi WHERE body @@@ bm25_term('body','foo')
+ ORDER BY body &@@ bm25_term('body','foo');
+
+SELECT bool_and(b.d IS NOT DISTINCT FROM n.d) AS jsonb_matches_baseline,
+       count(n.sub) AS subplan_rows_seen
+FROM dsi_base_jsonb b
+JOIN (SELECT o.id,
+             (SELECT i.id FROM dsi i WHERE i.body @@@ bm25_term('body','bar')
+                AND i.body <> (o.body || 'x')
+               ORDER BY i.body &@@ bm25_term('body','bar') LIMIT 1) AS sub,
+             round((o.body &@@ bm25_term('body','foo'))::numeric, 6) AS d
+        FROM dsi o WHERE o.body @@@ bm25_term('body','foo')
+       ORDER BY o.body &@@ bm25_term('body','foo')) n USING (id);
+
+-- The text and jsonb families must never cross-match on a coincidental byte
+-- sequence: a jsonb-ranked scan does not answer a text projection.
+SELECT bool_and(d = 'Infinity'::float8) AS text_does_not_match_jsonb_scan
+FROM (SELECT o.body &@@ 'foo' AS d
+        FROM dsi o WHERE o.body @@@ bm25_term('body','foo')
+       ORDER BY o.body &@@ bm25_term('body','foo')) s;
+
+-- DELIBERATE BEHAVIOUR CHANGE, pinned here so it is a decision and not a
+-- surprise: projecting a query nothing is ranking now yields +infinity. It used
+-- to yield the ranked scan's distance for a DIFFERENT query -- a silently wrong
+-- finite number. +inf is the same answer the off-index path gives.
+SELECT bool_and(d = 'Infinity'::float8) AS mismatched_projection_is_inf
+FROM (SELECT o.body &@@ 'bar' AS d
+        FROM dsi o WHERE o.body @@@ 'foo' ORDER BY o.body &@@ 'foo') s;
+
+-- Single-scan behaviour is untouched: the common case still resolves.
+SELECT bool_and(d = -bm25_score(ctid)) AS single_scan_unchanged
+FROM (SELECT ctid, body &@@ 'foo' AS d
+        FROM dsi WHERE body @@@ 'foo' ORDER BY body &@@ 'foo') s;
+
+-- Negative control: off the index there is no per-row score, and the degrade
+-- contract (+inf, never an error) is preserved. sql/50 pins this too; repeated
+-- here because the resolver is now what implements it.
+SET enable_seqscan = on;
+SELECT DISTINCT (body &@@ 'foo') = 'Infinity'::float8 AS inf_off_index FROM dsi;
+RESET enable_seqscan;
+
+DROP FUNCTION dsi_plan(text);
+DROP TABLE dsi_base, dsi_base_jsonb;
+DROP TABLE dsi;
+DROP EXTENSION bm25_native;

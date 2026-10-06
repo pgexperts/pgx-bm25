@@ -1,0 +1,23 @@
+CREATE EXTENSION bm25_native;
+CREATE TABLE docs (id int primary key, body text) WITH (autovacuum_enabled=off);
+INSERT INTO docs VALUES (1, 'quick quick fox'), (2, 'quick brown brown brown');
+CREATE INDEX docs_bm25 ON docs USING bm25_native (body);
+-- Build-path: verify tf and doclen are stored correctly.
+-- doc1: 'quick quick fox' => ntok=3; quick->tf=2,doclen=3; fox->tf=1,doclen=3
+-- doc2: 'quick brown brown brown' => ntok=4; quick->tf=1,doclen=4; brown->tf=3,doclen=4
+SELECT term, tf, doclen
+FROM bm25_debug_postings('docs_bm25')
+ORDER BY term, doclen, tf;
+-- Insert-path probe: after build, insert a row with a repeated term, then verify
+-- its tf/doclen via bm25_debug_postings.
+-- 'apple apple apple' => ntok=3; stored term is the STEMMED form 'appl' (tf=3,doclen=3)
+INSERT INTO docs VALUES (3, 'apple apple apple');
+-- bm25_debug_postings is segments-only (Phase 1); seal so the post-build-inserted
+-- doc 3 is drained and its 'appl' posting (tf=3, doclen=3) is observable.
+SELECT bm25_seal('docs_bm25');
+SELECT term, tf, doclen
+FROM bm25_debug_postings('docs_bm25')
+WHERE term = 'appl'
+ORDER BY term, doclen, tf;
+DROP TABLE docs;
+DROP EXTENSION bm25_native;

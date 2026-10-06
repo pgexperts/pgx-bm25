@@ -1,0 +1,18 @@
+-- 13_varbyte: encode then decode each value; assert identity and byte counts.
+CREATE EXTENSION bm25_native;
+SELECT v, (bm25_debug_varbyte_roundtrip(v)).*
+  FROM (VALUES (0::int8),(1),(127),(128),(16383),(16384),(2097151),(2097152),(4294967295)) AS t(v);
+     v      |  decoded   | nbytes 
+------------+------------+--------
+          0 |          0 |      1
+          1 |          1 |      1
+        127 |        127 |      1
+        128 |        128 |      2
+      16383 |      16383 |      2
+      16384 |      16384 |      3
+    2097151 |    2097151 |      3
+    2097152 |    2097152 |      4
+ 4294967295 | 4294967295 |      5
+(9 rows)
+
+DROP EXTENSION bm25_native;

@@ -1,0 +1,176 @@
+-- H17 (issue #56): bm25_scan_snapshot palloc's a copy of the whole live segment catalog
+-- in CurrentMemoryContext, and its header contract in bm25.h puts freeing it on the
+-- caller: "the caller must keep that context alive for the scan (or pfree segs before
+-- resetting it)". No caller did. bm25_analyze's lowercased copy, token array and
+-- per-lexeme copies leaked the same way.
+--
+-- On the @@@ filter path (bm25_load_if_needed) CurrentMemoryContext is
+-- estate->es_query_cxt, reclaimed only at end of QUERY; on the ranked paths the two
+-- builders created their scratchctx AFTER the snapshot and the corpus-stat prologue, so
+-- that allocation landed in the subtransaction context and survived to end of
+-- transaction. The WAND builder's comment even named "snap.segs" as living in its
+-- scratchctx while allocating it three statements before the context existed.
+--
+-- So a parameterized nested loop with a bm25 scan on the inner side leaked once per
+-- OUTER ROW. Measured on the shape below (150k rescans, this machine, PG 18.3), backend
+-- RSS during the statement:
+--      before:  16.8 MB -> 42.6 MB, monotonic, still climbing at statement end
+--      after:   14.9 MB -> 18.4 MB
+-- The report's own measurement, on a larger index, reached 1.85 GB in 120 s without
+-- plateauing and had to be terminated rather than completed.
+--
+-- WHAT THIS SUITE PINS. Memory footprint is not visible in expected output, so the CI
+-- floor in ci.yml is what fails if a scratch context is dropped. What this suite pins is
+-- the hazard the fix INTRODUCES: the snapshot now lives in a context that is explicitly
+-- deleted, so anything reading snap.segs after that delete is a use-after-free. That
+-- would show up here as a wrong result or a crash -- and in the cassert CI job as a read
+-- of clobbered memory, since --enable-cassert implies CLOBBER_FREED_MEMORY (ADR 0008).
+-- The shape is therefore deliberately rescan-heavy AND multi-segment, so snap.segs is a
+-- real array rather than one entry.
+CREATE EXTENSION bm25_native;
+-- Four sealed segments plus live pending rows, so every snapshot copies a 4-entry
+-- catalog and the per-segment header sweep after the ranking build has something to walk.
+CREATE TABLE rsd (id int, body text);
+CREATE INDEX rsd_idx ON rsd USING bm25_native (body);
+DO $$ DECLARE k int; BEGIN
+  FOR k IN 1..4 LOOP
+    INSERT INTO rsd
+    SELECT k*1000+g, 'database storage engine alpha' ||
+                     CASE WHEN g <= 3 THEN '' ELSE ' filler' END
+    FROM generate_series(1, 60) g;
+    PERFORM bm25_seal('rsd_idx');
+  END LOOP;
+END $$;
+-- Unsealed rows too: the snapshot captures pending_head alongside the catalog.
+INSERT INTO rsd SELECT 9000+g, 'database storage engine alpha' FROM generate_series(1,5) g;
+SELECT count(*) AS segs FROM bm25_debug_segcat('rsd_idx');
+ segs 
+------
+    4
+(1 row)
+
+CREATE TABLE rsq (term text);
+INSERT INTO rsq SELECT 'database' FROM generate_series(1, 200);
+ANALYZE rsd; ANALYZE rsq;
+SET enable_seqscan = off;
+SET enable_material = off;
+SET enable_memoize = off;   -- else the inner scan runs once and nothing rescans
+-- ---------------------------------------------------------------- filter path rescan
+-- One bm25_load_if_needed per outer row: 200 snapshots taken and freed. Every rescan
+-- must return the same answer as a single scan does.
+SELECT count(*) AS filter_rescan_rows
+  FROM rsq q, LATERAL (SELECT id FROM rsd WHERE body @@@ q.term) s;
+ filter_rescan_rows 
+--------------------
+              49000
+(1 row)
+
+SELECT count(*) AS filter_single_scan FROM rsd WHERE body @@@ 'database';
+ filter_single_scan 
+--------------------
+                245
+(1 row)
+
+-- 200 outer rows x the single-scan count, exactly -- a snapshot read after its context
+-- was freed would give a short or garbled inner result on some iterations.
+SELECT (SELECT count(*) FROM rsq q, LATERAL (SELECT id FROM rsd WHERE body @@@ q.term) s)
+       = 200 * (SELECT count(*) FROM rsd WHERE body @@@ 'database') AS filter_exact;
+ filter_exact 
+--------------
+ t
+(1 row)
+
+-- ---------------------------------------------------------------- ranked path rescan
+-- The two ranking builders are the sites where the snapshot moved INTO scratchctx, and
+-- both are exercised: wand_top_k = 0 takes the exhaustive builder, > 0 the WAND one.
+SET bm25_native.wand_top_k = 0;
+SELECT count(*) AS ranked_exhaustive_rescan
+  FROM rsq q, LATERAL (SELECT id FROM rsd WHERE body @@@ q.term
+                       ORDER BY body &@@ q.term LIMIT 3) s;
+ ranked_exhaustive_rescan 
+--------------------------
+                      600
+(1 row)
+
+SET bm25_native.wand_top_k = 3;
+SELECT count(*) AS ranked_wand_rescan
+  FROM rsq q, LATERAL (SELECT id FROM rsd WHERE body @@@ q.term
+                       ORDER BY body &@@ q.term LIMIT 3) s;
+ ranked_wand_rescan 
+--------------------
+                600
+(1 row)
+
+RESET bm25_native.wand_top_k;
+-- The ranked ANSWER is stable across rescans, not merely the row count: the top 3 by
+-- score are the short docs, and every one of the 200 iterations must agree. A distinct
+-- count of 1 says all iterations produced the identical id set.
+SET bm25_native.wand_top_k = 0;
+SELECT count(DISTINCT ids) AS distinct_top3_sets_exhaustive FROM (
+  SELECT q.ctid, (SELECT array_agg(id ORDER BY id) FROM
+                    (SELECT id FROM rsd WHERE body @@@ q.term
+                     ORDER BY body &@@ q.term LIMIT 3) t) AS ids
+  FROM rsq q) u;
+ distinct_top3_sets_exhaustive 
+-------------------------------
+                             1
+(1 row)
+
+SET bm25_native.wand_top_k = 3;
+SELECT count(DISTINCT ids) AS distinct_top3_sets_wand FROM (
+  SELECT q.ctid, (SELECT array_agg(id ORDER BY id) FROM
+                    (SELECT id FROM rsd WHERE body @@@ q.term
+                     ORDER BY body &@@ q.term LIMIT 3) t) AS ids
+  FROM rsq q) u;
+ distinct_top3_sets_wand 
+-------------------------
+                       1
+(1 row)
+
+RESET bm25_native.wand_top_k;
+-- And that set is the expected one (12 docs have the short body -- 3 per segment -- plus
+-- the 5 pending rows; the top 3 come from those, so the set is well-defined only as a
+-- membership test against the short-doc pool).
+SELECT bool_and(id >= 1001) AS top3_from_short_pool FROM (
+  SELECT id FROM rsd WHERE body @@@ 'database' ORDER BY body &@@ 'database' LIMIT 3) s;
+ top3_from_short_pool 
+----------------------
+ t
+(1 row)
+
+-- ---------------------------------------------------------------- empty-result exits
+-- The two early exits that now have to release the scratch context: a term that
+-- tokenizes to nothing (all stopwords) and a term that matches no doc. Both must leave
+-- the scan usable afterwards.
+SELECT count(*) AS stopword_only FROM rsd WHERE body @@@ 'the';
+ stopword_only 
+---------------
+             0
+(1 row)
+
+SELECT count(*) AS no_match      FROM rsd WHERE body @@@ 'nonexistentterm';
+ no_match 
+----------
+        0
+(1 row)
+
+SELECT count(*) AS still_works   FROM rsd WHERE body @@@ 'database';
+ still_works 
+-------------
+         245
+(1 row)
+
+-- Rescanned, so those exits are taken 200 times each rather than once.
+SELECT count(*) AS no_match_rescan
+  FROM rsq q, LATERAL (SELECT id FROM rsd WHERE body @@@ 'nonexistentterm') s;
+ no_match_rescan 
+-----------------
+               0
+(1 row)
+
+RESET enable_memoize;
+RESET enable_material;
+RESET enable_seqscan;
+DROP TABLE rsq;
+DROP TABLE rsd;
+DROP EXTENSION bm25_native;
